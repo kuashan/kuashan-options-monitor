@@ -116,6 +116,26 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/v1/health":
             self._json(200, {"ok": True, "service": "options-monitor-web", "mode": "read-only"})
             return
+        if parsed.path == "/api/v1/options":
+            from standalone_web.public_marketdata import MarketDataUnavailable, fetch_public_option_chain
+
+            try:
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                if set(query) - {"symbol", "expiry"} or any(len(v) != 1 for v in query.values()):
+                    raise ValueError("Supported parameters: symbol and optional expiry")
+                if "symbol" not in query:
+                    raise ValueError("symbol is required")
+                data = fetch_public_option_chain(query["symbol"][0], query.get("expiry", [None])[0])
+            except ValueError as exc:
+                self._json(400, {"ok": False, "error": str(exc), "data": None})
+                return
+            except MarketDataUnavailable as exc:
+                self._json(503, {"ok": False, "error": str(exc), "data": None, "provider": "yfinance"})
+                return
+            self._json(200, {"ok": True, "data": data, "warnings": [
+                "Unofficial Yahoo data; quote delay/accuracy not guaranteed; observe only."
+            ]})
+            return
         if parsed.path.startswith("/api/v1/"):
             view = parsed.path.removeprefix("/api/v1/")
             try:
