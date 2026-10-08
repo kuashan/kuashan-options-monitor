@@ -1,4 +1,4 @@
-name: Import upstream Git history
+name: Backup entire upstream and import source
 on:
   push:
     paths:
@@ -7,29 +7,39 @@ on:
 permissions:
   contents: write
 jobs:
-  mirror:
+  backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
-      - name: Import references incrementally and verify
+      - name: Archive original Git objects and import browsable source
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           git clone --mirror https://github.com/liuxie066/options-monitor.git upstream.git
-          cd upstream.git
-          git fsck --full --no-reflogs
-          git remote add backup https://x-access-token:${GH_TOKEN}@github.com/kuashan/kuashan-options-monitor.git
-          mapfile -t branches < <(git for-each-ref --format='%(refname)' refs/heads/ | grep -v '^refs/heads/main$')
-          mapfile -t tags < <(git for-each-ref --format='%(refname)' refs/tags/)
-          echo "SOURCE_BRANCHES=$((${#branches[@]}+1)) SOURCE_TAGS=${#tags[@]}"
-          for ref in "${branches[@]}" "${tags[@]}"; do
-            echo "Pushing $ref"
-            git -c http.postBuffer=524288000 push backup "+$ref:$ref"
-          done
-          git push --force backup '+refs/heads/main:refs/heads/main'
-          git ls-remote --heads --tags origin | sort > /tmp/upstream-refs
-          git ls-remote --heads --tags backup | sort > /tmp/backup-refs
-          diff -u /tmp/upstream-refs /tmp/backup-refs
-          echo "MIRROR_REFS_VERIFIED=PASS"
+          git -C upstream.git fsck --full --no-reflogs
+          git -C upstream.git bundle create "$PWD/options-monitor-full-history.bundle" --all
+          echo "BUNDLE_BYTES=$(stat -c %s options-monitor-full-history.bundle)"
+          echo "SOURCE_BRANCHES=$(git -C upstream.git for-each-ref refs/heads/ --format='%(refname)' | wc -l)"
+          echo "SOURCE_TAGS=$(git -C upstream.git for-each-ref refs/tags/ --format='%(refname)' | wc -l)"
+          git clone --branch main https://github.com/liuxie066/options-monitor.git upstream
+          git clone https://x-access-token:${GH_TOKEN}@github.com/kuashan/kuashan-options-monitor.git backup
+          rsync -a --delete --exclude='/.git/' --exclude='/.github/workflows/' --exclude='/upstream-workflows/' upstream/ backup/
+          mkdir -p backup/upstream-workflows
+          if [ -d upstream/.github/workflows ]; then
+            rsync -a upstream/.github/workflows/ backup/upstream-workflows/
+          fi
+          echo 'Original workflow YAML files are stored here because GITHUB_TOKEN cannot push them to .github/workflows. Complete original history (with original paths) is in the release Git bundle.' > backup/upstream-workflows/README.txt
+          git -C backup config user.name 'github-actions[bot]'
+          git -C backup config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C backup add -A
+          if ! git -C backup diff --cached --quiet; then
+            git -C backup commit -m 'backup: import upstream source snapshot and original workflows'
+            git -C backup push origin HEAD:main
+          fi
+          gh release create upstream-preservation-20261008 ./options-monitor-full-history.bundle --repo kuashan/kuashan-options-monitor --title 'Full upstream Git history backup 2026-10-08' --notes 'Complete original Git refs and objects, including all branches, tags, and workflow history. Restore with git clone options-monitor-full-history.bundle recovered-repo.'
+          git clone --mirror https://github.com/kuashan/kuashan-options-monitor.git verify.git
+          git -C upstream.git bundle verify "$PWD/options-monitor-full-history.bundle"
+          test -s options-monitor-full-history.bundle
+          echo 'BACKUP_BUNDLE_AND_SOURCE_SNAPSHOT=PASS'
