@@ -137,30 +137,9 @@ class Handler(BaseHTTPRequestHandler):
             ]})
             return
         if parsed.path.startswith("/api/v1/"):
-            # Observation-only V1: do not read Futu account, SQLite ledger or snapshots.
             self._json(403, {
                 "ok": False,
                 "error": "Account and ledger APIs are disabled in public observer mode",
-            })
-            return
-            view = parsed.path.removeprefix("/api/v1/")
-            try:
-                tool, payload = make_tool_request(view, parse_qs(parsed.query))
-                envelope = invoke_tool(tool, payload)
-            except ValueError as exc:
-                self._json(400, {"ok": False, "error": str(exc)})
-                return
-            except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
-                self._json(503, {"ok": False, "error": "Tool gateway unavailable", "reason": type(exc).__name__})
-                return
-            self._json(200, {
-                "ok": bool(envelope.get("ok")),
-                "view": view,
-                "market": payload.get("market", payload.get("config_key", "us")),
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "data": envelope.get("data"),
-                "warnings": envelope.get("warnings") or [],
-                "error": envelope.get("error"),
             })
             return
         static = STATIC_FILES.get(parsed.path)
