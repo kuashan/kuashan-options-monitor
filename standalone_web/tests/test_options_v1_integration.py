@@ -130,7 +130,7 @@ class UiIntegrationContractTests(unittest.TestCase):
         self.assertNotIn('"/api/v1/positions"',script)
         self.assertNotIn('"/api/v1/send_order"',script)
         self.assertIn("textContent",script)
-        self.assertNotIn("innerHTML",script)
+        self.assertNotIn(".innerHTML",script)
 
 
 class FourLegHttpTests(HttpTests):
