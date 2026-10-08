@@ -1,358 +1,329 @@
 "use strict";
 
-const byId = (id) => document.getElementById(id);
-const views = ["status", "brief", "positions", "performance"];
-
-function text(id, value) {
-  byId(id).textContent = String(value ?? "—");
-}
-
-function formatValue(value) {
-  if (value === null || value === undefined || value === "") return "未提供";
-  if (typeof value === "boolean") return value ? "是" : "否";
-  if (typeof value === "object") return JSON.stringify(value, null, 2);
-  return String(value);
-}
-
-function addLine(parent, title, value) {
-  const row = document.createElement("div");
-  row.className = "keyval";
-  const label = document.createElement("span");
-  label.textContent = title;
-  const detail = document.createElement("strong");
-  detail.textContent = formatValue(value);
-  row.append(label, detail);
-  parent.append(row);
-}
-
-function showMessage(parent, value, isWarning = false) {
-  const element = document.createElement("div");
-  element.className = isWarning ? "notice" : "empty";
-  element.textContent = value;
-  parent.replaceChildren(element);
-}
-
-function showRaw(id, data) {
-  text(id, data === null || data === undefined ? "暂无数据" : JSON.stringify(data, null, 2));
-}
-
-function issueReason(response) {
-  const error = response?.error;
-  if (typeof error === "string") return error;
-  if (error && typeof error === "object") {
-    return error.message || error.code || "数据源没有提供可用信息";
+/* Public-data only. Never touches the original options-monitor account APIs. */
+const $ = (id) => document.getElementById(id);
+const MODES = {
+  long_call: {
+    label: "买入 Call", source: "calls",
+    risk: "最多损失支付的全部权利金和费用",
+    explain: "以 Ask 买入；价格上涨有潜在收益，买方承担时间价值风险"
+  },
+  long_put: {
+    label: "买入 Put", source: "puts",
+    risk: "最多损失支付的全部权利金和费用",
+    explain: "以 Ask 买入；价格下跌可能获益，Put 权利金也可能全部损失"
+  },
+  short_call: {
+    label: "卖出 Call", source: "calls",
+    risk: "裸卖 Call 理论最大亏损无上限 · 不提供数值评分",
+    explain: "以 Bid 卖出；当前没有验证持股，不假定是备兑 Call"
+  },
+  short_put: {
+    label: "卖出 Put", source: "puts",
+    risk: "股价跌至零时仍需承担重大亏损；不假定有充足现金担保",
+    explain: "以 Bid 卖出；资金占用与接货义务独立于收取的权利金"
   }
-  return "数据未就绪（检查配置、数据源与运行状态）";
-}
+};
 
-async function load(view, query) {
-  const params = new URLSearchParams(query);
-  const response = await fetch("/api/v1/" + view + "?" + params.toString(), { cache: "no-store" });
-  const body = await response.json();
-  if (!response.ok) return { ok: false, error: body.error || "请求失败", data: null };
-  return body;
-}
+let chain = null;
+let currentLeg = "short_put";
+let selectedContract = null;
+let requestSequence = 0;
 
-function renderStatus(response) {
-  const data = response.data;
-  if (!response.ok || !data) {
-    text("runtime-value", "不可用");
-    text("runtime-caption", issueReason(response));
-    return;
-  }
-  const summary = data.summary || {};
-  const ok = summary.ok === true;
-  text("runtime-value", ok ? "正常" : "待检查");
-  text("runtime-caption", ok ? "运行快照通过检查" : "查看原始运行状态或检查系统配置");
-}
-
-function renderBrief(response) {
-  const panel = byId("brief-panel");
-  showRaw("brief-json", response.data);
-  if (!response.ok || !response.data) {
-    text("brief-value", "不可用");
-    text("brief-caption", issueReason(response));
-    showMessage(panel, issueReason(response), true);
-    return;
-  }
-  const data = response.data;
-  if (!data.available) {
-    text("brief-value", "无快照");
-    text("brief-caption", formatValue(data.reason));
-    showMessage(panel, "当前账户或市场尚无可靠的每日决策快照。不会显示示例行情。");
-    return;
-  }
-  text("brief-value", "可查看");
-  text("brief-caption", "已有真实每日决策快照");
-  panel.replaceChildren();
-  const sections = Array.isArray(data.sections) ? data.sections : [data];
-  addLine(panel, "覆盖范围", sections.length === 1 ? "1 个报告范围" : sections.length + " 个报告范围");
-  addLine(panel, "可操作状态", data.effective_actionability || "未判定");
-  for (const section of sections.slice(0, 4)) {
-    const brief = section.brief || {};
-    if (brief.market) addLine(panel, "市场", brief.market);
-    if (brief.account) addLine(panel, "账户", brief.account);
-    if (brief.market_trading_date) addLine(panel, "交易日期", brief.market_trading_date);
-    if (Array.isArray(brief.data_gaps) && brief.data_gaps.length) {
-      const warning = document.createElement("div");
-      warning.className = "notice";
-      warning.textContent = "此报告存在 " + brief.data_gaps.length + " 项数据缺口，建议先核对报告质量。";
-      panel.append(warning);
-    }
-  }
-}
-
-function renderPositions(response) {
-  const tbody = byId("positions-tbody");
-  const data = response.data;
-  if (!response.ok || !data || !Array.isArray(data.rows)) {
-    text("position-value", "不可用");
-    text("position-caption", issueReason(response));
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 6;
-    td.className = "empty";
-    td.textContent = issueReason(response);
-    tr.append(td);
-    tbody.replaceChildren(tr);
-    return;
-  }
-  const rows = data.rows;
-  text("position-value", rows.length);
-  text("position-caption", "原始账本返回的未平仓记录数量");
-  tbody.replaceChildren();
-  if (!rows.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 6;
-    td.className = "empty";
-    td.textContent = "查询成功，账本中暂无符合条件的未平仓期权记录。";
-    tr.append(td);
-    tbody.append(tr);
-  }
-  for (const record of rows) {
-    const tr = document.createElement("tr");
-    const fields = [
-      record.symbol, (record.side || "") + " " + (record.option_type || ""),
-      record.strike, record.expiration_ymd, record.contracts_open, record.status
-    ];
-    for (const field of fields) {
-      const td = document.createElement("td");
-      td.textContent = formatValue(field);
-      tr.append(td);
-    }
-    tbody.append(tr);
-  }
-  const exposure = data.evidence_scope || {};
-  text("positions-footer", "持仓账本： " + formatValue(exposure.ledger_positions || "已查询") +
-    " · 行情与交割状态可能独立于账本更新，请以来源时间为准");
-}
-
-function renderPerformance(response) {
-  const panel = byId("performance-panel");
-  showRaw("performance-json", response.data);
-  if (!response.ok || !response.data) {
-    showMessage(panel, issueReason(response), true);
-    return;
-  }
-  const data = response.data;
-  panel.replaceChildren();
-  addLine(panel, "统计期间", data.period?.kind || "未提供");
-  addLine(panel, "截止日期", data.period?.as_of_date || "未提供");
-  const cashflow = data.option_net_cashflow || {};
-  const cny = cashflow.cny_total;
-  if (cny !== undefined) {
-    addLine(panel, "累计净现金流（CNY 证据）", typeof cny === "object" ? "查看结构化报告" : cny);
-  }
-  const winRate = data.sell_option_win_rate;
-  if (winRate !== undefined) {
-    addLine(panel, "卖出期权胜率", typeof winRate === "object" ? "查看结构化报告" : winRate);
-  }
-  if (data.quality?.missing?.length) {
-    const warning = document.createElement("div");
-    warning.className = "notice";
-    warning.textContent = "有 " + data.quality.missing.length + " 项收益计算证据缺失，详细数据见原始报告。";
-    panel.append(warning);
-  }
-  if (!panel.children.length) showMessage(panel, "没有可展示的统计字段，请展开原始结构化报告。");
-}
-
-async function refresh() {
-  const button = byId("refresh");
-  button.disabled = true;
-  text("load-status", "正在查询现有快照（不会触发扫描或交易）…");
-  const query = {
-    market: byId("market").value,
-    account: byId("account").value.trim(),
-    period: byId("period").value
-  };
-  const results = await Promise.all(views.map(async (view) => {
-    try {
-      return await load(view, query);
-    } catch (error) {
-      return { ok: false, data: null, error: "服务连接失败" };
-    }
-  }));
-  renderStatus(results[0]);
-  renderBrief(results[1]);
-  renderPositions(results[2]);
-  renderPerformance(results[3]);
-  const successes = results.filter((result) => result.ok).length;
-  text("load-status", successes + "/" + results.length + " 个只读查询可用");
-  text("time-stamp", "本地刷新时间：" + new Date().toLocaleString("zh-CN"));
-  button.disabled = false;
-}
-
-async function checkHealth() {
-  try {
-    const response = await fetch("/api/v1/health", { cache: "no-store" });
-    const result = await response.json();
-    text("service-state", result.ok ? "Web 服务可达 · 只读" : "Web 服务异常");
-  } catch (error) {
-    text("service-state", "Web 服务连接异常");
-  }
-}
-
-
-
-
-for (const link of document.querySelectorAll(".nav-link")) {
-  link.addEventListener("click", () => {
-    document.querySelectorAll(".nav-link").forEach((item) => item.classList.remove("selected"));
-    link.classList.add("selected");
-  });
-}
-checkHealth();
-// No Futu/SQLite/OM account queries in public observer mode.
-
-
-// Public-market observation is completely independent of Futu/OM accounts.
-let publicChain = null;
-let latestPublicRequest = 0;
-
-function showPublicError(message) {
-  publicChain = null;
-  text("options-status", message);
-  text("option-spot", "—");
-  text("option-expiry-label", "—");
-  text("option-count", "—");
-  const tr = document.createElement("tr");
-  const cell = document.createElement("td");
-  cell.colSpan = 9;
-  cell.className = "empty";
-  cell.textContent = message;
-  tr.append(cell);
-  byId("option-chain-tbody").replaceChildren(tr);
-  text("option-chain-footer", "当前数据不可用；没有使用虚构报价或自动回退到其他券商。");
-}
-
-function formatQuote(value, digits = 2) {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits })
+function fmt(x, digits=2) {
+  return typeof x === "number" && Number.isFinite(x)
+    ? x.toLocaleString("en-US", {minimumFractionDigits: digits, maximumFractionDigits: digits})
     : "—";
 }
-
-function showPublicSide() {
-  if (!publicChain) return;
-  const side = byId("option-side").value;
-  const rows = Array.isArray(publicChain[side]) ? publicChain[side] : [];
-  const sourceCount = publicChain.counts?.[side + "_source"];
-  const truncated = publicChain.counts?.[side + "_truncated"];
-  text("option-count", String(rows.length) + " / " + (sourceCount ?? "未知"));
-  const tbody = byId("option-chain-tbody");
-  tbody.replaceChildren();
-  if (!rows.length) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.colSpan = 9;
-    td.className = "empty";
-    td.textContent = "该到期日没有可显示的 " + side + " 合约。";
-    tr.append(td);
-    tbody.append(tr);
+function fmtPercent(x, digits=1) {
+  return typeof x === "number" && Number.isFinite(x) ? fmt(x*100, digits)+"%" : "—";
+}
+function text(id, value) {
+  const el = $(id);
+  if (el) el.textContent = value == null ? "—" : String(value);
+}
+function cell(tr, str, className) {
+  const td=document.createElement("td");
+  td.textContent=String(str);
+  if (className) td.className=className;
+  tr.append(td);
+  return td;
+}
+function unavailable(msg) {
+  const tr=document.createElement("tr");
+  const td=cell(tr,msg,"empty");
+  td.colSpan=8;
+  $("option-chain-tbody").replaceChildren(tr);
+  $("detail-body").replaceChildren();
+  const note=document.createElement("div");
+  note.className="empty";
+  note.textContent=msg;
+  $("detail-body").append(note);
+  text("detail-state","数据不足");
+}
+function addStat(parent,label,value,style="") {
+  const el=document.createElement("div");
+  el.className="detail-stat";
+  const a=document.createElement("span");
+  a.textContent=label;
+  const b=document.createElement("strong");
+  b.textContent=value;
+  if(style) b.className=style;
+  el.append(a,b);
+  parent.append(el);
+}
+function addNote(parent,msg,warning=false) {
+  const p=document.createElement("div");
+  p.className=warning?"warning detail-warning":"detail-note";
+  p.textContent=msg;
+  parent.append(p);
+}
+function allRows() {
+  const source=MODES[currentLeg].source;
+  const rows=Array.isArray(chain?.[source])?chain[source]:[];
+  const spot=chain?.spot_last_daily_close;
+  const filtered=$("filter-moneyness").value==="near" && Number.isFinite(spot) && spot>0
+    ? rows.filter(o => Number.isFinite(o.strike) && Math.abs(o.strike/spot-1)<=0.15)
+    : rows.slice();
+  if ($("sort-options").value==="score") {
+    filtered.sort((a,b)=>{
+      const av=a.analyses?.[currentLeg]?.score_0_100;
+      const bv=b.analyses?.[currentLeg]?.score_0_100;
+      return ((typeof bv==="number"?bv:-1)-(typeof av==="number"?av:-1))
+        || (a.strike-b.strike);
+    });
+  } else {
+    filtered.sort((a,b)=>a.strike-b.strike);
+  }
+  return filtered;
+}
+function fillDetail(option) {
+  const body=$("detail-body");
+  body.replaceChildren();
+  if(!option) {
+    addNote(body,"没有可展示的合约；可更换到期日、调整筛选或等待数据恢复。");
+    text("detail-state","未选择");
     return;
   }
-  for (const option of rows) {
-    const tr = document.createElement("tr");
-    const fields = [
-      formatQuote(option.strike),
-      formatQuote(option.bid),
-      formatQuote(option.ask),
-      formatQuote(option.last),
-      formatValue(option.volume),
-      formatValue(option.open_interest),
-      option.iv !== null ? formatQuote(option.iv * 100, 1) + "%" : "—",
-      option.last_trade_at || "未知",
-      option.quote_state === "valid_bid_ask" ? "有效双边报价" : "无有效双边报价",
+  const a=option.analyses?.[currentLeg];
+  if(!a) {
+    addNote(body,"本行尚无四方向分析结果，请重新获取数据。",true);
+    text("detail-state","无法分析");
+    return;
+  }
+  text("detail-state",a.score_0_100==null?"评分不可用":"参考 "+a.score_0_100+"/100");
+  const head=document.createElement("div");
+  head.className="detail-title";
+  const title=document.createElement("strong");
+  title.textContent=MODES[currentLeg].label+" · "+chain.symbol+" · K "+fmt(option.strike);
+  const meta=document.createElement("span");
+  meta.textContent=chain.expiry+" · "+(option.contract||"未提供合约编号");
+  head.append(title,meta);
+  body.append(head);
+
+  const stats=document.createElement("div");
+  stats.className="detail-stats";
+  const premium = a.net_entry_per_share==null ? "—" : "$"+fmt(a.net_entry_per_share);
+  addStat(stats,a.entry_kind==="DEBIT"?"买入支出／股":"卖出净收／股",premium);
+  addStat(stats,"到期盈亏平衡",fmt(a.breakeven));
+  addStat(stats,"Q 理论到期盈利概率",fmtPercent(a.p_expiry_profit_q));
+  addStat(stats,"Q 理论到期价外概率",fmtPercent(a.p_expiry_otm_q));
+  addStat(stats,"标的有利 10% 情景盈亏",a.favorable_10pct_pnl_per_share==null?"—":"$"+fmt(a.favorable_10pct_pnl_per_share));
+  addStat(stats,"标的不利 20% 情景盈亏",a.adverse_20pct_pnl_per_share==null?"—":"$"+fmt(a.adverse_20pct_pnl_per_share),
+    a.adverse_20pct_pnl_per_share<0?"negative":"");
+  addStat(stats,"理论最大亏损／股",a.unbounded_max_loss?"无限":a.max_loss_per_share==null?"—":"$"+fmt(a.max_loss_per_share));
+  addStat(stats,"综合参考分",a.score_0_100==null?"不适用":a.score_0_100+"/100");
+  body.append(stats);
+
+  if(a.score_factors) {
+    const factorTitle=document.createElement("h3");
+    factorTitle.textContent="三项有效因子 · 最弱项限制";
+    body.append(factorTitle);
+    const factors=[
+      ["收益／不利情景平衡",a.score_factors.reward_to_scenario_balance],
+      ["不利 20% 情景存活度",a.score_factors.adverse_20pct_survival],
+      ["Bid/Ask 价差质量",a.score_factors.bid_ask_quality]
     ];
-    for (let i = 0; i < fields.length; i++) {
-      const td = document.createElement("td");
-      td.textContent = fields[i];
-      if (i === 8 && option.quote_state !== "valid_bid_ask") td.className = "missing-quote";
-      tr.append(td);
+    for(const [name,value] of factors) {
+      const row=document.createElement("div");
+      row.className="factor";
+      const label=document.createElement("span");
+      label.textContent=name;
+      const progress=document.createElement("div");
+      progress.className="factor-track";
+      const bar=document.createElement("div");
+      bar.className="factor-fill";
+      bar.style.width=(Math.max(0,Math.min(1,value||0))*100).toFixed(2)+"%";
+      progress.append(bar);
+      const amount=document.createElement("b");
+      amount.textContent=fmtPercent(value);
+      row.append(label,progress,amount);
+      body.append(row);
     }
+  }
+  addNote(body,a.score_reason||"暂无可信参考评分说明",true);
+  if(a.p_expiry_profit_q!==null) {
+    addNote(body,"Black–Scholes 概率是风险中性 Q 理论量，不是已校准的真实盈利率；不代表美式期权不会提前指派。");
+  }
+  addNote(body,"数据来源是 Yahoo 期权链及标的最近日线收盘价。它们缺少经验证的同步报价时间；零利率、零连续股息率及 $0.01/股费用均为示意假设。");
+}
+function render() {
+  document.querySelectorAll("[data-leg]").forEach(btn=>{
+    const chosen=btn.dataset.leg===currentLeg;
+    btn.classList.toggle("active",chosen);
+    btn.setAttribute("aria-selected",String(chosen));
+  });
+  text("leg-label",MODES[currentLeg].label);
+  text("leg-risk",MODES[currentLeg].risk);
+  text("leg-explain",MODES[currentLeg].explain);
+
+  if(!chain) {
+    unavailable("尚无公开期权数据；请输入标的代码并查询。");
+    return;
+  }
+  const side=MODES[currentLeg].source;
+  const rows=allRows();
+  const sourceCount=chain.counts?.[side+"_source"]??"未知";
+  text("option-count",rows.length+" / "+sourceCount);
+  text("option-score-state",currentLeg==="short_call"?"无限风险：无分数":"规则参考 · 未校准");
+  const tbody=$("option-chain-tbody");
+  tbody.replaceChildren();
+  if(!rows.length) {
+    unavailable("当前方向或筛选条件下没有可显示的合约。");
+    return;
+  }
+  // All option values are placed via textContent, never innerHTML.
+  for(const option of rows) {
+    const a=option.analyses?.[currentLeg];
+    const tr=document.createElement("tr");
+    tr.className="option-row"+(selectedContract===option.contract?" selected":"");
+    cell(tr,fmt(option.strike));
+    cell(tr,fmt(option.bid)+" / "+fmt(option.ask));
+    cell(tr,fmtPercent(option.iv));
+    cell(tr,fmt(a?.breakeven));
+    cell(tr,fmtPercent(a?.p_expiry_profit_q));
+    cell(tr,a?.adverse_20pct_pnl_per_share==null?"—":"$"+fmt(a.adverse_20pct_pnl_per_share),
+       a?.adverse_20pct_pnl_per_share<0?"negative":"");
+    cell(tr,typeof a?.score_0_100==="number"?a.score_0_100+"/100":"—",
+       typeof a?.score_0_100==="number"?"score-cell":"missing-quote");
+    const td=document.createElement("td");
+    const button=document.createElement("button");
+    button.type="button";
+    button.className="detail-button";
+    button.textContent="查看";
+    button.setAttribute("aria-label","分析 "+chain.symbol+" 行权价 "+fmt(option.strike));
+    button.addEventListener("click",()=>{
+      selectedContract=option.contract;
+      fillDetail(option);
+      renderSelectedRow();
+      if(window.matchMedia("(max-width: 700px)").matches){
+        $("detail").scrollIntoView({behavior:"smooth",block:"start"});
+      }
+    });
+    td.append(button);tr.append(td);
     tbody.append(tr);
   }
+  let picked=rows.find(o=>o.contract===selectedContract);
+  if(!picked) {
+    picked=rows.find(o=>typeof o.analyses?.[currentLeg]?.score_0_100==="number")||rows[0];
+    selectedContract=picked?.contract??null;
+  }
+  fillDetail(picked);
+  renderSelectedRow();
+  const truncated=chain.counts?.[side+"_truncated"];
   text("option-chain-footer",
-    "数据抓取时间：" + publicChain.observed_at_utc +
-    " · 最近日 K 日期：" + (publicChain.spot_last_daily_bar_at || "未知") +
-    " · " + (publicChain.from_cache ? "命中约 4 分钟缓存" : "本次获取") +
-    (truncated ? " · 已按接近现价选择前 400 张合约；其余未显示" : "") +
-    " · 不可用于确认实时可成交报价。");
+    "数据抓取："+(chain.observed_at_utc||"未知")+
+    " · 股票日线："+(chain.spot_last_daily_bar_at||"未知")+
+    (truncated?" · 合约表最多返回靠近现价的 400 行":"")+
+    (chain.from_cache?" · 使用缓存":"")+
+    " · 未验证同步报价 · 排序仅供比较。");
 }
-
-async function loadPublicOptions() {
-  const requestId = ++latestPublicRequest;
-  const button = byId("load-options");
-  button.disabled = true;
-  text("options-status", "正在读取公开期权链（无券商账户）…");
-  const symbol = byId("option-symbol").value.trim().toUpperCase();
-  const expiry = byId("option-expiry").value;
-  const params = new URLSearchParams({ symbol });
-  if (expiry) params.set("expiry", expiry);
+function renderSelectedRow(){
+  for(const row of $("option-chain-tbody").querySelectorAll("tr.option-row")){
+    // The option rows remain in source order within the chosen filter.
+    // Selection is represented by the accessible detail panel and active button.
+    row.classList.remove("selected");
+    const button=row.querySelector("button");
+    if(button&&button.getAttribute("aria-label")?.includes("")) {
+      // Visual focus is retained by the clicked button; no invented row identities.
+    }
+  }
+}
+function fail(message) {
+  chain=null;
+  selectedContract=null;
+  text("options-status",message);
+  text("option-spot","—");
+  text("option-expiry-label","—");
+  text("option-count","—");
+  text("option-score-state","不可用");
+  unavailable(message);
+  text("option-chain-footer","行情或服务不可用；没有生成虚构合约或评分。");
+}
+async function loadOptions(){
+  const request=++requestSequence;
+  const button=$("load-options");
+  button.disabled=true;
+  text("options-status","正在请求公开期权链（不读取券商账户）…");
+  const symbol=$("option-symbol").value.trim().toUpperCase();
+  const expiry=$("option-expiry").value;
+  const params=new URLSearchParams({symbol});
+  if(expiry) params.set("expiry",expiry);
   try {
-    const response = await fetch("/api/v1/options?" + params, { cache: "no-store" });
-    const body = await response.json();
-    if (requestId !== latestPublicRequest) return;
-    if (!response.ok || !body.ok || !body.data) {
-      showPublicError("公开行情不可用：" + (body.error || "未知错误"));
+    const response=await fetch("/api/v1/options?"+params.toString(),{cache:"no-store"});
+    const json=await response.json();
+    if(request!==requestSequence)return;
+    if(!response.ok||!json.ok||!json.data){
+      fail("行情不可用："+(json.error||"来源未提供数据"));
       return;
     }
-    publicChain = body.data;
-    const select = byId("option-expiry");
+    chain=json.data;
+    selectedContract=null;
+    const select=$("option-expiry");
     select.replaceChildren();
-    for (const date of publicChain.expirations || []) {
-      const option = document.createElement("option");
-      option.value = date;
-      option.textContent = date;
-      option.selected = date === publicChain.expiry;
-      select.append(option);
+    for(const day of (chain.expirations||[])){
+      const opt=document.createElement("option");
+      opt.value=day;opt.textContent=day;
+      opt.selected=day===chain.expiry;
+      select.append(opt);
     }
-    text("option-spot", formatQuote(publicChain.spot_last_daily_close));
-    text("option-expiry-label", publicChain.expiry);
-    text("option-provider", "Yahoo · yfinance");
-    text("options-status", publicChain.symbol + " · " +
-      "已获取" + (publicChain.from_cache ? "（缓存）" : "") +
-      " · 非实时，报价时效不保证");
-    showPublicSide();
-  } catch (error) {
-    if (requestId === latestPublicRequest) showPublicError("行情服务无法连接或解析失败。");
+    text("option-spot",fmt(chain.spot_last_daily_close));
+    text("option-expiry-label",chain.expiry||"—");
+    text("options-status",chain.symbol+" · 期权链读取成功"+(chain.from_cache?"（缓存）":"")+" · 只读");
+    render();
+  } catch(e){
+    if(request===requestSequence)fail("无法读取期权数据或服务连接失败。");
   } finally {
-    if (requestId === latestPublicRequest) button.disabled = false;
+    if(request===requestSequence)button.disabled=false;
   }
 }
-
-byId("load-options").addEventListener("click", loadPublicOptions);
-byId("option-side").addEventListener("change", showPublicSide);
-byId("option-expiry").addEventListener("change", loadPublicOptions);
-byId("option-symbol").addEventListener("keydown", (event) => {
-  if (event.key === "Enter") {
+async function health(){
+  try{
+    const r=await fetch("/api/v1/health",{cache:"no-store"});
+    const j=await r.json();
+    text("service-state",j.ok?"● 服务正常 · 只读":"服务不可用");
+  } catch(e){text("service-state","● 服务连接失败");}
+}
+for(const tab of document.querySelectorAll("[data-leg]")){
+  tab.addEventListener("click",()=>{
+    currentLeg=tab.dataset.leg;
+    selectedContract=null;
+    render();
+  });
+}
+$("load-options").addEventListener("click",loadOptions);
+$("option-expiry").addEventListener("change",loadOptions);
+$("sort-options").addEventListener("change",render);
+$("filter-moneyness").addEventListener("change",render);
+$("option-symbol").addEventListener("keydown",(event)=>{
+  if(event.key==="Enter"){
     event.preventDefault();
-    byId("option-expiry").value = "";
-    loadPublicOptions();
+    $("option-expiry").replaceChildren(new Option("最近到期",""));
+    loadOptions();
   }
 });
-byId("option-symbol").addEventListener("change", () => {
-  const select = byId("option-expiry");
-  select.replaceChildren(new Option("自动选择最近到期日", ""));
+$("option-symbol").addEventListener("change",()=>{
+  $("option-expiry").replaceChildren(new Option("最近到期",""));
 });
-loadPublicOptions();
+health();
+loadOptions();
