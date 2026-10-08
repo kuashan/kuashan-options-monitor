@@ -137,6 +137,12 @@ class Handler(BaseHTTPRequestHandler):
             ]})
             return
         if parsed.path.startswith("/api/v1/"):
+            # Observation-only V1: do not read Futu account, SQLite ledger or snapshots.
+            self._json(403, {
+                "ok": False,
+                "error": "Account and ledger APIs are disabled in public observer mode",
+            })
+            return
             view = parsed.path.removeprefix("/api/v1/")
             try:
                 tool, payload = make_tool_request(view, parse_qs(parsed.query))
