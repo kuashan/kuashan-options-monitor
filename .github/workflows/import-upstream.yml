@@ -1,0 +1,27 @@
+name: Import upstream Git history
+on:
+  push:
+    paths:
+      - '.github/workflows/import-upstream.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch all upstream branches and tags
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git clone --mirror https://github.com/liuxie066/options-monitor.git upstream.git
+          cd upstream.git
+          git fsck --full --no-reflogs
+          git remote add backup https://x-access-token:${GH_TOKEN}@github.com/kuashan/kuashan-options-monitor.git
+          git push --force backup '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+          git ls-remote --heads --tags origin | sed '/\^{}$/d' | sort > /tmp/upstream-refs
+          git ls-remote --heads --tags backup | sed '/\^{}$/d' | sort > /tmp/backup-refs
+          diff -u /tmp/upstream-refs /tmp/backup-refs
+          echo "MIRROR_REFS_VERIFIED=PASS"
