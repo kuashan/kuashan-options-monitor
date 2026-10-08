@@ -53,19 +53,19 @@ def run() -> None:
         db = duckdb.connect(":memory:")
         # No data mutation or publication; DuckDB can scan Parquet in place.
         opt_schema = set(
-            db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(opt)]).df()["column_name"]
+            row[0] for row in db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(opt)]).fetchall()
         )
         missing = REQUIRED - opt_schema
         if missing:
             raise AssertionError(f"Missing required option columns: {sorted(missing)}")
         px_schema = set(
-            db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(px)]).df()["column_name"]
+            row[0] for row in db.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(px)]).fetchall()
         )
         missing_px = {"date", "close"} - px_schema
         if missing_px:
             raise AssertionError(f"Missing required underlying columns: {sorted(missing_px)}")
-        db.execute("CREATE VIEW o AS SELECT * FROM read_parquet(?)", [str(opt)])
-        db.execute("CREATE VIEW u AS SELECT * FROM read_parquet(?)", [str(px)])
+        db.execute(f"CREATE VIEW o AS SELECT * FROM read_parquet('{opt.as_posix()}')")
+        db.execute(f"CREATE VIEW u AS SELECT * FROM read_parquet('{px.as_posix()}')")
         summary = db.execute("""
             SELECT
                 COUNT(*) AS rows,
