@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import pytest
+
+from domain.domain.ledger import ContractKey, TradeEvent
+from domain.domain.trade_contract_identity import derive_trade_side
+from src.application.ledger.repository import SQLiteOptionPositionsRepository
+from src.application.ledger.writer import persist_trade_event_object
+from src.application.trades.auto_intake import (
+    _attach_combo_reconciliation_after_open,
+)
+from src.application.trades.combo_reconciliation import (
+    reconcile_account_post_trade_combos,
+    trade_combo_runtime_environment,
+)
+
+
+BASE_TIME_MS = 1_785_312_000_000
+
+
+@pytest.mark.parametrize("current_complete", [True, False])
+def test_auto_combo_uses_only_its_own_market_date_completeness(tmp_path, monkeypatch, current_complete):
+    from datetime import datetime, timezone
+    import src.application.trades.combo_reconciliation as module
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    for event in (*_open_events(), _event("old-call", "old-call-lot", option_type="call", side="long",
+            strike=120, event_time_ms=BASE_TIME_MS - 864000000)):
+        persist_trade_event_object(repo, event)
+    current_date = datetime.fromtimestamp(BASE_TIME_MS / 1000, timezone.utc).strftime("%Y-%m-%d")
+
+    def read(**kwargs):
+        current = kwargs["market_trading_date"] == current_date
+        return {"available": True, "complete": current_complete if current else not current_complete,
+                "delivery_available": True, "exposures": [_exposure()] if current else []}
+
+    monkeypatch.setattr(module, "read_combo_candidate_exposures", read)
+    result = module.reconcile_account_post_trade_combos(repo=repo, runtime_root=tmp_path, account="lx",
+        runtime_environment="opend:127.0.0.1:11111", mode="auto", effective_now_ms=BASE_TIME_MS + 3000)
+    assert any(row["complete"] is current_complete for row in result["evidence_reads"]
+               if row["market_date"] == current_date)
+    assert len(repo.list_strategy_group_identities(account="lx")) == 0
+
+
+
+
+def _exposure() -> dict:
+    return {
+        "candidate_exposure_id": "exposure-1", "candidate_occurrence_id": "occurrence-1",
+        "account": "lx", "market": "US", "currency": "USD", "multiplier": 100,
+        "put_contract_key": {"underlying_symbol": "NVDA", "option_type": "put", "expiration_ymd": "2026-08-21", "strike": 100},
+        "call_contract_key": {"underlying_symbol": "NVDA", "option_type": "call", "expiration_ymd": "2026-08-21", "strike": 110},
+        "generated_at_ms": BASE_TIME_MS, "valid_until_ms": BASE_TIME_MS + 10_000,
+        "delivery_confirmed": True,
+    }
+
+
+def _open_events() -> tuple[TradeEvent, TradeEvent]:
+    return (
+        _event("call-open", "call-lot", option_type="call", side="long", strike=110, event_time_ms=BASE_TIME_MS + 1_000),
+        _event("put-open", "put-lot", option_type="put", side="short", strike=100, event_time_ms=BASE_TIME_MS + 2_000),
+    )
+
+
+def _event(
+    event_id: str,
+    lot_id: str,
+    *,
+    option_type: str,
+    side: str,
+    strike: int,
+    event_time_ms: int,
+) -> TradeEvent:
+    return TradeEvent(
+        multiplier=100,
+        event_id=event_id,
+        event_type="open",
+        event_time_ms=event_time_ms,
+        contract_key=ContractKey.from_values(
+            broker="futu",
+            account="lx",
+            underlying_symbol="NVDA",
+            option_type=option_type,
+            strike=strike,
+            expiration_ymd="2026-08-21",
+                ),
+        contracts=1,
+        price=1,
+        currency="USD",
+        source="test",
+        lot_id=lot_id,
+        raw_payload={
+            "execution_input": {"broker_account_ref": {"broker_id": "futu", "external_account_id": "1001", "environment": "REAL", "account_label": "lx"}},
+            # §9.2 step 3: the contract key no longer carries the position side,
+            # so the fixture's side travels as the trade side of this open.
+            "side": derive_trade_side("open", side) or "",
+            "_trade_intake_source": {
+                "schema_version": "trade_intake_source.v1",
+                "transport": "push",
+                "source_id": "lx",
+                "account": "lx",
+                "futu_account_id": "1001",
+                "opend_process": "FutuOpenD",
+                "opend_host": "127.0.0.1",
+                "opend_port": 11111,
+                "received_at_utc": "2026-07-31T13:00:00+00:00",
+            }
+        },
+    )
+
+
+def test_account_reconciler_reads_frozen_exposure_and_auto_adopts_strict_match(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import src.application.trades.combo_reconciliation as module
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+    for event in _open_events():
+        persist_trade_event_object(repo, event)
+    reads: list[tuple[str, str]] = []
+
+    def _read_exposures(**kwargs):
+        reads.append((kwargs["market"], kwargs["market_trading_date"]))
+        return {"available": True, "complete": True, "delivery_available": True, "reason": "ok", "exposures": [_exposure()]}
+
+    monkeypatch.setattr(module, "read_combo_candidate_exposures", _read_exposures)
+    result = reconcile_account_post_trade_combos(
+        repo=repo,
+        runtime_root=tmp_path,
+        account="lx",
+        runtime_environment="opend:127.0.0.1:11111",
+        mode="observe",
+        effective_now_ms=BASE_TIME_MS + 3_000,
+    )
+
+    assert reads and reads[0][0] == "US"
+    assert result["proposal_ready_count"] == 1
+    assert result["inferences"][0]["evidence_grade"] == "exact_delivered_candidate"
+    assert repo.list_combo_pair_inferences(account="lx")[0]["status"] == "proposal_ready"
+    assert len(repo.list_trade_events()) == 2
+    assert all(
+        not item["fields"].get("strategy_group_id")
+        for item in repo.list_position_lots()
+    )
+
+    auto_result = reconcile_account_post_trade_combos(
+        repo=repo,
+        runtime_root=tmp_path,
+        account="lx",
+        runtime_environment="opend:127.0.0.1:11111",
+        mode="auto",
+        effective_now_ms=BASE_TIME_MS + 4_000,
+    )
+
+    assert auto_result["proposal_ready_count"] == 1
+    assert len(repo.list_strategy_group_identities(account="lx")) == 0
+    assert not hasattr(module, "adopt_post_trade_combo_pair")
+
+
+def test_off_mode_does_not_touch_the_repository(tmp_path) -> None:
+    result = reconcile_account_post_trade_combos(
+        repo=object(),
+        runtime_root=tmp_path,
+        account="lx",
+        runtime_environment="opend:127.0.0.1:11111",
+        mode="off",
+    )
+    assert result["status"] == "off"
+    assert result["persisted"] is False
+
+
+def test_post_commit_failure_is_diagnostic_only_and_preserves_receipt() -> None:
+    receipt = {"status": "confirmed", "delivery_key": "receipt-1"}
+    result = {
+        "status": "applied",
+        "action": "open",
+        "account": "lx",
+        "receipt": receipt,
+    }
+
+    def _fail() -> dict:
+        raise RuntimeError("injected reconcile failure")
+
+    returned = _attach_combo_reconciliation_after_open(
+        result,
+        apply_changes=True,
+        mode="observe",
+        reconcile_fn=_fail,
+    )
+
+    assert returned is result
+    assert returned["status"] == "applied"
+    assert returned["receipt"] is receipt
+    assert returned["combo_reconciliation"]["status"] == "failed"
+    assert "injected reconcile failure" in returned["combo_reconciliation"]["error"]
+
+
+def test_runtime_environment_is_stable_per_opend_endpoint() -> None:
+    assert (
+        trade_combo_runtime_environment(host="127.0.0.1", port=11111)
+        == "opend:127.0.0.1:11111"
+    )
+
+
+@pytest.mark.parametrize("evidence", [
+    {"available": True, "complete": True, "delivery_available": True, "reason": "partial", "invalid_revisions": [99]},
+    {"available": True, "complete": True, "delivery_available": True, "reason": "ok", "invalid_revisions": [99]},
+    {"available": False, "reason": "unavailable"},
+])
+def test_incomplete_exposure_never_auto_adopts(tmp_path, monkeypatch, evidence):
+    import src.application.trades.combo_reconciliation as module
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    for event in _open_events():
+        persist_trade_event_object(repo, event)
+    monkeypatch.setattr(module, "read_combo_candidate_exposures", lambda **kw: {**evidence, "exposures": [_exposure()]})
+    result = module.reconcile_account_post_trade_combos(
+        repo=repo, runtime_root=tmp_path, account="lx", runtime_environment="opend:127.0.0.1:11111",
+        mode="auto", effective_now_ms=BASE_TIME_MS + 3_000,
+    )
+    assert len(repo.list_strategy_group_identities(account="lx")) == 0
+    assert len(repo.list_trade_events()) == 2
+    assert repo.list_strategy_group_identities(account="lx") == []

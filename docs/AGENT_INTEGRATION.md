@@ -1,0 +1,408 @@
+# Tool Gateway Integration
+
+The public Tool Gateway launcher is `./om-agent`.
+
+`./om-agent` is a structured local tool-call entrypoint for external agents,
+scripts, Codex, or operators. It is not OM's autonomous/project
+Agent, and it should not own multi-step planning or message conversation
+state. Current entry and layer terminology is defined in
+[ARCHITECTURE.md](ARCHITECTURE.md); channel message handling is defined in
+[INBOUND_CONTROL.md](INBOUND_CONTROL.md).
+
+It exposes a stable JSON contract intended for local machine usage:
+
+- `./om-agent add-account --market us|hk --account-label <label> --account-type futu --dry-run`
+- `./om-agent spec`
+- `./om-agent run --tool <name> --input-json '<json>'`
+
+Capability boundaries, risk classes, Inbound Bot exposure, and
+verification rules are maintained in
+[OM_AGENT_CAPABILITY_MAP.md](OM_AGENT_CAPABILITY_MAP.md).
+This document only describes integration contracts and invocation patterns.
+
+也支持：
+
+- `./om-agent run --tool <name> --input-file payload.json`
+
+其中 `--input-file` 会覆盖 `--input-json`。
+
+Implementation ownership:
+- Tool implementation source of truth: `src/application/agent_tools/<domain>.py`
+- Tool manifest collector: `src/application/agent_tool_registry.py`
+- Tool write permission gate: `src/application/agent_tools/permissions.py`
+- Tool response contract: `src/application/agent_tool_contracts.py`
+- Runtime config helpers: `src/application/agent_tool_config.py`
+- Runtime config initialization/account mutation helpers: `src/application/config_yaml_init.py`, `src/application/config_yaml_accounts.py`
+- Public CLI owner: `src/interfaces/agent/cli.py`
+- Runtime tick is not a separate single-account / multi-account split. The live chain is `./om run tick` -> `src.application.multi_account_tick.run_tick`; pass one account for single-account execution or multiple accounts for multi-account execution.
+
+## Contract
+
+All tool responses return:
+
+```json
+{
+  "schema_version": "1.0",
+  "tool_name": "healthcheck",
+  "ok": true,
+  "data": {},
+  "warnings": [],
+  "error": null,
+  "meta": {}
+}
+```
+
+Errors are normalized to stable codes such as:
+
+- `CONFIG_ERROR`
+- `INPUT_ERROR`
+- `DEPENDENCY_MISSING`
+- `PERMISSION_DENIED`
+- `CONFIRMATION_REQUIRED`
+- `INTERNAL_ERROR`
+
+说明：
+- 这些是顶层错误 envelope 的稳定代码。
+- 某些底层诊断项（例如 OpenD readiness probe 的细粒度失败原因）可能会体现在 `checks[]` 中，而不是顶层错误 code 枚举中。
+
+## Project reference and run evidence tools
+
+The canonical `project` toolset provides `project_context` (configuration/account
+and resource navigation) and `project_files` (list, literal search and paged read).
+The Bot Scene exposes both through the existing catalog; no shell, SQL, code
+execution or source-editing tool is added.
+
+For `resource=project`, `list` returns only the requested directory's immediate
+allowed children, with `kind=file|directory`. Directory names have no trailing
+slash and can be used directly for another `list` or `search`; only files can be
+read. An empty `relative_name` means the project root. Root list/search visit
+`src`, `domain`, `agent-runtime`, `docs`, `configs`, then allowed root Markdown
+files, retaining only existing allowed resources. `configs` permits only the
+existing example configuration path. Search remains recursive, case-sensitive
+literal matching with the first match per file. An explicit directory confines
+search to that subtree; a file path searches only that file, without listing siblings.
+Each match includes up to eight lines on each side, bounded to 1800 characters and
+always retaining the match, plus inclusive `context_start_line`/`context_end_line`.
+Use `read` with that file and start line for further implementation context.
+Long lines still start reading at the line beginning and continue by cursor. Documents remain reachable by continuation or explicit
+`relative_name=docs`. List coverage describes one layer, not its descendants.
+Each page has at most 40 entries; the existing 2,000-byte entries soft stop can
+end it earlier with continuation. Partial search is not project-wide absence.
+Project list/search cursors bind the traversal version and reject older traversal
+semantics. Page revisions bind stable returned evidence, including matching file
+hashes, rather than cursor signatures or timestamps. Project reads keep the default
+80/max 200 lines and 9000-byte output ceiling, reserving room for Bot/Host metadata;
+continuous text pages are no longer independently cut at 4000 characters. Other
+resources keep their existing paging behavior. Ordinary file/directory mismatches
+return `INPUT_ERROR` with `not_directory` or `is_directory` and a corrective hint;
+links and excluded resources remain `PERMISSION_DENIED`. Missing resources remain
+`READ_ERROR`, while no search match is a successful result with explicit coverage.
+
+```bash
+./om-agent run --tool project_context --input-json '{"config_key":"us"}'
+./om-agent run --tool project_files --input-json '{"action":"search","query":"wheel","relative_name":"src"}'
+./om-agent run --tool project_files --input-json '{"action":"read","relative_name":"docs/ARCHITECTURE.md","start_line":1,"max_lines":80}'
+./om-agent run --tool project_files --input-json '{"resource":"run","action":"list","config_key":"us","account":"lx"}'
+```
+
+Roots come from trusted project/runtime resolvers; the Bot cannot supply paths
+or roots. Runtime reading rejects the development `repo_default` root. Project
+reading permits approved documentation/source categories; runtime reading permits
+only account/market-bound candidate owner snapshots and status indexes validated
+against their formal manifest. Manifest/config/dependency bytes used internally
+for validation are not exposed as generic readable resources. Existing candidate,
+Daily Brief and receipt tools remain the preferred structured evidence owners.
+
+All filesystem reading is bounded and descriptor-based, without following links.
+A whole UTF-8 file must fit 1 MiB before redaction and paging; a bundle/search has
+an 8 MiB body budget. Directories over 10,000 entries require narrower scope.
+`value.next_cursor` is signed and binds query, source identity and configured
+scope; continue with the same filters and omit `start_line`. Source changes reject
+continuation. Missing signing capability returns `continuation_status` rather
+than an unusable cursor. `body_range` preserves source line numbering, with
+character offsets into redacted text; a returned page is not full-file coverage.
+
+Source snippets support `reference_fact` only, never current account facts.
+Historical run bodies retain account/run/time/hash provenance. Host-generated
+navigation and query-failure acknowledgements support exact `tool_status` claims
+only; the original failed observation stays failed. Status-only answers remain
+insufficient evidence, and do not complete an unfinished business investigation.
+Explicit Bot account inputs are checked against the configured account set before
+execution; aggregate tools without an account retain their existing defaults.
+
+## Bot evidence projection and Wheel activation
+
+For “Wheel 有没有正常激活？”, use the existing read-only status tool:
+
+```bash
+./om-agent run --tool runtime_status --input-json '{"config_key":"us","accounts":["lx"],"view":"wheel_activation"}'
+```
+
+`view` defaults to `summary`. The `wheel_activation` view compares the selected
+accounts' runtime configuration with durable activation windows, returning the
+market, account identities, monitoring gate, new-lifecycle eligibility and reason
+codes. Its `freshness.as_of` is the activation read time; unavailable storage
+remains `unknown`. The summary view retains scan-artifact freshness. Activation
+evidence does not establish that a scan ran, candidates exist or trades occurred.
+
+Bot `model_value_fields` explicitly selects result paths. Selected values retain
+JSON structure, empty values and all rows until the complete redacted observation
+is checked against the 4,000-token budget. Field count and nesting depth do not
+alone make evidence incomplete. Results with upstream truncation markers or an
+oversized observation still require narrowing, and cannot support complete claims.
+The Host rechecks the budget after attaching evidence metadata. Filtering is an
+option only where the tool actually supports it; identical retries do not repair
+an output limitation.
+
+## Claude Code
+
+Use the launcher as a local command tool. Typical pattern:
+
+```bash
+./om-agent spec
+./om-agent run --tool version_check --input-json '{"remote_name":"origin"}'
+./om-agent run --tool version_update --input-json '{"bump":"patch"}'
+./om-agent run --tool config_validate --input-json '{"config_key":"us"}'
+./om-agent run --tool runtime_status --input-json '{"config_key":"us"}'
+./om-agent run --tool healthcheck --input-json '{"config_key":"us"}'
+./om-agent run --tool scheduler_status --input-json '{"config_key":"us","account":"lx"}'
+./om-agent run --tool query_cash_headroom --input-json '{"config_key":"us","account":"lx"}'
+./om-agent run --tool query_cash_headroom --input-json '{"config_key":"us","account":"sy"}'
+./om-agent run --tool candidate_rank_explain --input-json '{"mode":"put","top_n":5}'
+./om-agent run --tool option_performance_report --input-json '{"config_key":"us","account":"lx","period":"mtd"}'
+./om-agent run --tool option_positions_read --input-json '{"config_key":"us","action":"list","account":"lx","status":"open"}'
+./om-agent run --tool close_advice_read --input-json '{"config_key":"us","query":{"option_type":"put","side":"short"}}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_query --input-json '{"view":"overview","accounts":["lx","sy"]}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_pnl_bridge --input-json '{"period":"mtd","as_of_month":"2026-07","accounts":["lx","sy"]}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_cash_bridge --input-json '{"period":"mtd","as_of_month":"2026-07","accounts":["lx","sy"]}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_assignment_scenario --input-json '{"accounts":["lx","sy"]}'
+```
+
+`portfolio_query` 是同机 portfolio-management 的纯读适配器。它只发送 GET，
+默认连接 `http://127.0.0.1:8765`，并拒绝非 loopback 的
+`PORTFOLIO_SERVICE_URL`。模型 payload 不能提供 URL/endpoint；支持的 view 为
+`health|accounts|overview|holdings|cash|nav|distribution|full_report`。服务返回的
+业务字段保留在结果顶层，并补充 `source`、`scope`、`freshness`。portfolio-management
+返回 `success=false`、HTTP 错误、无效 JSON 或超时时，工具返回标准失败 envelope。
+
+`portfolio_pnl_bridge` 和 `portfolio_cash_bridge` 的路由仍保留，但期权收益模块不再
+提供 PnL 或包含指派正股现金的组合现金事实。因此两者分别返回
+`authoritative_option_pnl_source_unavailable` 和
+`combined_option_assignment_cash_source_required`，不会从期权净现金流推导替代值。
+
+`portfolio_assignment_scenario` 只接受 `accounts`。它从富途 OpenD 取得股票、现金
+（含 MMF）和股票现价，富途余额及报价估值共用同次 OM 市场汇率观测；仅当
+`portfolio.holdings.enabled=true` 时补充 PM Holdings 中明确为非富途来源的资产，
+排除 PM 的富途股票、现金和 MMF 副本。OM canonical SQLite `position_lots` 提供
+open short put/call。输出固定为 CNY 资金覆盖，Long Option 不进入输入或输出。费用复用统一股票费用计算器；
+缺少指派费用规则时净现金与净分布保持 `null/partial`。该工具不写 assignment、
+持仓、报告或通知状态。Holdings 关闭时不读取 PM；开启时 PM 只提供非富途资产，
+并要求 `holdings_scope=non_futu` 回显与按账户批准的 broker 原文清单；缺失、新值或
+旧版响应时保留富途基线并标 partial。非富途现金不计入富途期权资金覆盖。
+
+Cash-Secured Put (CSP) 现金余量的标准 Tool Gateway 工具是 `query_cash_headroom`。它包装
+`src.application.cash_headroom_query` 里的 `query_sell_put_cash(...)`，用于返回账户现金、
+CSP 担保占用和剩余可用现金，并支持按账户和币种折算到 CNY。该工具是纯读入口，
+不会为了查询而写本地 cache。
+
+如果 payload 很长，优先用：
+
+```bash
+./om-agent run --tool close_advice_read --input-file payload.json
+```
+
+## Kimi Code
+
+Use the same launcher contract. Kimi Code only needs a local command invocation and JSON parsing.
+
+## Codex
+
+Use the same launcher contract as Claude Code. For first-pass troubleshooting, prefer:
+
+```bash
+./om-agent run --tool runtime_status --input-json '{"config_key":"us"}'
+./om-agent run --tool healthcheck --input-json '{"config_key":"us"}'
+```
+
+For MacBook-side Codex diagnosis of online quality or candidate-scan behavior,
+use the independent Research side lane instead of `om-agent` and instead of
+calling an online AI provider:
+
+```bash
+./om research collect --config-key us --scope full --output both --no-write-outputs
+./om research archive inventory --remote prod
+./om research archive pull --remote prod --ssh-target <host>
+./om research archive verify --remote prod
+```
+
+Research remains an offline evidence side lane. `collect` can render a redacted
+handoff; archive inventory, pull, and verify preserve remote run evidence for local
+inspection. This workflow must not call online AI providers, mutate runtime config,
+write trade state, or send notifications. Archive pull is a dry run unless
+`--write` is supplied.
+
+## Inbound Remote Messages
+
+Human-facing names are `om bot` and `om channel feishu`. Legacy `assistant` / `inbound` aliases remain compatible; internal configuration keys are unchanged.
+
+Use `./om bot handle` when a remote messaging gateway needs to send user text into OM:
+
+```bash
+./om bot handle --text '/positions sy' --sender ou_xxx --channel feishu --message-id msg_xxx
+```
+
+This is a controlled Inbound Bot message entrypoint, not an `./om-agent`
+tool and not a shell bridge. It performs sender allowlist checks, message
+idempotency, and SQLite audit. Explicit commands and pending-operation replies
+enter deterministic Control; every other message enters the single read-first
+`om_chat` Bot Scene when `bot.enabled` is true. Bot gets
+canonical pure-read tools selected by its scene. Portfolio queries follow
+`portfolio_management.enabled`; no extra Bot toolset switch is required. Bot may request one validated deterministic Control
+preview; it cannot confirm, cancel, apply, or receive direct notification,
+config-write, ledger/trade, broker-write, service-control, or upgrade tools.
+
+The Host persists structured conversation memory, durable runs, cancellation,
+durable run events, cancellation, and an idempotent reply outbox.
+These are Host governance mechanisms, not additional business-routing layers.
+
+Remote channels require:
+
+```bash
+OM_FEISHU_BOT_USER_OPEN_ID='ou_xxx'
+OM_FEISHU_BOT_ALLOWED_OPEN_IDS='ou_xxx'
+```
+
+The remote capability surface is intentionally smaller than the full
+`om-agent` manifest. Inspect it with `./om bot capabilities --format json`
+and keep boundary decisions in [OM_AGENT_CAPABILITY_MAP.md](OM_AGENT_CAPABILITY_MAP.md).
+Do not connect Feishu, WeChat, or Hermes to arbitrary shell execution. Gateways
+should call only `./om bot handle`. See [INBOUND_CONTROL.md](INBOUND_CONTROL.md).
+
+For Feishu event JSON specifically, use the thin adapter:
+
+```bash
+OM_FEISHU_BOT_ALLOWED_OPEN_IDS='ou_xxx' \
+./om channel feishu event --input-file feishu_event.json --format text
+```
+
+It extracts `im.message.receive_v1` text fields and then delegates to the same Inbound control path.
+
+For the full Feishu loop, run the long-connection service:
+
+```bash
+./om channel feishu serve --check
+./om channel feishu serve --config-key us --config-path /var/lib/options-monitor/config.us.json --lock-path /var/lib/options-monitor/locks/feishu-ws.lock
+```
+
+The long-connection client receives Feishu events through the authenticated SDK connection, delegates text messages to Inbound control, and replies through the Feishu message reply API. Successful Bot replies and deterministic replies that contain rich Markdown are rendered as display-only Feishu Card JSON 2.0 Markdown so tables remain readable; short plain Control replies and errors stay as text. The reply outbox persists the final transport envelope before delivery, retries that exact envelope with a stable UUID, and remains compatible with legacy text rows. New envelopes also retain a top-level flattened `text` copy so a code rollback can drain pending rows through the legacy sender. A confirmed permanent card rejection may use the envelope's flattened text fallback; ambiguous or transient failures retry the original card.
+
+Scheduled Daily Brief delivery independently uses a frozen Card JSON 2.0
+envelope derived from its canonical decision view. A post fallback is allowed
+only for a definite permanent Card rejection with no earlier transient or
+ambiguous attempt; it uses a distinct fallback UUID. Provider business
+rejections are definite failures, while timeouts and other ambiguous outcomes
+remain unresolved and cannot advance the Daily Brief delivery pointer.
+
+When `inbound.feishu_ws.ack_reaction` is configured, an independent bounded ACK lane adds the Reaction after the allowlisted text event has entered the business queue; the Reaction is best-effort and does not mean that Control, Bot, a tool, or the final reply has completed. Unauthorized senders remain silent, and ACK failures or drops do not block business processing. Render it as a long-running service with `./om service render --include-feishu-ws ...`; no public callback URL or reverse proxy is required.
+
+`openclaw_readiness` has been retired. Use `healthcheck` for environment readiness and
+`runtime_status` for existing runtime artifacts.
+
+## Service Deployment
+
+Treat `./om-agent` as a local Tool Gateway command.
+
+Recommended environment:
+
+- keep repo-local `config.us.json` / `config.hk.json` as generated runtime snapshots
+- complete first-time initialization with `./om setup init` interactively, or supply `--market`, matching `--us-symbol` / `--hk-symbol`, and each symbol's `--symbol-strategy` with required CSP/CC strike bounds to `./om config init`
+- use explicit `config_path` input only when you intentionally want to override the default repo-local config
+- keep `OM_AGENT_ENABLE_WRITE_TOOLS` unset unless you explicitly want a Tool Gateway business/config write
+- use `$RUNTIME/service.profile.json` from `./om service render` when production paths are not repo-local
+- keep portfolio-management API on the same host and loopback; enable its `portfolio-management-api.service` explicitly
+
+Recommended first commands:
+
+```bash
+./om-agent run --tool healthcheck --input-json '{"config_key":"us"}'
+./om-agent run --tool runtime_status --input-json '{"config_key":"us"}'
+```
+
+Use `runtime_status` when you only want to inspect existing runtime files. It does not run a pipeline, send
+notifications, or write state. It summarizes:
+
+- `output_shared/state/last_run.json`
+- `output_accounts/<account>/state/last_run.json`
+- the latest `output_runs/<run_id>` pointer when available
+- historical or explicit manual-stage compatibility notification artifacts and their `compatibility_only` authority
+- freshness and per-account summary fields
+
+普通 scan / Tick 不再生成 `symbols_alerts.txt`、`symbols_changes.txt` 或
+`symbols_notification.txt`，其通知正文权威是持久化 Daily Brief。`runtime_status`
+仍可诊断历史文件或显式 `--stage-only alert|notify` 生成的兼容 artifact；它们不能证明
+当前运行生成了 Daily Brief，更不能作为通知已投递的证据。
+
+If the production layout uses non-default paths, pass them explicitly:
+
+```bash
+./om-agent run --tool runtime_status --input-json '{
+  "profile_path": "/var/lib/options-monitor/service.profile.json"
+}'
+```
+
+Default service safety posture:
+
+- Prefer `healthcheck` or `runtime_status` before any runtime command.
+- Do not run `./om run tick` or notification send commands unless the user explicitly asks for a live run.
+- 先看 `spec` 中每个工具的 `risk_level`、`side_effects`、`requires_confirm` 和 `requires_env`。
+- 纯读工具不写状态；`read_only=true` 且 `risk_level=local_write` 的 materialization 工具可能写本地 cache/report，但不写业务状态或远端。
+- 真正被工具定义判定为 write request 的调用需要 `OM_AGENT_ENABLE_WRITE_TOOLS=true`；只有 `requires_confirm=true` 的工具还要求 `confirm=true` 或 `yes=true`。
+- `add-account` / `edit-account` / `remove-account` are write-capable commands; use `--dry-run`
+  first, then rerun with `OM_AGENT_ENABLE_WRITE_TOOLS=true` and `--confirm` only when the config write is intended.
+
+## `spec` 的行为说明
+
+`./om-agent spec` 输出的是当前环境下的 tool manifest。
+
+工具定义里的 `risk_level`、`requires_confirm`、`requires_env` 和
+`safe_default_input` 是代码声明，不会因为环境变量而改写。环境只会改变
+`defaults.write_tools_enabled`，用于说明当前进程是否打开 Tool Gateway 写门禁。
+
+调用方应先读取 `safe_default_input`，不要假设所有工具都要求显式选择市场。例如
+`option_performance_report` 当前有安全默认 `config_key=us`，而大多数 runtime
+诊断仍需要显式传 `config_key: us|hk` 或 `config_path`。
+
+如果你打开了：
+
+```bash
+OM_AGENT_ENABLE_WRITE_TOOLS=true
+```
+
+那么 `spec` 里的默认能力描述也会随之变化。
+
+## 写操作门禁
+
+写权限由工具元数据和 payload 共同决定，不是按工具名硬编码。
+
+门禁入口在 `src/application/tool_execution.py`，但“这个 payload 是否请求写入”
+由 `src/application/agent_tools/<domain>.py` 的工具定义/写入策略决定，并由
+`src/application/agent_tools/permissions.py` 统一执行 env/confirm 门禁。执行层不再按
+具体工具名维护特殊分支。
+
+当且仅当工具定义把当前 payload 判定为 write request 时，环境开关才是必需的：
+
+1. 环境变量允许写：
+
+```bash
+OM_AGENT_ENABLE_WRITE_TOOLS=true
+```
+
+如果该工具同时声明 `requires_confirm=true`，调用 payload 还要显式确认
+（例如 `confirm=true` 或 `yes=true`）。
+
+以 `manage_symbols` 为例：
+
+- `list` 永远允许
+- 真正写入需要环境变量；该工具声明需要确认时还要显式确认
+
+OpenClaw cron/readiness/profile workflows are retired from the public plugin contract.

@@ -1,0 +1,1206 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, cast
+
+from src.application.secret_store import (
+    INBOUND_OPERATION_HMAC_KEY,
+    SecretError,
+    resolve_secret,
+)
+
+from src.application.account_config import resolve_configured_accounts
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.ledger.api import (
+    TradeEventPaginationError,
+    assigned_stock_event_log,
+    ledger_store_payload,
+    trade_event_page,
+)
+from src.application.positions.assigned_stock_view import build_assigned_stock_view
+from src.application.trade_time_format import add_trade_time_beijing
+from src.application.payload_helpers import as_dict as _dict
+from src.application.runtime_config_freshness import infer_runtime_config_market
+from src.application.wheel.read_model import build_wheel_read_model
+
+
+_TRADE_EVENT_CURSOR_KEY_DOMAIN = b"options-monitor/bot/trade-event-cursor/v1"
+
+
+def _derive_trade_event_cursor_key(master_key: str) -> str:
+    return hmac.new(
+        master_key.encode("utf-8"),
+        _TRADE_EVENT_CURSOR_KEY_DOMAIN,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _as_int(value: Any, *, default: int, minimum: int = 1, maximum: int = 500) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        out = int(default)
+    return max(int(minimum), min(int(maximum), out))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except Exception as exc:
+        raise AgentToolError(code="INPUT_ERROR", message=f"expected integer value, got: {value}") from exc
+
+
+def _optional_float(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except Exception as exc:
+        raise AgentToolError(code="INPUT_ERROR", message=f"expected numeric value, got: {value}") from exc
+
+
+def _scalar_text(value: Any, *, default: str = "") -> str:
+    if isinstance(value, (list, tuple, set)):
+        items = [item for item in value if item not in (None, "")]
+        if len(items) == 1:
+            value = items[0]
+        elif not items:
+            value = default
+    if value is None:
+        value = default
+    text = str(value).strip()
+    if not text and default:
+        return str(default).strip()
+    return text
+
+
+def _optional_text(value: Any) -> str | None:
+    text = _scalar_text(value)
+    return text or None
+
+
+def normalize_option_positions_read_input(
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the public action rules before defaults or quality checks."""
+
+    normalized = dict(payload)
+    events_only_fields = {"cursor", "include_total", "position_effect"}
+    has_events_only_input = any(name in normalized for name in events_only_fields)
+    explicit_action = _scalar_text(normalized.get("action")).lower()
+    if has_events_only_input:
+        if explicit_action and explicit_action != "events":
+            raise ValueError(
+                "cursor, include_total, and position_effect require action=events"
+            )
+        normalized["action"] = "events"
+        explicit_action = "events"
+    if explicit_action == "events":
+        allowed_fields = {
+            "config_key",
+            "config_path",
+            "data_config",
+            "action",
+            "broker",
+            "account",
+            "limit",
+            "cursor",
+            "include_total",
+            "position_effect",
+            "symbol",
+            "option_type",
+            "strike",
+            "exp",
+            "expiration_ymd",
+        }
+        unsupported = sorted(set(normalized) - allowed_fields)
+        if unsupported:
+            raise ValueError(
+                "unsupported fields for action=events: " + ", ".join(unsupported)
+            )
+    if explicit_action == "events" and "limit" in normalized:
+        limit = normalized["limit"]
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise ValueError("单次最多查询 20 条交易事件，请将数量设为 1 到 20。")
+    return normalized
+
+
+def _bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _optional_path(value: Any) -> Path | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return Path(text).expanduser()
+
+
+def _quote_snapshot_rows(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [dict(item) for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        rows: list[dict[str, Any]] = []
+        for key, item in value.items():
+            if isinstance(item, dict):
+                row = dict(item)
+                row.setdefault("symbol", key)
+                rows.append(row)
+            else:
+                rows.append({"symbol": key, "spot": item})
+        return rows
+    return []
+
+
+def _assigned_stock_row_matches(
+    row: dict[str, Any],
+    *,
+    symbol: str | None,
+    lot_id: str | None,
+    status: str | None,
+) -> bool:
+    if symbol and str(row.get("symbol") or "").strip().upper() != symbol:
+        return False
+    if lot_id and str(row.get("stock_lot_id") or "") != lot_id:
+        return False
+    if status:
+        row_status = str(row.get("status") or "").strip().lower()
+        if status == "open":
+            try:
+                shares_remaining = float(row.get("shares_remaining"))
+            except Exception:
+                shares_remaining = None
+            if shares_remaining is not None:
+                return shares_remaining > 0
+            return row_status in {"open", "partially_sold"}
+        if row_status != status:
+            return False
+    return True
+
+
+def _resolve_local_path(value: Any, *, base: Path, default: Path) -> Path:
+    if value in (None, ""):
+        return default.resolve()
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    return path
+
+
+def version_check_tool(
+    payload: dict[str, Any],
+    *,
+    check_version_update: Callable[..., dict[str, Any]],
+    repo_base: Callable[[], Path],
+    mask_path: Callable[[Any], str],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    remote_name = str(payload.get("remote_name") or "origin").strip() or "origin"
+    result = check_version_update(base_dir=repo_base(), remote_name=remote_name)
+    warnings: list[str] = []
+    if not bool(result.get("ok", True)):
+        message = str(result.get("message") or "version check failed").strip()
+        error = str(result.get("error") or "").strip()
+        warnings.append(f"{message}: {error}" if error else message)
+    return result, warnings, {"repo_base": mask_path(repo_base()), "remote_name": remote_name}
+
+
+def version_update_tool(
+    payload: dict[str, Any],
+    *,
+    update_local_version: Callable[..., dict[str, Any]],
+    repo_base: Callable[[], Path],
+    mask_path: Callable[[Any], str],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    if _optional_text(payload.get("version")):
+        raise AgentToolError(
+            code="INPUT_ERROR",
+            message="version_update.version has been removed; use target_version",
+        )
+    target_version = _optional_text(payload.get("target_version"))
+    bump = _optional_text(payload.get("bump"))
+    apply_mode = bool(payload.get("apply", False))
+    allow_downgrade = bool(payload.get("allow_downgrade", False))
+    try:
+        result = update_local_version(
+            base_dir=repo_base(),
+            target_version=target_version,
+            bump=bump,
+            apply=apply_mode,
+            allow_downgrade=allow_downgrade,
+            remote_name=_optional_text(payload.get("remote_name")) or "origin",
+            recommendation_digest=_optional_text(payload.get("recommendation_digest")),
+            expected_base_version=_optional_text(payload.get("expected_base_version")),
+            expected_target_version=_optional_text(payload.get("expected_target_version")),
+        )
+    except ValueError as exc:
+        raise AgentToolError(
+            code="INPUT_ERROR",
+            message=str(exc),
+            hint="Use a semver value like 1.2.3 or a bump value: major, minor, patch.",
+        ) from exc
+
+    data = dict(result)
+    version_path = data.get("version_path")
+    write = data.get("write")
+    if isinstance(write, dict) and write.get("version_path"):
+        write = dict(write)
+        write["version_path"] = mask_path(write.get("version_path"))
+        data["write"] = write
+        version_path = write["version_path"]
+    elif version_path:
+        data["version_path"] = mask_path(version_path)
+        version_path = data["version_path"]
+
+    warnings: list[str] = []
+    if str(bump or "").lower() == "auto":
+        from src.application.release_version_recommendation import recommendation_warnings
+
+        warnings.extend(recommendation_warnings(data))
+    elif not apply_mode and bool(data.get("would_change")):
+        warnings.append("dry-run only; pass apply=true to write VERSION")
+    return data, warnings, {
+        "repo_base": mask_path(repo_base()),
+        "version_path": version_path,
+        "remote_name": _optional_text(payload.get("remote_name")) or "origin" if str(bump or "").lower() == "auto" else None,
+    }
+
+
+def config_validate_tool(
+    payload: dict[str, Any],
+    *,
+    load_runtime_config: Callable[..., tuple[Path, dict[str, Any]]],
+    validate_runtime_config: Callable[..., list[str]],
+    accounts_from_config: Callable[[dict[str, Any]], list[str]],
+    resolve_watchlist_config: Callable[[dict[str, Any]], list[dict[str, Any]]],
+    mask_path: Callable[[Any], str],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    config_path, cfg = load_runtime_config(config_key=payload.get("config_key"), config_path=payload.get("config_path"))
+    warnings = validate_runtime_config(cfg, allow_empty_symbols=bool(payload.get("allow_empty_symbols", False)))
+    accounts = accounts_from_config(cfg)
+    symbols = resolve_watchlist_config(cfg)
+    data = {
+        "ok": True,
+        "config_path": mask_path(config_path),
+        "config_key": _optional_text(payload.get("config_key")),
+        "account_count": len(accounts),
+        "accounts": accounts,
+        "symbol_count": len(symbols),
+        "warnings": warnings,
+    }
+    return data, warnings, {"config_path": mask_path(config_path)}
+
+
+def scheduler_status_tool(
+    payload: dict[str, Any],
+    *,
+    load_runtime_config: Callable[..., tuple[Path, dict[str, Any]]],
+    read_state: Callable[[Path], dict[str, Any]],
+    decide: Callable[..., Any],
+    repo_base: Callable[[], Path],
+    resolve_runtime_root: Callable[..., Any],
+    validate_schedule_cfg: Callable[[Any, str], None],
+    select_state_filename: Callable[[list[str]], str],
+    select_schedule_key: Callable[[list[str], dict[str, Any]], str],
+    shared_state_path: Callable[[Path, str], Path],
+    parse_state_datetime: Callable[[Any], datetime | None],
+    mask_path: Callable[[Any], str],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    base = repo_base()
+    config_path, cfg = load_runtime_config(config_key=payload.get("config_key"), config_path=payload.get("config_path"))
+    market = infer_runtime_config_market(
+        config_key=payload.get("config_key"),
+        config_path=config_path,
+        config=cfg,
+    )
+    if market not in {"us", "hk"}:
+        raise AgentToolError(
+            code="CONFIG_ERROR",
+            message="scheduler market could not be inferred from runtime config",
+        )
+
+    scheduler_markets = [market.upper()]
+    state_filename = select_state_filename(scheduler_markets)
+    if payload.get("state") not in (None, ""):
+        state_path = _resolve_local_path(payload.get("state"), base=base, default=base)
+        state_selection = "explicit_state"
+    elif payload.get("state_dir") not in (None, ""):
+        state_dir = _resolve_local_path(payload.get("state_dir"), base=base, default=base)
+        state_path = (state_dir / state_filename).resolve()
+        state_selection = "explicit_state_dir"
+    else:
+        runtime_root = resolve_runtime_root(repo_root=base).runtime_root
+        state_path = shared_state_path(runtime_root, state_filename)
+        state_selection = "production_default"
+
+    explicit_schedule = payload.get("schedule_key") not in (None, "")
+    schedule_key = (
+        str(payload.get("schedule_key")).strip()
+        if explicit_schedule
+        else select_schedule_key(scheduler_markets, cfg)
+    )
+    if not schedule_key:
+        raise AgentToolError(
+            code="INPUT_ERROR",
+            message="schedule_key must not be empty",
+        )
+    if schedule_key not in cfg:
+        raise AgentToolError(
+            code="INPUT_ERROR" if explicit_schedule else "CONFIG_ERROR",
+            message=f"scheduler schedule key is missing: {schedule_key}",
+            details={"reason": "schedule_missing", "retryable": False,
+                     "hint": "Select an existing schedule key or correct the runtime configuration."},
+        )
+    schedule_cfg = cfg[schedule_key]
+    if not isinstance(schedule_cfg, dict) or (explicit_schedule and not schedule_cfg):
+        raise AgentToolError(
+            code="CONFIG_ERROR", message=f"scheduler schedule is invalid: {schedule_key}",
+            details={"reason": "schedule_invalid", "retryable": False,
+                     "hint": "Correct the selected schedule configuration before querying again."},
+        )
+    try:
+        validate_schedule_cfg(schedule_cfg, schedule_key)
+    except SystemExit as exc:
+        raise AgentToolError(
+            code="CONFIG_ERROR", message=f"scheduler schedule is invalid: {schedule_key}",
+            details={"reason": "schedule_invalid", "retryable": False,
+                     "hint": "Correct the selected schedule configuration before querying again."},
+        ) from exc
+    schedule_status = "available"
+    schedule_enabled = (
+        bool(schedule_cfg.get("enabled", True))
+        if schedule_cfg is not None
+        else None
+    )
+
+    state_data, state_status = _read_scheduler_state_snapshot(
+        state_path,
+        read_state=read_state,
+        parse_datetime=parse_state_datetime,
+    )
+
+    account = _optional_text(payload.get("account"))
+    if account is not None:
+        try:
+            account = resolve_configured_accounts(cfg, [account])[0]
+        except ValueError as exc:
+            raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+    force = bool(payload.get("force", False))
+    now_utc = datetime.now(timezone.utc)
+    decision_mode = "force_simulation" if force else "current_state"
+    decision_payload: dict[str, Any]
+    if schedule_cfg is not None and state_data is not None:
+        try:
+            decision = decide(
+                schedule_cfg,
+                state_data,
+                now_utc,
+                account=account,
+                schedule_key=schedule_key,
+                force=force,
+            )
+        except Exception:
+            try:
+                decide(
+                    schedule_cfg,
+                    {},
+                    now_utc,
+                    account=account,
+                    schedule_key=schedule_key,
+                    force=force,
+                )
+            except Exception:
+                schedule_status = "invalid"
+                schedule_enabled = None
+                reason = "schedule_invalid"
+            else:
+                state_data = None
+                state_status = "corrupt"
+                reason = "state_corrupt"
+            decision_payload = _unknown_scheduler_decision(
+                now_utc=now_utc,
+                schedule_key=schedule_key,
+                reason=reason,
+            )
+        else:
+            decision_payload = asdict(decision)
+            decision_payload["should_notify"] = bool(decision_payload.get("is_notify_window_open"))
+            decision_payload["status"] = "available"
+    else:
+        reason = (
+            f"schedule_{schedule_status}"
+            if schedule_status != "available"
+            else f"state_{state_status}"
+        )
+        decision_payload = _unknown_scheduler_decision(
+            now_utc=now_utc,
+            schedule_key=schedule_key,
+            reason=reason,
+        )
+    decision_payload["schedule_enabled"] = schedule_enabled
+    decision_payload["evaluation_mode"] = decision_mode
+
+    state = state_data or {}
+    last_run_by_account = state.get("last_run_utc_by_account")
+    last_processed_target_by_account = state.get("last_processed_scan_target_utc_by_account")
+    last_notify_by_account = state.get("last_notify_utc_by_account")
+    account_maps = (last_run_by_account, last_processed_target_by_account, last_notify_by_account)
+    account_record_status = (
+        "not_selected"
+        if account is None
+        else "unknown"
+        if state_data is None
+        else "present"
+        if any(isinstance(item, dict) and account in item for item in account_maps)
+        else "absent"
+    )
+    data = {
+        "decision": decision_payload,
+        "freshness": {
+            "status": "current",
+            "as_of": decision_payload["now_utc"],
+        },
+        "schedule": {
+            "key": schedule_key,
+            "selection": "explicit" if explicit_schedule else "production_default",
+            "status": schedule_status,
+            "enabled": schedule_enabled,
+        },
+        "state": {
+            "state_path": mask_path(state_path),
+            "selection": state_selection,
+            "status": state_status,
+            "empty": state_data == {} if state_data is not None else None,
+            "account_record_status": account_record_status,
+            "last_run_utc_for_account": (
+                last_run_by_account.get(account) if account and isinstance(last_run_by_account, dict) else None
+            ),
+            "last_processed_scan_target_utc_for_account": (
+                last_processed_target_by_account.get(account)
+                if account and isinstance(last_processed_target_by_account, dict)
+                else None
+            ),
+            "last_notify_utc": state.get("last_notify_utc"),
+            "last_notify_utc_for_account": (
+                last_notify_by_account.get(account) if account and isinstance(last_notify_by_account, dict) else None
+            ),
+        },
+        "filters": {
+            "account": account,
+            "schedule_key": schedule_key,
+            "force": force,
+            "market": market,
+        },
+    }
+    return data, [], {"config_path": mask_path(config_path), "state_path": mask_path(state_path)}
+
+
+def _read_scheduler_state_snapshot(
+    state_path: Path,
+    *,
+    read_state: Callable[[Path], dict[str, Any]],
+    parse_datetime: Callable[[Any], datetime | None],
+) -> tuple[dict[str, Any] | None, str]:
+    try:
+        state_stat = state_path.stat()
+        if not state_path.is_file():
+            return None, "unreadable"
+        if state_stat.st_size <= 0:
+            return None, "corrupt"
+        state = read_state(state_path)
+    except FileNotFoundError:
+        return None, "missing"
+    except (OSError, UnicodeError):
+        return None, "unreadable"
+    except json.JSONDecodeError:
+        return None, "corrupt"
+    except Exception:
+        return None, "corrupt"
+    if not isinstance(state, dict):
+        return None, "corrupt"
+    account_map_fields = (
+        "last_run_utc_by_account",
+        "last_scan_utc_by_account",
+        "last_processed_scan_target_utc_by_account",
+        "last_notify_utc_by_account",
+    )
+    for field in account_map_fields:
+        if field not in state:
+            continue
+        raw_map = state[field]
+        if not isinstance(raw_map, dict):
+            return None, "corrupt"
+        for value in raw_map.values():
+            if not isinstance(value, str) or not value.strip():
+                return None, "corrupt"
+            try:
+                parsed = parse_datetime(value)
+            except Exception:
+                return None, "corrupt"
+            if parsed is None or parsed.tzinfo is None:
+                return None, "corrupt"
+    for field in (
+        "last_run_utc",
+        "last_scan_utc",
+        "last_processed_scan_target_utc",
+        "last_notify_utc",
+    ):
+        if field not in state or state[field] is None:
+            continue
+        value = state[field]
+        if not isinstance(value, str) or not value.strip():
+            return None, "corrupt"
+        try:
+            parsed = parse_datetime(value)
+        except Exception:
+            return None, "corrupt"
+        if parsed is None or parsed.tzinfo is None:
+            return None, "corrupt"
+    return state, "available"
+
+
+def _unknown_scheduler_decision(
+    *,
+    now_utc: datetime,
+    schedule_key: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "now_utc": now_utc.isoformat(),
+        "schedule_key": schedule_key,
+        "in_run_window": None,
+        "should_run_scan": None,
+        "is_notify_window_open": None,
+        "should_notify": None,
+        "reason": reason,
+    }
+
+
+def _event_row(event: dict[str, Any], *, normalize_broker: Callable[[Any], str], normalize_account: Callable[[Any], str]) -> dict[str, Any]:
+    return add_trade_time_beijing({
+        "event_id": event.get("event_id"),
+        "trade_time_ms": event.get("trade_time_ms"),
+        "source_type": event.get("source_type"),
+        "event_type": event.get("event_type"),
+        "source_name": event.get("source_name"),
+        "broker": normalize_broker(event.get("broker")),
+        "account": normalize_account(event.get("account")) if event.get("account") else None,
+        "symbol": event.get("symbol"),
+        "option_type": event.get("option_type"),
+        "side": event.get("side"),
+        "position_effect": event.get("position_effect"),
+        "contracts": event.get("contracts"),
+        "price": event.get("price"),
+        "strike": event.get("strike"),
+        "expiration_ymd": event.get("expiration_ymd"),
+        "currency": event.get("currency"),
+    })
+
+
+def _events_action(
+    repo: Any,
+    payload: dict[str, Any],
+    *,
+    market: str,
+    authorized_accounts: list[str],
+    normalize_broker: Callable[[Any], str],
+    normalize_account: Callable[[Any], str],
+    admit_query: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    account = normalize_account(payload["account"]) if payload.get("account") else None
+    canonical_payload = dict(payload)
+    if payload.get("broker") not in (None, ""):
+        canonical_payload["broker"] = normalize_broker(payload.get("broker"))
+    try:
+        master_key = resolve_secret(INBOUND_OPERATION_HMAC_KEY)
+    except SecretError as exc:
+        raise AgentToolError(
+            code="DEPENDENCY_MISSING",
+            message="inbound.operation_hmac_key could not be resolved",
+        ) from exc
+    if not master_key:
+        raise AgentToolError(
+            code="DEPENDENCY_MISSING",
+            message="inbound.operation_hmac_key is required for events pagination",
+        )
+    cursor_key = _derive_trade_event_cursor_key(master_key)
+    try:
+        page = trade_event_page(
+            repo,
+            payload=canonical_payload,
+            account=account,
+            market=market,
+            authorized_accounts=authorized_accounts,
+            cursor_key=cursor_key,
+            admit_query=admit_query,
+        )
+    except TradeEventPaginationError as exc:
+        error_code = {
+            "needs_narrowing": "NEEDS_NARROWING",
+            "cursor_expired": "CURSOR_EXPIRED",
+            "cursor_authority_mismatch": "CURSOR_SCOPE_MISMATCH",
+            "cursor_query_mismatch": "CURSOR_SCOPE_MISMATCH",
+            "pagination_unavailable": "DEPENDENCY_MISSING",
+        }.get(exc.code, "INPUT_ERROR")
+        hints = {
+            "NEEDS_NARROWING": "单次最多查询 20 条，请缩小数量或增加筛选条件后重新查询。",
+            "CURSOR_EXPIRED": "上次查询快照已过期，请重新发起查询；新结果可能与已返回记录重叠。",
+            "CURSOR_SCOPE_MISMATCH": "Reuse the cursor without changing its signed filters or authority scope.",
+            "DEPENDENCY_MISSING": "Run the controlled option-position projection migration before paging events.",
+        }
+        raise AgentToolError(
+            code=error_code,
+            message=str(exc),
+            hint=hints.get(error_code),
+            details={"retryable": False},
+        ) from exc
+    return {
+        **page,
+        "rows": [
+            _event_row(
+                row,
+                normalize_broker=normalize_broker,
+                normalize_account=normalize_account,
+            )
+            for row in page["rows"]
+        ],
+    }
+
+
+def _assigned_stock_action(
+    repo: Any,
+    payload: dict[str, Any],
+    *,
+    cfg: dict[str, Any],
+    repo_base: Callable[[], Path],
+    quote_state_base_dir: Path | None,
+    normalize_broker: Callable[[Any], str],
+    normalize_account: Callable[[Any], str],
+    refresh_assigned_stock_quotes: Callable[..., Any],
+) -> dict[str, Any]:
+    broker = _optional_text(payload.get("broker"))
+    broker = normalize_broker(broker) if broker else None
+    account = normalize_account(payload.get("account")) if payload.get("account") else None
+    symbol = _optional_text(payload.get("symbol"))
+    symbol = symbol.upper() if symbol else None
+    lot_id = _optional_text(payload.get("stock_lot_id") or payload.get("target_stock_lot_id"))
+    status = _optional_text(payload.get("status"))
+    status = status.lower() if status else None
+    if status == "all":
+        status = None
+    elif status in {"close", "closed_sold", "sold"}:
+        status = "closed"
+    elif status in {"partial", "partially-sold"}:
+        status = "partially_sold"
+    quote_snapshots = payload.get("quote_snapshots")
+    as_of_ms = _optional_int(payload.get("as_of_ms")) if payload.get("as_of_ms") not in (None, "") else None
+    refresh_flag = payload.get("refresh_quotes")
+    refresh_quotes = (
+        _bool_flag(refresh_flag)
+        if refresh_flag not in (None, "")
+        else as_of_ms is None and "quote_snapshots" not in payload
+    )
+
+    read_as_of_ms = as_of_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+    report = build_assigned_stock_view(
+        repo,
+        account=account,
+        broker=broker,
+        quote_snapshots=quote_snapshots,
+        as_of_ms=read_as_of_ms,
+    )
+    selected_report_rows = [
+        row
+        for row in (report.get("assigned_stock_lots") or [])
+        if isinstance(row, dict)
+        and _assigned_stock_row_matches(row, symbol=symbol, lot_id=lot_id, status=status)
+    ]
+    quote_refresh: dict[str, Any] = {"enabled": False}
+    quote_refresh_warnings: list[str] = []
+    if refresh_quotes:
+        if as_of_ms is not None:
+            quote_refresh = {
+                "enabled": False,
+                "status": "skipped_historical_as_of",
+                "reason": "historical as-of queries require supplied quote_snapshots or saved marks",
+            }
+            quote_refresh_warnings.append(
+                "refresh_quotes ignored because as_of_ms was provided; historical as-of requires supplied quote_snapshots"
+            )
+        elif not selected_report_rows:
+            quote_refresh = {
+                "enabled": False,
+                "status": "skipped_no_matching_assigned_stock",
+                "reason": "no assigned-stock row matched the query filters",
+            }
+        else:
+            try:
+                port_value = payload.get("opend_port") or payload.get("port")
+                refresh = refresh_assigned_stock_quotes(
+                    selected_report_rows,
+                    cfg=cfg,
+                    account=account,
+                    host=_optional_text(payload.get("opend_host") or payload.get("host")),
+                    port=_optional_int(port_value) if port_value not in (None, "") else None,
+                    base_dir=repo_base(),
+                    state_base_dir=quote_state_base_dir,
+                )
+            except Exception as exc:
+                quote_refresh = {
+                    "enabled": True,
+                    "status": "source_error",
+                    "quote_source": "opend_realtime",
+                    "errors": [{"error_code": type(exc).__name__, "message": str(exc)}],
+                }
+                quote_refresh_warnings.append(f"assigned stock quote refresh failed: {type(exc).__name__}: {exc}")
+            else:
+                quote_refresh = dict(getattr(refresh, "diagnostics", {}) or {})
+                quote_refresh.setdefault("enabled", True)
+                quote_refresh_warnings.extend(
+                    str(item) for item in (getattr(refresh, "warnings", []) or []) if str(item).strip()
+                )
+                refreshed_snapshots = list(getattr(refresh, "quote_snapshots", []) or [])
+                if refreshed_snapshots:
+                    quote_snapshots = [*_quote_snapshot_rows(payload.get("quote_snapshots")), *refreshed_snapshots]
+                    report = build_assigned_stock_view(
+                        repo,
+                        account=account,
+                        broker=broker,
+                        quote_snapshots=quote_snapshots,
+                        as_of_ms=read_as_of_ms,
+                    )
+                    selected_report_rows = [
+                        row
+                        for row in (report.get("assigned_stock_lots") or [])
+                        if isinstance(row, dict)
+                        and _assigned_stock_row_matches(
+                            row,
+                            symbol=symbol,
+                            lot_id=lot_id,
+                            status=status,
+                        )
+                    ]
+    try:
+        wheel_accounts = resolve_configured_accounts(
+            cfg,
+            [account] if account else None,
+        )
+    except ValueError as exc:
+        raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+
+    wheel_batches: dict[tuple[str, str], dict[str, Any]] = {}
+    wheel_branches: list[dict[str, Any]] = []
+    for account_value in wheel_accounts:
+        model = build_wheel_read_model(
+            repo,
+            account_value,
+            read_as_of_ms,
+            market=str(payload.get("config_key") or ""),
+        )
+        wheel_batches.update(
+            {
+                (account_value, str(batch.get("stock_lot_id") or "").strip()): dict(batch)
+                for batch in model.get("batches") or []
+                if isinstance(batch, dict) and str(batch.get("stock_lot_id") or "").strip()
+            }
+        )
+        wheel_branches.extend(
+            dict(branch)
+            for branch in model.get("wheel_branches") or []
+            if isinstance(branch, dict)
+            and (not symbol or str(branch.get("symbol") or "").strip().upper() == symbol)
+            and (
+                not lot_id
+                or str(branch.get("stock_lot_id") or "").strip() == lot_id
+            )
+        )
+    rows = []
+    for item in selected_report_rows:
+        row = dict(item)
+        row["wheel"] = wheel_batches.get(
+            (
+                str(row.get("account") or "").strip().lower(),
+                str(row.get("stock_lot_id") or "").strip(),
+            )
+        )
+        rows.append(row)
+    sale_rows = _assigned_stock_related_rows(
+        report.get("assigned_stock_sale_rows"),
+        selected_lot_rows=selected_report_rows,
+        lot_id=lot_id,
+    )
+    review_rows = _assigned_stock_related_rows(
+        report.get("assigned_stock_review_rows"),
+        selected_lot_rows=selected_report_rows,
+        lot_id=lot_id,
+    )
+    return {
+        "schema_version": "option_positions_read.output.v3",
+        "action": "assigned-stock",
+        "rows": rows,
+        "row_count": len(rows),
+        "wheel_branches": wheel_branches,
+        "assigned_stock_lots": rows,
+        "assigned_stock_sale_rows": sale_rows,
+        "assigned_stock_review_rows": review_rows,
+        "filters": {
+            "broker": broker,
+            "account": account,
+            "symbol": symbol,
+            "stock_lot_id": lot_id,
+            "status": status,
+            "as_of_ms": as_of_ms,
+            "refresh_quotes": refresh_quotes,
+        },
+        "quote_refresh": quote_refresh,
+        "warnings": [
+            *[str(item) for item in report.get("warnings") or [] if str(item).strip()],
+            *quote_refresh_warnings,
+        ],
+    }
+
+
+def _assigned_stock_related_rows(
+    raw_rows: Any,
+    *,
+    selected_lot_rows: list[dict[str, Any]],
+    lot_id: str | None,
+) -> list[dict[str, Any]]:
+    if not selected_lot_rows:
+        return []
+    selected_lot_ids = {
+        str(row.get("stock_lot_id") or "").strip()
+        for row in selected_lot_rows
+        if str(row.get("stock_lot_id") or "").strip()
+    }
+    selected_scope_keys = {
+        (
+            str(row.get("account") or "").strip().lower(),
+            str(row.get("broker") or "").strip(),
+            str(row.get("symbol") or "").strip().upper(),
+        )
+        for row in selected_lot_rows
+    }
+    out: list[dict[str, Any]] = []
+    for raw in raw_rows or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        row_lot_id = str(
+            row.get("stock_lot_id")
+            or row.get("target_stock_lot_id")
+            or ""
+        ).strip()
+        if row_lot_id:
+            if row_lot_id in selected_lot_ids:
+                out.append(row)
+            continue
+        if lot_id:
+            continue
+        scope_key = (
+            str(row.get("account") or "").strip().lower(),
+            str(row.get("broker") or "").strip(),
+            str(row.get("symbol") or "").strip().upper(),
+        )
+        if scope_key in selected_scope_keys:
+            out.append(row)
+    return out
+
+
+def option_positions_read_tool(
+    payload: dict[str, Any],
+    *,
+    load_runtime_config: Callable[..., tuple[Path, dict[str, Any]]],
+    resolve_public_data_config_path: Callable[[dict[str, Any], dict[str, Any]], Path],
+    normalize_broker: Callable[[Any], str],
+    normalize_account: Callable[[Any], str],
+    refresh_assigned_stock_quotes: Callable[..., Any],
+    resolve_option_positions_repo: Callable[..., tuple[Path, Any]],
+    list_position_rows: Callable[..., list[dict[str, Any]]],
+    build_lot_event_history: Callable[..., list[dict[str, Any]]],
+    inspect_projection_state: Callable[..., dict[str, Any]],
+    repo_base: Callable[[], Path],
+    mask_path: Callable[[Any], str],
+    admit_event_query: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    try:
+        payload = normalize_option_positions_read_input(payload)
+    except ValueError as exc:
+        raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+    action = _scalar_text(payload.get("action"), default="list").lower()
+    if action not in {"list", "events", "history", "inspect", "assigned-stock"}:
+        raise AgentToolError(code="INPUT_ERROR", message=f"unsupported option_positions_read action: {action}")
+
+    config_path, cfg = load_runtime_config(config_key=payload.get("config_key"), config_path=payload.get("config_path"))
+    query_payload = _dict(payload.get("query"))
+    requested_account = _optional_text(
+        query_payload.get("account") if action == "list" else payload.get("account")
+    )
+    if action == "list" and requested_account is None:
+        requested_account = _optional_text(payload.get("account"))
+    try:
+        account = normalize_account(requested_account) if requested_account else None
+        if account:
+            resolve_configured_accounts(cfg, [account])
+    except ValueError as exc:
+        raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+    portfolio_raw = cfg.get("portfolio")
+    portfolio_cfg = cast(dict[str, Any], portfolio_raw) if isinstance(portfolio_raw, dict) else {}
+    data_config_path = resolve_public_data_config_path(payload, portfolio_cfg)
+    _resolved_data_config, repo = resolve_option_positions_repo(base=repo_base(), data_config=data_config_path)
+    ledger_store = ledger_store_payload(data_config_path, repo)
+
+    warnings: list[str] = []
+    bootstrap_status = getattr(repo, "bootstrap_status", None)
+    bootstrap_message = getattr(repo, "bootstrap_message", None)
+    if bootstrap_status and str(bootstrap_status).startswith("degraded"):
+        warnings.append(str(bootstrap_message or bootstrap_status))
+
+    data: dict[str, Any]
+    if action == "list":
+        query = query_payload
+        expiration_query = _dict(query.get("expiration"))
+        broker = normalize_broker(payload.get("broker") or portfolio_cfg.get("broker") or "富途")
+        account = account or _optional_text(payload.get("account"))
+        status = _scalar_text(query.get("status") if "status" in query else payload.get("status"), default="open").lower()
+        if status == "closed":
+            status = "close"
+        if status not in {"open", "close", "all"}:
+            raise AgentToolError(code="INPUT_ERROR", message="status must be one of: open, close, all")
+        limit = _as_int(query.get("limit") if "limit" in query else payload.get("limit"), default=50)
+        expiration_within_days = _optional_int(
+            expiration_query.get("within_days")
+            or payload.get("exp_within_days")
+            or payload.get("expiration_within_days")
+        )
+        symbol = _optional_text(query.get("symbol") if "symbol" in query else payload.get("symbol"))
+        option_type = _optional_text(query.get("option_type") if "option_type" in query else payload.get("option_type"))
+        side = _optional_text(query.get("side") if "side" in query else payload.get("side"))
+        strike = _optional_float(query.get("strike") if "strike" in query else payload.get("strike"))
+        expiration_exact = _optional_text(expiration_query.get("exact") or payload.get("expiration_exact"))
+        expiration_month = _optional_text(expiration_query.get("month") or payload.get("expiration_month"))
+        expiration_before = _optional_text(expiration_query.get("before") or payload.get("expiration_before"))
+        expiration_after = _optional_text(expiration_query.get("after") or payload.get("expiration_after"))
+        rows = list_position_rows(
+            repo,
+            broker=broker,
+            account=account,
+            status=status,
+            limit=limit,
+            expiration_within_days=expiration_within_days,
+            symbol=symbol,
+            option_type=option_type,
+            side=side,
+            strike=strike,
+            expiration_exact=expiration_exact,
+            expiration_month=expiration_month,
+            expiration_before=expiration_before,
+            expiration_after=expiration_after,
+        )
+        effective_query = {
+            "account": normalize_account(account) if account else None,
+            "status": status,
+            "symbol": symbol,
+            "option_type": option_type,
+            "side": side,
+            "strike": strike,
+            "expiration": {
+                "exact": expiration_exact,
+                "month": expiration_month,
+                "before": expiration_before,
+                "after": expiration_after,
+                "within_days": expiration_within_days,
+            },
+            "limit": limit,
+        }
+        data = {
+            "action": action,
+            "evidence_scope": {
+                "ledger_positions": "observed",
+                "broker_settlement": "not_observed",
+                "market_price": "not_observed",
+                "margin_state": "not_observed",
+            },
+            "rows": rows,
+            "row_count": len(rows),
+            "filters": {
+                "broker": broker,
+                "query": effective_query,
+                "account": effective_query["account"],
+                "status": status,
+                "limit": limit,
+                "expiration_within_days": expiration_within_days,
+            },
+        }
+    elif action == "events":
+        market = infer_runtime_config_market(
+            config_key=str(payload.get("config_key") or "").strip() or None,
+            config_path=config_path,
+            config=cfg,
+        )
+        if market not in {"us", "hk"}:
+            raise AgentToolError(
+                code="CONFIG_ERROR",
+                message="option_positions_read market could not be inferred",
+            )
+        try:
+            authorized_accounts = resolve_configured_accounts(cfg)
+        except ValueError as exc:
+            raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+        event_data = _events_action(
+            repo,
+            payload,
+            market=market,
+            authorized_accounts=authorized_accounts,
+            normalize_broker=normalize_broker,
+            normalize_account=normalize_account,
+            admit_query=admit_event_query,
+        )
+        data = {"action": action, **event_data}
+    elif action == "assigned-stock":
+        data = _assigned_stock_action(
+            repo,
+            payload,
+            cfg=cfg,
+            repo_base=repo_base,
+            quote_state_base_dir=_optional_path(ledger_store.get("runtime_root")),
+            normalize_broker=normalize_broker,
+            normalize_account=normalize_account,
+            refresh_assigned_stock_quotes=refresh_assigned_stock_quotes,
+        )
+    elif action == "history":
+        lot_id = _optional_text(payload.get("record_id"))
+        if not lot_id:
+            raise AgentToolError(code="INPUT_ERROR", message="record_id is required for option_positions_read history")
+        try:
+            history = build_lot_event_history(repo, base=repo_base(), lot_id=lot_id)
+        except ValueError as exc:
+            if not str(exc).startswith("position lot or event history not found:"):
+                raise AgentToolError(code="INPUT_ERROR", message=str(exc)) from exc
+            history = []
+        allowed_accounts = {account} if account else set(resolve_configured_accounts(cfg))
+        if any(str(row.get("account") or "").lower() not in allowed_accounts for row in history):
+            raise AgentToolError(code="PERMISSION_DENIED", message="Lot history is outside the authorized account scope")
+        data = {
+            "action": action,
+            "record_id": lot_id,
+            "events": history,
+            "event_count": len(history),
+            "read_status": "ok" if history else "not_found",
+            "coverage": {"status": "complete", "complete_for": "full_query", "included_count": len(history),
+                         "total_count": len(history), "omitted_count": 0, "has_more": False},
+            "pagination": {"total_count": len(history), "matched_count": len(history), "returned_count": len(history),
+                           "scanned_count": len(history), "has_more": False},
+            "scope": {"account": account, "accounts": sorted(allowed_accounts), "record_id": lot_id},
+        }
+    else:
+        selectors = {
+            "record_id": _optional_text(payload.get("record_id")),
+            "account": _optional_text(payload.get("account")),
+            "symbol": _optional_text(payload.get("symbol")),
+            "option_type": _optional_text(payload.get("option_type")),
+            "strike": _optional_float(payload.get("strike")),
+            "expiration_ymd": _optional_text(payload.get("exp") or payload.get("expiration_ymd")),
+        }
+        if not any(value not in (None, "") for value in selectors.values()):
+            raise AgentToolError(code="INPUT_ERROR", message="inspect requires at least one selector")
+        # `selectors` doubles as the tool's "scope" output payload (see below and
+        # the sibling branch above), whose key is the external `record_id`. Split
+        # it rather than rename it, so the boundary spelling stays put while the
+        # callee keeps the converged `lot_id` parameter.
+        inspected = inspect_projection_state(
+            repo,
+            base=repo_base(),
+            lot_id=selectors.get("record_id"),
+            **{key: value for key, value in selectors.items() if key != "record_id"},
+        )
+        allowed_accounts = {account} if account else set(resolve_configured_accounts(cfg))
+        scope_rows = [(row.get("fields") or {}) for row in inspected.get("current_lots") or []]
+        scope_rows.extend(inspected.get("projected_lots") or [])
+        scope_rows.extend(inspected.get("related_events") or [])
+        if any(str(row.get("account") or "").lower() not in allowed_accounts for row in scope_rows):
+            raise AgentToolError(code="PERMISSION_DENIED", message="Projection results include accounts outside the authorized scope", hint="Choose an authorized account explicitly.")
+        data = {"action": action, **inspected,
+                "read_status": "ok" if scope_rows else "not_found",
+                "coverage": {"status": "complete", "complete_for": "point"},
+                "scope": {"account": account, "accounts": sorted(allowed_accounts), **selectors}}
+
+    if action in {"list", "assigned-stock"}:
+        returned = len(data.get("rows") or [])
+        limited = action == "list" and returned >= max(1, min(500, limit))
+        data["pagination"] = {"total_count": None if limited else returned,
+                              "matched_count": None if limited else returned, "returned_count": returned,
+                              "scanned_count": None, "has_more": None if limited else False}
+        data["coverage"] = {"status": "partial" if limited else "complete",
+                            "complete_for": "requested_page" if limited else "full_query",
+                            "included_count": returned, "total_count": None if limited else returned,
+                            "omitted_count": None if limited else 0, "has_more": None if limited else False}
+    elif action == "inspect":
+        matched = len(data.get("matched_record_ids") or [])
+        data["pagination"] = {"total_count": None, "matched_count": matched, "returned_count": matched,
+                              "scanned_count": None, "has_more": False}
+
+    data_warnings = data.get("warnings")
+    if isinstance(data_warnings, list):
+        warnings.extend(str(item) for item in data_warnings if str(item).strip())
+
+    data["bootstrap"] = {
+        "status": bootstrap_status,
+        "message": bootstrap_message,
+    }
+    data.setdefault("source", {"label": "OM local option ledger", "kind": "ledger_snapshot"})
+    data.setdefault("scope", {"action": action, **(data.get("filters") if isinstance(data.get("filters"), dict) else {})})
+    if isinstance(data.get("evidence_scope"), dict):
+        data.setdefault("coverage", dict(data["evidence_scope"]))
+    if action == "events":
+        data["pagination"] = {"total_count": None, "matched_count": data.get("total_count"),
+                              "returned_count": data.get("returned_count", 0), "scanned_count": None,
+                              "has_more": bool(data.get("has_more")), "next_cursor": data.get("next_cursor")}
+    if action == "history":
+        event_times = [row["trade_time_ms"] for row in data["events"] if type(row.get("trade_time_ms")) is int]
+        data["freshness"] = {"status": "historical", "kind": "ledger_event_history",
+                             "as_of": datetime.fromtimestamp(max(event_times) / 1000, timezone.utc).isoformat() if event_times else None,
+                             "observed_at": datetime.now(timezone.utc).isoformat()}
+    if action in {"events", "history"}:
+        data.setdefault(
+            "freshness",
+            {
+                "status": "historical",
+                "as_of": data.get("as_of"),
+                "kind": "ledger_snapshot",
+            },
+        )
+    else:
+        data.setdefault(
+            "freshness",
+            {
+                "status": "fresh",
+                "as_of": datetime.now(timezone.utc).isoformat(),
+                "kind": "ledger_snapshot",
+                **(
+                    {"quote_refresh": data.get("quote_refresh")}
+                    if isinstance(data.get("quote_refresh"), dict)
+                    else {}
+                ),
+            },
+        )
+    return data, warnings, {
+        "config_path": mask_path(config_path),
+        "data_config": mask_path(data_config_path),
+        "ledger_store": ledger_store,
+    }

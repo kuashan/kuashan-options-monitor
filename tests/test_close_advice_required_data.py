@@ -1,0 +1,1484 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+from typing import NamedTuple
+
+import pandas as pd
+import pytest
+
+
+def _config(
+    *,
+    account: str,
+    enabled: bool = True,
+    host: str = "127.0.0.1",
+    port: int = 11111,
+) -> dict:
+    return {
+        "portfolio": {
+            "broker": "富途",
+            "account": account,
+        },
+        "close_advice": {"enabled": enabled},
+        "symbols": [
+            {
+                "symbol": "NVDA",
+                "broker": "US",
+                "fetch": {
+                    "source": "opend",
+                    "host": host,
+                    "port": port,
+                },
+                "sell_put": {"enabled": True},
+                "sell_call": {"enabled": False},
+            }
+        ],
+    }
+
+
+def _position(
+    *,
+    account: str,
+    lot_id: str,
+    broker: str = "富途",
+    expiration: str = "2026-08-28",
+) -> dict:
+    return {
+        "record_id": lot_id,
+        "fields": {
+            "contract_key": {
+                "broker": broker,
+                "account": account,
+                "underlying_symbol": "NVDA",
+                "option_type": "put",
+                "strike": "100",
+                "expiration_ymd": expiration,
+                "asset_type": "option",
+            },
+            "status": "open",
+            "position_side": "short",
+            "contracts_opened": 1,
+            "contracts_open": 1,
+            "multiplier": 100,
+            "currency": "USD",
+            "premium_open": "2.000000",
+            "opened_at_ms": int(
+                datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
+                * 1000
+            ),
+        },
+    }
+
+
+def _plan(**overrides: object) -> dict:
+    from src.application.close_advice_required_data import (
+        build_close_advice_required_data_plan,
+    )
+
+    base: dict[str, object] = {
+        "run_id": "run-1",
+        "run_started_at_utc": datetime(2026, 7, 29, 1, 40, tzinfo=timezone.utc),
+        "markets_to_run": ["US"],
+    }
+    base.update(overrides)
+    return build_close_advice_required_data_plan(**base)
+
+
+def test_requirements_plan_is_order_independent_and_skips_disabled_account() -> None:
+    started = datetime(2026, 7, 29, 1, 40, tzinfo=timezone.utc)
+    configs = {
+        "lx": _config(account="lx"),
+        "sy": _config(account="sy", enabled=False),
+    }
+    positions = {
+        "lx": [_position(account="lx", lot_id="lot-lx")],
+        "sy": [_position(account="sy", lot_id="lot-sy")],
+    }
+    forward = _plan(
+        run_started_at_utc=started,
+        account_configs=configs, base_config=configs["lx"],
+        position_records_by_account=positions,
+    )
+    reverse = _plan(
+        run_started_at_utc=started,
+        account_configs={"sy": configs["sy"], "lx": configs["lx"]},
+        base_config=configs["lx"],
+        position_records_by_account={"sy": positions["sy"], "lx": positions["lx"]},
+    )
+
+    assert forward == reverse
+    assert forward["status"] == "complete"
+    assert forward["accounts"]["sy"] == {
+        "close_advice_enabled": False,
+        "status": "not_applicable",
+        "requirements": [],
+        "planning_errors": [],
+    }
+    requirement = forward["accounts"]["lx"]["requirements"][0]
+    assert (
+        requirement["quote_key"]
+        == "NVDA|put|2026-08-28|100.000000"
+    )
+    assert requirement["fetch_binding"]["binding_id"]
+    assert forward["summary"]["requirements_total"] == 1
+
+
+def test_plan_reads_canonical_contract_key_and_isolates_shared_lots() -> None:
+    configs = {
+        "lx": _config(account="lx"),
+        "sy": _config(account="sy"),
+    }
+    shared = [
+        _position(account="lx", lot_id="lot-lx"),
+        _position(account="sy", lot_id="lot-sy"),
+        _position(account="lx", lot_id="lot-lx-other-broker", broker="IBKR"),
+    ]
+
+    plan = _plan(
+        account_configs=configs,
+        base_config=configs["lx"],
+        position_records_by_account={"lx": shared, "sy": shared},
+    )
+
+    lx_requirements = plan["accounts"]["lx"]["requirements"]
+    sy_requirements = plan["accounts"]["sy"]["requirements"]
+    assert [item["position_lot_id"] for item in lx_requirements] == ["lot-lx"]
+    assert [item["position_lot_id"] for item in sy_requirements] == ["lot-sy"]
+    assert lx_requirements[0]["symbol"] == "NVDA"
+    assert lx_requirements[0]["market"] == "US"
+    assert lx_requirements[0]["quote_key"] == "NVDA|put|2026-08-28|100.000000"
+    assert plan["summary"]["requirements_total"] == 2
+
+
+def test_plan_uses_market_local_date_and_seals_independent_calendar(tmp_path: Path) -> None:
+    from src.application.close_advice_required_data import (
+        enrich_close_advice_required_data_plan,
+        load_close_advice_required_data_plan,
+        publish_close_advice_required_data_plan,
+    )
+
+    config = _config(account="lx")
+    plan = _plan(
+        account_configs={"lx": config}, base_config=config,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+    assert plan["as_of_market_dates"] == {"US": "2026-07-28", "HK": "2026-07-29"}
+    path = tmp_path / "plan.json"
+    publish_close_advice_required_data_plan(path=path, payload=plan)
+
+    class Gateway:
+        def get_trading_days_with_receipt(self, **kwargs):
+            assert kwargs == {"market": "US", "start": "2026-07-28", "end": "2026-08-28"}
+            return {
+                "retcode": 0, "coverage_complete": True, "pagination_complete": True,
+                "page_count": 1,
+                "rows": [
+                    {"time": "2026-07-28", "trade_date_type": "WHOLE"},
+                    {"time": "2026-08-28", "trade_date_type": "MORNING"},
+                ],
+            }
+
+        def get_market_state(self, codes):
+            assert codes == ["US.NVDA"]
+            return [{"code": "US.NVDA", "market_state": "MORNING"}]
+
+        def close(self):
+            pass
+
+    enrich_close_advice_required_data_plan(
+        plan_path=path, expected_run_id="run-1",
+        gateway_factory=lambda **_kwargs: Gateway(),
+    )
+    loaded = load_close_advice_required_data_plan(path=path, expected_run_id="run-1")
+    requirement = loaded["accounts"]["lx"]["requirements"][0]
+    assert requirement["trading_calendar_status"] == "ok"
+    assert json.loads(requirement["trading_calendar_dates"]) == ["2026-07-28", "2026-08-28"]
+    assert requirement["market_state_after_snapshot"] == "MORNING"
+
+
+def test_calendar_rejects_missing_session_type() -> None:
+    from src.application.close_advice_required_data import _calendar_dates
+
+    with pytest.raises(ValueError, match="calendar row invalid"):
+        _calendar_dates(
+            {"retcode": 0, "coverage_complete": True, "pagination_complete": True,
+             "page_count": 1, "rows": [{"time": "2026-07-28"}]},
+            start=date(2026, 7, 28), end=date(2026, 8, 28),
+        )
+
+
+def test_malformed_opend_calendar_seals_unavailable_plan(tmp_path: Path) -> None:
+    from src.application.close_advice_required_data import (
+        enrich_close_advice_required_data_plan,
+        publish_close_advice_required_data_plan,
+    )
+    from src.infrastructure.futu_gateway import _FutuAPIClient, build_futu_gateway
+
+    config = _config(account="lx")
+    plan_path = tmp_path / "plan.json"
+    publish_close_advice_required_data_plan(
+        path=plan_path,
+        payload=_plan(
+            account_configs={"lx": config}, base_config=config,
+            position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+        ),
+    )
+
+    class FakeBackend:
+        def __init__(self, *, host, port):
+            pass
+
+        def _ensure_clients(self):
+            class FakeQuote:
+                def request_trading_days(self, **_kwargs):
+                    return 0, [
+                        {"time": "2026-07-28", "trade_date_type": "WHOLE"},
+                        "malformed-row",
+                    ]
+
+            return FakeQuote(), None
+
+    enriched = enrich_close_advice_required_data_plan(
+        plan_path=plan_path,
+        expected_run_id="run-1",
+        gateway_factory=lambda **kwargs: build_futu_gateway(
+            **kwargs, backend_cls=FakeBackend, client_cls=_FutuAPIClient
+        ),
+    )
+    requirement = enriched["accounts"]["lx"]["requirements"][0]
+    assert requirement["trading_calendar_status"] == "unavailable"
+    assert requirement["trading_calendar_reason"] == "calendar_unavailable:FutuGatewayError"
+
+
+def test_calendar_enrichment_timeout_leaves_plan_for_fail_closed_seal(monkeypatch, tmp_path: Path) -> None:
+    import subprocess
+    from src.application import close_advice_required_data as mod
+
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text('{"sentinel": true}', encoding="utf-8")
+
+    def _timeout(*args, **kwargs):
+        assert kwargs["timeout"] == 30
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(mod.subprocess, "run", _timeout)
+    assert mod.enrich_close_advice_required_data_plan_bounded(
+        plan_path=plan_path, expected_run_id="run-1", python=Path("python"), repo_root=tmp_path,
+    ) == "calendar_enrichment_timeout"
+    assert json.loads(plan_path.read_text(encoding="utf-8")) == {"sentinel": True}
+
+
+def test_cross_year_calendar_is_explicitly_unavailable(tmp_path: Path) -> None:
+    from src.application.close_advice_required_data import (
+        enrich_close_advice_required_data_plan, publish_close_advice_required_data_plan,
+    )
+
+    config = _config(account="lx")
+    plan = _plan(
+        account_configs={"lx": config}, base_config=config,
+        position_records_by_account={"lx": [
+            _position(account="lx", lot_id="lot-lx", expiration="2027-01-15"),
+            _position(account="lx", lot_id="lot-near", expiration="2026-08-28"),
+        ]},
+    )
+    path = tmp_path / "plan.json"
+    publish_close_advice_required_data_plan(path=path, payload=plan)
+    class Gateway:
+        def get_trading_days_with_receipt(self, **kwargs):
+            assert kwargs["end"] == "2026-08-28"
+            return {"retcode": 0, "coverage_complete": True, "pagination_complete": True,
+                    "page_count": 1, "rows": [{"time": "2026-08-28", "trade_date_type": "WHOLE"}]}
+
+        def get_market_state(self, _codes):
+            return []
+
+        def close(self):
+            pass
+
+    enriched = enrich_close_advice_required_data_plan(
+        plan_path=path, expected_run_id="run-1",
+        gateway_factory=lambda **_kwargs: Gateway(),
+    )
+    requirements = {r["position_lot_id"]: r for r in enriched["accounts"]["lx"]["requirements"]}
+    assert requirements["lot-lx"]["trading_calendar_status"] == "unavailable"
+    assert requirements["lot-lx"]["trading_calendar_reason"] == "calendar_cross_year_unsupported"
+    assert requirements["lot-near"]["trading_calendar_status"] == "ok"
+
+
+def test_candidate_route_wins_and_only_conflicting_position_is_rejected() -> None:
+    from src.application.required_data_prefetch_planning import (
+        merge_close_advice_requirements_into_prefetch_config,
+    )
+
+    candidate = _config(account="lx", host="127.0.0.1", port=11111)
+    position_config = _config(
+        account="lx",
+        host="127.0.0.1",
+        port=11112,
+    )
+    plan = _plan(
+        account_configs={"lx": position_config},
+        base_config=candidate,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+
+    merged, resolved_plan = (
+        merge_close_advice_requirements_into_prefetch_config(
+            candidate_config=candidate,
+            requirements_plan=plan,
+        )
+    )
+
+    assert len(merged["symbols"]) == 1
+    assert merged["symbols"][0]["fetch"]["port"] == 11111
+    assert "_close_advice_position_requirements" not in merged["symbols"][0]
+    requirement = resolved_plan["accounts"]["lx"]["requirements"][0]
+    assert requirement["planning_status"] == "unavailable"
+    assert requirement["planning_reason"] == "required_data_route_conflict"
+    assert resolved_plan["accounts"]["lx"]["status"] == "partial"
+    diagnostic = merged["_close_advice_required_data_diagnostics"][0]
+    assert diagnostic["preserved_candidate_binding"]["port"] == 11111
+    assert diagnostic["rejected_requirement_ids"] == [
+        requirement["requirement_id"]
+    ]
+
+
+def test_ambiguous_candidate_routes_are_preserved_and_position_is_rejected() -> None:
+    from src.application.required_data_prefetch_planning import (
+        merge_close_advice_requirements_into_prefetch_config,
+    )
+
+    position_config = _config(account="lx", port=11111)
+    candidate_config = dict(position_config)
+    candidate_config["symbols"] = [
+        _config(account="lx", port=port)["symbols"][0]
+        for port in (11111, 11112)
+    ]
+    plan = _plan(
+        account_configs={"lx": position_config},
+        base_config=candidate_config,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+
+    merged, resolved_plan = (
+        merge_close_advice_requirements_into_prefetch_config(
+            candidate_config=candidate_config,
+            requirements_plan=plan,
+        )
+    )
+
+    assert len(merged["symbols"]) == 2
+    assert {
+        item["fetch"]["port"] for item in merged["symbols"]
+    } == {11111, 11112}
+    assert all(
+        "_close_advice_position_requirements" not in item
+        for item in merged["symbols"]
+    )
+    diagnostic = merged["_close_advice_required_data_diagnostics"][0]
+    assert diagnostic["candidate_route_ambiguous"] is True
+    assert len(diagnostic["rejected_requirement_ids"]) == 1
+    assert (
+        resolved_plan["accounts"]["lx"]["requirements"][0][
+            "planning_reason"
+        ]
+        == "required_data_route_conflict"
+    )
+
+
+def test_position_binding_uses_base_fallback_without_defaulting() -> None:
+    account_config = _config(account="lx")
+    account_config["symbols"] = []
+    base_config = _config(account="lx", host="10.0.0.8", port=22222)
+    plan = _plan(
+        account_configs={"lx": account_config},
+        base_config=base_config,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+
+    binding = plan["accounts"]["lx"]["requirements"][0][
+        "fetch_binding"
+    ]
+    assert binding["config_scope"] == "base"
+    assert binding["host"] == "10.0.0.8"
+    assert binding["port"] == 22222
+
+
+def test_missing_or_unsupported_position_binding_is_typed_unavailable() -> None:
+    missing = _config(account="lx")
+    missing["symbols"] = []
+    unsupported = _config(account="sy")
+    unsupported["symbols"][0]["fetch"]["source"] = "http"
+    plan = _plan(
+        account_configs={"lx": missing, "sy": unsupported},
+        base_config=missing,
+        position_records_by_account={
+            "lx": [_position(account="lx", lot_id="lot-lx")],
+            "sy": [_position(account="sy", lot_id="lot-sy")],
+        },
+    )
+
+    assert (
+        plan["accounts"]["lx"]["requirements"][0]["planning_reason"]
+        == "required_data_symbol_config_missing"
+    )
+    assert (
+        plan["accounts"]["sy"]["requirements"][0]["planning_reason"]
+        == "required_data_symbol_source_unsupported"
+    )
+    assert all(
+        "fetch_binding" not in plan["accounts"][account]["requirements"][0]
+        for account in ("lx", "sy")
+    )
+
+
+def test_position_only_requirement_creates_one_exact_prefetch_plan(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import src.application.required_data_planning as planning
+    from src.application.required_data_prefetch_planning import (
+        merge_close_advice_requirements_into_prefetch_config,
+    )
+
+    config = _config(account="lx")
+    plan = _plan(
+        account_configs={"lx": config},
+        base_config=config,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+    candidate_config = dict(config)
+    candidate_config["symbols"] = []
+    merged, resolved_plan = (
+        merge_close_advice_requirements_into_prefetch_config(
+            candidate_config=candidate_config,
+            requirements_plan=plan,
+        )
+    )
+    symbol_cfg = merged["symbols"][0]
+    monkeypatch.setattr(
+        planning,
+        "get_underlier_spot",
+        lambda *_args, **_kwargs: 110.0,
+    )
+    monkeypatch.setattr(
+        "src.application.opend_utils.get_trading_date",
+        lambda _market: date(2026, 7, 29),
+    )
+    monkeypatch.setattr(
+        planning,
+        "list_option_expirations",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        planning.opend_utils,
+        "get_trading_date",
+        lambda _market: date(2026, 7, 29),
+    )
+    bundle = planning.build_required_data_fetch_plan(
+        base=tmp_path,
+        required_data_dir=tmp_path / "required_data",
+        symbol="NVDA",
+        limit_expirations=0,
+        want_put=False,
+        want_call=False,
+        sell_put_cfg={"enabled": False},
+        sell_call_cfg={"enabled": False},
+        position_requirements=symbol_cfg[
+            "_close_advice_position_requirements"
+        ],
+        symbol_cfg=symbol_cfg,
+        fetch_host="127.0.0.1",
+        fetch_port=11111,
+    )
+
+    assert len(merged["symbols"]) == 1
+    assert resolved_plan["accounts"]["lx"]["status"] == "ready"
+    assert len(bundle.side_plans) == 1
+    side_plan = bundle.side_plans[0]
+    assert side_plan.option_type == "put"
+    assert side_plan.explicit_expirations == ["2026-08-28"]
+    assert side_plan.strike_window.min_strike == 100
+    assert side_plan.strike_window.max_strike == 100
+    assert side_plan.source_fields == [
+        "close_advice.position_requirements"
+    ]
+
+
+def test_position_only_route_conflict_rejects_all_affected_requirements() -> None:
+    from src.application.required_data_prefetch_planning import (
+        merge_close_advice_requirements_into_prefetch_config,
+    )
+
+    configs = {
+        "lx": _config(account="lx", port=11111),
+        "sy": _config(account="sy", port=11112),
+    }
+    plan = _plan(
+        account_configs=configs,
+        base_config=configs["lx"],
+        position_records_by_account={
+            account: [_position(account=account, lot_id=f"lot-{account}")]
+            for account in configs
+        },
+    )
+    candidate_config = dict(configs["lx"])
+    candidate_config["symbols"] = []
+
+    merged, resolved_plan = (
+        merge_close_advice_requirements_into_prefetch_config(
+            candidate_config=candidate_config,
+            requirements_plan=plan,
+        )
+    )
+
+    assert merged["symbols"] == []
+    diagnostic = merged["_close_advice_required_data_diagnostics"][0]
+    assert diagnostic["position_only_conflict"] is True
+    assert len(diagnostic["rejected_requirement_ids"]) == 2
+    for account in ("lx", "sy"):
+        account_plan = resolved_plan["accounts"][account]
+        assert account_plan["status"] == "partial"
+        assert (
+            account_plan["requirements"][0]["planning_reason"]
+            == "required_data_route_conflict"
+        )
+
+
+def test_candidate_and_position_routes_normalize_host_case() -> None:
+    from src.application.required_data_prefetch_planning import (
+        merge_close_advice_requirements_into_prefetch_config,
+    )
+
+    position_config = _config(account="lx", host="opend.example")
+    plan = _plan(
+        run_id="run-host-case",
+        account_configs={"lx": position_config},
+        base_config=position_config,
+        position_records_by_account={"lx": [_position(account="lx", lot_id="lot-lx")]},
+    )
+    candidate_config = _config(account="lx", host="OpenD.EXAMPLE")
+
+    merged, resolved_plan = (
+        merge_close_advice_requirements_into_prefetch_config(
+            candidate_config=candidate_config,
+            requirements_plan=plan,
+        )
+    )
+
+    requirement = resolved_plan["accounts"]["lx"]["requirements"][0]
+    diagnostic = merged["_close_advice_required_data_diagnostics"][0]
+    assert resolved_plan["accounts"]["lx"]["status"] == "ready"
+    assert requirement["planning_status"] == "ready"
+    assert diagnostic["rejected_requirement_ids"] == []
+    assert diagnostic["accepted_requirement_ids"] == [
+        requirement["requirement_id"]
+    ]
+
+
+class _FrozenWorkspace(NamedTuple):
+    config: dict
+    context_path: Path
+    required_root: Path
+    output_dir: Path
+    manifest_path: Path
+
+    def run_kwargs(self, base_dir: Path, *, plan: bool = True, **overrides: object) -> dict:
+        kwargs: dict[str, object] = {
+            "config": self.config,
+            "context_path": self.context_path,
+            "required_data_root": self.required_root,
+            "output_dir": self.output_dir,
+            "base_dir": base_dir,
+            "markets_to_run": ["US"],
+            "required_data_snapshot_manifest": self.manifest_path,
+            "required_data_snapshot_run_id": "run-1",
+            "account": "lx",
+        }
+        if plan:
+            kwargs["close_advice_required_data_plan"] = (
+                self.manifest_path.parent / "close_advice_required_data_plan.json"
+            )
+        kwargs.update(overrides)
+        return kwargs
+
+
+def _frozen_workspace(
+    tmp_path: Path,
+    *,
+    quote_strike: float = 100,
+    position_fields: dict[str, object] | None = None,
+    ledger_wheel: bool = False,
+    run_started_at_utc: datetime | None = None,
+    quote_expiration: str = "2026-08-28",
+    quote_ask: float = 2.1,
+    quote_delta: float = -0.3,
+    calendar_days: list[str] | None = None,
+) -> _FrozenWorkspace:
+    from src.application.ledger import api as ledger_api
+    from src.application.close_advice_required_data import (
+        PLAN_FILE_NAME,
+        build_close_advice_required_data_plan,
+        close_advice_market_date,
+        enrich_close_advice_required_data_plan,
+        publish_close_advice_required_data_plan,
+    )
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    from src.application.opend_symbol_outputs import (
+        publish_required_data_quote_snapshot,
+        save_outputs,
+    )
+    from src.application.positions.assigned_stock_view import build_assigned_stock_view
+    from src.application.positions.context_builder import build_context
+    from src.application.required_data_plan_identity import (
+        build_required_data_expected_fetch_contract,
+        required_data_plan_id,
+    )
+    from src.application.required_data_snapshot import (
+        seal_required_data_snapshot,
+    )
+
+    run_id = "run-1"
+    run_dir = tmp_path / "output_runs" / run_id
+    required_root = run_dir / "required_data"
+    (required_root / "raw").mkdir(parents=True)
+    (required_root / "parsed").mkdir(parents=True)
+    state_dir = run_dir / "state"
+    state_dir.mkdir()
+    account_state = run_dir / "accounts" / "lx" / "state"
+    account_state.mkdir(parents=True)
+    output_dir = run_dir / "accounts" / "lx"
+    config = _config(account="lx")
+    if ledger_wheel:
+        repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+        ledger_api.record_manual_position_open(
+            repo,
+            broker="富途",
+            account="lx",
+            symbol="NVDA",
+            option_type="put",
+            side="short",
+            contracts=2,
+            currency="USD",
+            strike=100,
+            multiplier=100,
+            expiration_ymd="2026-08-21",
+            premium_per_share=2,
+            opened_at_ms=1_000,
+        )
+        put_id = repo.list_position_lots()[0]["record_id"]
+        ledger_api.record_manual_assignment(
+            repo,
+            lot_id=put_id,
+            contracts_to_close=2,
+            stock_side="buy",
+            stock_qty=200,
+            stock_price=100,
+            as_of_ms=2_000,
+        )
+        stock_id = build_assigned_stock_view(
+            repo,
+            account="lx",
+            as_of_ms=2_000,
+        )["assigned_stock_lots"][0]["stock_lot_id"]
+        ledger_api.record_manual_position_open(
+            repo,
+            broker="富途",
+            account="lx",
+            symbol="NVDA",
+            option_type="call",
+            side="short",
+            contracts=2,
+            currency="USD",
+            strike=110,
+            multiplier=100,
+            expiration_ymd="2026-07-29",
+            premium_per_share=2,
+            opened_at_ms=3_000,
+            strategy_snapshot={
+                "strategy": "wheel",
+                "leg_role": "wheel_call",
+                "source_stock_lot_id": stock_id,
+            },
+        )
+        # The strategy family's home is the event layer
+        # (``write-side-definition.md`` §2), so the context is built from the
+        # read model's own loader -- the same one ``pipeline_context`` uses --
+        # rather than straight off the stored payload.
+        from src.application.ledger.read_model import load_position_lot_records
+
+        position_records = load_position_lot_records(repo)
+        assigned = build_assigned_stock_view(
+            repo,
+            account="lx",
+            as_of_ms=3_000,
+        )
+        assert [
+            row["shares"] for row in assigned["covered_call_allocations"]
+        ] == [200]
+    else:
+        record = _position(account="lx", lot_id="lot-lx")
+        record["fields"].update(position_fields or {})
+        record["fields"]["contract_key"]["expiration_ymd"] = quote_expiration
+        position_records = [record]
+    started = run_started_at_utc or datetime(2026, 7, 29, 14, 40, tzinfo=timezone.utc)
+    plan = build_close_advice_required_data_plan(
+        run_id=run_id,
+        run_started_at_utc=started,
+        account_configs={"lx": config},
+        base_config=config,
+        markets_to_run=["US"],
+        position_records_by_account={"lx": position_records},
+    )
+    plan_path = state_dir / PLAN_FILE_NAME
+    publish_close_advice_required_data_plan(
+        path=plan_path,
+        payload=plan,
+    )
+    observed_at = started if run_started_at_utc else datetime.now(timezone.utc) - timedelta(seconds=5)
+    completed_at = observed_at + timedelta(seconds=1)
+    discovery_trading_date = close_advice_market_date(started, "US")
+    quote_dte = (
+        date.fromisoformat(quote_expiration) - discovery_trading_date
+    ).days
+    quote_spot = 110.0
+    term_lookback = max(20, quote_dte)
+    term_input_hash = "a" * 64
+    term_entry = {
+        "schema_version": "term_matched_rv.v1",
+        "expiration": quote_expiration,
+        "status": "ok",
+        "reason": None,
+        "term_matched_rv": 0.2,
+        "remaining_sessions": quote_dte,
+        "lookback_sessions": term_lookback,
+        "input_start": "2026-01-02",
+        "input_end": discovery_trading_date.isoformat(),
+        "input_close_session_count": term_lookback + 1,
+        "input_return_count": term_lookback,
+        "input_hash": term_input_hash,
+    }
+    side_plan = {
+        "option_type": "put",
+        "min_dte": quote_dte,
+        "max_dte": quote_dte,
+        "explicit_expirations": [quote_expiration],
+        "strike_window": {
+            "min_strike": quote_strike,
+            "max_strike": quote_strike,
+            "source": "close_advice_fixture",
+            "buffer_applied": False,
+            "buffer_pct": 0.0,
+            "base_min_strike": quote_strike,
+            "base_max_strike": quote_strike,
+        },
+        "planning_reason": "close_advice_fixture",
+        "source_fields": ["open_position"],
+        "spot_reference": quote_spot,
+        "min_strike": quote_strike,
+        "max_strike": quote_strike,
+        "expiration_count": 1,
+        "required_exact_strikes_by_expiration": {
+            quote_expiration: [float(quote_strike)],
+        },
+    }
+    fetch_plan = {
+        "symbol": "NVDA",
+        "spot_reference": quote_spot,
+        "require_realized_volatility": True,
+        "side_plans": [side_plan],
+        "merged_requests": [
+            {
+                "symbol": "NVDA",
+                "limit_expirations": 8,
+                "host": "127.0.0.1",
+                "port": 11111,
+                "option_types": ["put"],
+                "explicit_expirations": [quote_expiration],
+                "trading_date": discovery_trading_date.isoformat(),
+                "min_dte": quote_dte,
+                "max_dte": quote_dte,
+                "side_strike_windows": {
+                    "put": {
+                        "min_strike": quote_strike,
+                        "max_strike": quote_strike,
+                    }
+                },
+                "include_realized_volatility": True,
+                "side_plans": [side_plan],
+                "planning_reason": "close_advice_fixture",
+            }
+        ],
+        "expiration_discovery_complete": True,
+        "expiration_discovery_error": None,
+        "expiration_discovery": {
+            "outcome": "success_rows",
+            "reason_code": None,
+            "expirations": [quote_expiration],
+            "observed_at_utc": observed_at.isoformat(),
+            "completed_at_utc": completed_at.isoformat(),
+            "request_identity": {
+                "symbol": "NVDA",
+                "underlier": "US.NVDA",
+                "source": "opend",
+                "host": "127.0.0.1",
+                "port": 11111,
+                "trading_date": discovery_trading_date.isoformat(),
+            },
+            "error": None,
+        },
+        "projection_outcome": "success_rows",
+        "projected_expirations": [quote_expiration],
+    }
+    expected_contract = build_required_data_expected_fetch_contract(
+        symbol="NVDA",
+        fetch_plan=fetch_plan,
+        source="opend",
+        host="127.0.0.1",
+        port=11111,
+    )
+    quote_payload = {
+        "symbol": "NVDA",
+        "underlier_code": "US.NVDA",
+        "meta": {
+            "status": "ok",
+            "source": "opend",
+            "host": "127.0.0.1",
+            "port": 11111,
+            "trading_date": discovery_trading_date.isoformat(),
+            "source_outcome": "success_rows",
+            "source_observed_at": observed_at.isoformat(),
+            "completed_at_utc": completed_at.isoformat(),
+            "snapshot_requested_codes": 1,
+            "snapshot_returned_codes": 1,
+            "snapshot_missing_codes": 0,
+            "snapshot_unexpected_codes": 0,
+            "snapshot_requested_code_set": ["NVDA-P"],
+            "snapshot_returned_code_set": ["NVDA-P"],
+            "snapshot_missing_code_set": [],
+            "snapshot_unexpected_code_set": [],
+            "snapshot_complete": True,
+            "realized_volatility": {
+                "status": "ok",
+                "reason": None,
+                "realized_volatility_20": 0.2,
+                "realized_volatility_60": 0.2,
+                "realized_volatility_120": 0.2,
+                "realized_volatility_estimate": 0.2,
+                "term_matched": {quote_expiration: term_entry},
+                "qfq_history": {"status": "ok"},
+                "trading_calendar": {"status": "ok"},
+            },
+        },
+        "rows": [
+            {
+                "symbol": "NVDA",
+                "market": "US",
+                "option_type": "put",
+                "expiration": quote_expiration,
+                "dte": quote_dte,
+                "contract_symbol": "NVDA-P",
+                "strike": quote_strike,
+                "spot": quote_spot,
+                "bid": 1.9 if quote_ask >= 1.9 else quote_ask / 2,
+                "ask": quote_ask,
+                "mid": ((1.9 if quote_ask >= 1.9 else quote_ask / 2) + quote_ask) / 2,
+                "last_price": quote_ask,
+                "implied_volatility": 0.3,
+                "realized_volatility_20": 0.2,
+                "realized_volatility_60": 0.2,
+                "realized_volatility_120": 0.2,
+                "realized_volatility_estimate": 0.2,
+                "term_matched_rv": 0.2,
+                "term_matched_rv_status": "ok",
+                "term_matched_rv_reason": None,
+                "term_matched_rv_remaining_sessions": quote_dte,
+                "term_matched_rv_lookback_sessions": term_lookback,
+                "term_matched_rv_input_start": "2026-01-02",
+                "term_matched_rv_input_end": discovery_trading_date.isoformat(),
+                "term_matched_rv_input_session_count": term_lookback + 1,
+                "term_matched_rv_input_hash": term_input_hash,
+                "delta": quote_delta,
+                "snapshot_received_at_utc": completed_at.isoformat(),
+                "multiplier": 100,
+            }
+        ],
+    }
+    raw_path, csv_path = save_outputs(
+        tmp_path,
+        "NVDA",
+        quote_payload,
+        output_root=required_root,
+    )
+    publish_required_data_quote_snapshot(
+        runtime_root=tmp_path,
+        producer_root=required_root,
+        producer_run_id=run_id,
+        symbol="NVDA",
+        raw_path=raw_path,
+        csv_path=csv_path,
+        fetch_plan=fetch_plan,
+        fetch_policy={
+            "source": "opend",
+            "host": "127.0.0.1",
+            "port": 11111,
+        },
+        expected_fetch_contract=expected_contract,
+        source_observed_at=observed_at,
+        completed_at=completed_at,
+        now=completed_at,
+    )
+    plan_items = [
+        {
+            "symbol": "NVDA",
+            "source": "opend",
+            "fetch_plan": fetch_plan,
+            "fetch_binding": expected_contract["fetch_binding"],
+            "expected_fetch_contract": expected_contract,
+            "projection_outcome": "success_rows",
+            "discovery_status": "complete",
+        }
+    ]
+    if calendar_days is not None:
+        class Gateway:
+            def get_trading_days_with_receipt(self, **_kwargs):
+                return {
+                    "retcode": 0, "coverage_complete": True, "pagination_complete": True,
+                    "page_count": 1,
+                    "rows": [{"time": day, "trade_date_type": "WHOLE"} for day in calendar_days],
+                }
+
+            def get_market_state(self, _codes):
+                return [{"code": "US.NVDA", "market_state": "MORNING"}]
+
+            def close(self):
+                pass
+
+        enrich_close_advice_required_data_plan(
+            plan_path=plan_path, expected_run_id=run_id,
+            gateway_factory=lambda **_kwargs: Gateway(),
+        )
+    manifest_path = state_dir / "required_data_snapshot_manifest.json"
+    seal_required_data_snapshot(
+        manifest_path=manifest_path,
+        required_data_root=required_root,
+        run_id=run_id,
+        prefetch_summary={
+            "global_required_data_plan": {
+                "plan_id": required_data_plan_id(plan_items),
+                "symbols": plan_items,
+            },
+            "symbols": [],
+            "results": [],
+        },
+        close_advice_required_data_plan_path=plan_path,
+    )
+    context = build_context(
+        position_records,
+        broker="富途",
+        account="lx",
+        observed_at=started,
+    )
+    context_path = account_state / "option_positions_context.json"
+    context_path.write_text(
+        json.dumps(context),
+        encoding="utf-8",
+    )
+    return _FrozenWorkspace(
+        config, context_path, required_root, output_dir, manifest_path
+    )
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected"), [(-0.06, "close"), (-0.01, "hold")]
+)
+def test_frozen_v3_decision_uses_sealed_calendar_and_delta(
+    tmp_path: Path, delta: float, expected: str,
+) -> None:
+    from src.application.close_advice_required_data import close_advice_market_date
+    from src.application.close_advice_runner import run_close_advice
+
+    started = datetime.now(timezone.utc) - timedelta(seconds=10)
+    market_day = close_advice_market_date(started, "US")
+    expiry = market_day + timedelta(days=14)
+    frozen = _frozen_workspace(
+        tmp_path,
+        run_started_at_utc=started,
+        quote_expiration=expiry.isoformat(),
+        quote_ask=0.1,
+        quote_delta=delta,
+        calendar_days=[market_day.isoformat(), expiry.isoformat()],
+    )
+    result = run_close_advice(**frozen.run_kwargs(tmp_path))
+    row = pd.read_csv(frozen[3] / "close_advice.csv").iloc[0]
+
+    assert result["snapshot_authority"] == "valid"
+    assert row["policy_version"] == "remaining_yield_capture.v3"
+    assert row["trading_calendar_status"] == "ok"
+    assert row["remaining_trading_sessions"] == 2
+    assert row["recommendation_state"] == expected
+    assert row["decision_evidence_status"] == "complete"
+
+
+@pytest.mark.parametrize(
+    ("delta", "expected"), [(-0.06, "close"), (-0.01, "not_evaluable")]
+)
+def test_frozen_v3_missing_calendar_uses_delta_only_when_conclusive(
+    tmp_path: Path, delta: float, expected: str,
+) -> None:
+    from src.application.close_advice_required_data import close_advice_market_date
+    from src.application.close_advice_runner import run_close_advice
+
+    started = datetime.now(timezone.utc) - timedelta(seconds=10)
+    expiry = close_advice_market_date(started, "US") + timedelta(days=14)
+    frozen = _frozen_workspace(
+        tmp_path, run_started_at_utc=started, quote_expiration=expiry.isoformat(),
+        quote_ask=0.1, quote_delta=delta,
+    )
+    result = run_close_advice(**frozen.run_kwargs(tmp_path))
+    row = pd.read_csv(frozen[3] / "close_advice.csv").iloc[0]
+
+    assert result["snapshot_authority"] == "valid"
+    assert row["trading_calendar_status"] == "unavailable"
+    assert row["trading_calendar_reason"] == "calendar_plan_not_enriched"
+    assert row["recommendation_state"] == expected
+
+
+def test_frozen_close_advice_reads_only_sealed_snapshot(
+    tmp_path: Path,
+) -> None:
+    from src.application import close_advice_runner as runner
+
+    frozen = _frozen_workspace(
+        tmp_path,
+        position_fields={
+            "strategy": "combo_yield",
+            "strategy_group_id": "combo-group-1",
+            "leg_role": "funding_put",
+        },
+    )
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    assert not hasattr(runner, "_ensure_required_data_coverage_for_positions")
+    assert not hasattr(runner, "_fetch_missing_quotes_via_opend")
+    (required_root / "parsed" / "NVDA_required_data.meta.json").write_text(
+        json.dumps(
+            {
+                "symbol": "NVDA",
+                "status": "stale",
+                "csv_sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tracked = sorted(
+        [
+            *required_root.glob("raw/*"),
+            *required_root.glob("parsed/*"),
+            *required_root.glob("receipts/**/*"),
+        ]
+    )
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in tracked if path.is_file()}
+
+    result = runner.run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    assert result["snapshot_authority"] == "valid"
+    assert result["quote_mode"] == "frozen_snapshot"
+    assert result["quote_fetch_diagnostics"]["network_fetch_attempts"] == 0
+    assert result["quote_fetch_diagnostics"]["required_data_write_attempts"] == 0
+    assert result["quote_fetch_diagnostics"]["position_requirements_validated"] == 1
+    assert result["quote_fetch_diagnostics"]["position_requirements_missing"] == 0
+    assert len(result["quote_fetch_diagnostics"]["binding_ids"]) == 1
+    assert result["business_date"] == "2026-07-29"
+    assert result["report_manifest"]["status"] == "success"
+    assert result["close_advice_required_data_plan_sha256"]
+    csv_path = output_dir / "close_advice.csv"
+    row = pd.read_csv(csv_path).iloc[0].to_dict()
+    assert row["quote_mode"] == "frozen_snapshot"
+    assert row["required_data_snapshot_plan_id"]
+    assert row["required_data_snapshot_manifest_sha256"]
+    assert row["close_advice_required_data_plan_sha256"]
+    assert row["required_data_requirement_id"]
+    assert row["required_data_binding_id"]
+    assert row["required_data_snapshot_id"]
+    assert row["required_data_receipt_hash"]
+    assert row["required_data_payload_sha256"]
+    assert row["required_data_source_observed_at"]
+    assert row["required_data_expires_at"]
+    assert row["strategy_group_id"] == "combo-group-1"
+    assert row["leg_role"] == "funding_put"
+    assert pd.isna(row["source_stock_lot_id"])
+    assert result["report_manifest"]["csv_sha256"] == hashlib.sha256(csv_path.read_bytes()).hexdigest()
+    assert "strategy_group_id" not in result["report_manifest"]
+    assert "leg_role" not in result["report_manifest"]
+    assert "source_stock_lot_id" not in result["report_manifest"]
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before} == before
+
+
+def _run_frozen_wheel_close_advice(tmp_path: Path):
+    """Run frozen-snapshot close advice over the wheel ledger, read its report."""
+
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(
+        tmp_path,
+        ledger_wheel=True,
+    )
+    config, context_path, required_root, output_dir, manifest_path = frozen
+
+    result = run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    csv_path = output_dir / "close_advice.csv"
+    row = pd.read_csv(csv_path).iloc[0]
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    return result, row, context["open_positions_min"][0], csv_path, config
+
+
+def test_frozen_lifecycle_close_advice_preserves_wheel_stock_relationship(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_service import (
+        assemble_daily_decision_brief,
+    )
+
+    result, row, _context_row, csv_path, config = _run_frozen_wheel_close_advice(
+        tmp_path
+    )
+
+    assert result["snapshot_authority"] == "valid"
+    assert result["quote_mode"] == "frozen_snapshot"
+    assert row["recommendation_state"] == "not_evaluable"
+    assert row["position_lifecycle_state"] == "expiry_day"
+    assert row["strategy_family"] == "covered_call"
+    assert result["report_manifest"]["csv_sha256"] == hashlib.sha256(
+        csv_path.read_bytes()
+    ).hexdigest()
+
+    brief = assemble_daily_decision_brief(
+        base=tmp_path,
+        run_id="run-1",
+        account="lx",
+        market="US",
+        scheduler_decision={"in_run_window": True},
+        account_result={"ran_scan": True, "reason": "ok"},
+        pipeline_succeeded=True,
+        config=config,
+        now_utc=datetime(2026, 7, 29, 14, tzinfo=timezone.utc),
+    )
+    assert len(brief["positions"]) == 1
+    assert brief["positions"][0]["position_lot_id"] == row["position_lot_id"]
+
+
+def test_frozen_lifecycle_close_advice_keeps_the_wheel_leg_relationship(
+    tmp_path: Path,
+) -> None:
+    """The wheel call's relationship has to survive into the close-advice report.
+
+    ``strategy_group_id`` / ``leg_role`` / ``source_stock_lot_id`` are
+    RECONSTRUCTIBLE lot keys (``write-side-definition.md`` §2) whose home is the
+    wheel open/adjust event's payload, while
+    ``close_advice_runner._position_relationship_fields`` reads them off the
+    position dict it is handed -- and that dict comes from the context's
+    ``open_positions_min``, which ``ledger/views.py:as_open_position_min`` builds
+    from the lot payload. The event side reaches that payload now
+    (``read_model.load_position_lot_records`` folds it onto the read model's
+    records), so the relationship is carried through instead of dropped.
+    """
+
+    from src.application.daily_decision_brief_service import (
+        assemble_daily_decision_brief,
+    )
+
+    _result, row, context_row, _csv_path, config = _run_frozen_wheel_close_advice(
+        tmp_path
+    )
+    # The event-side family reaches the context row the runner reads...
+    assert context_row["strategy"] == "wheel"
+    assert context_row["leg_role"] == "wheel_call"
+    assert context_row["source_stock_lot_id"]
+    # ...and is carried from there into the CSV the report publishes.
+    assert row["leg_role"] == "wheel_call"
+    assert row["source_stock_lot_id"] == context_row["source_stock_lot_id"]
+    assert (
+        row["strategy_group_id"] == context_row["strategy_group_id"]
+    ) or (
+        pd.isna(row["strategy_group_id"]) and context_row["strategy_group_id"] is None
+    )
+
+    brief = assemble_daily_decision_brief(
+        base=tmp_path,
+        run_id="run-1",
+        account="lx",
+        market="US",
+        scheduler_decision={"in_run_window": True},
+        account_result={"ran_scan": True, "reason": "ok"},
+        pipeline_succeeded=True,
+        config=config,
+        now_utc=datetime(2026, 7, 29, 14, tzinfo=timezone.utc),
+    )
+    assert len(brief["positions"]) == 1
+    assert (
+        brief["positions"][0]["source_stock_lot_id"]
+        == row["source_stock_lot_id"]
+    )
+
+
+def test_bound_plan_snapshot_returns_the_exact_validated_generation(
+    tmp_path: Path,
+) -> None:
+    from src.application.close_advice_required_data import (
+        resolve_bound_close_advice_required_data_plan_snapshot,
+    )
+    from src.application.required_data_snapshot import (
+        load_required_data_snapshot_manifest_snapshot,
+    )
+
+    frozen = _frozen_workspace(tmp_path)
+    manifest, _root, _manifest_bytes = (
+        load_required_data_snapshot_manifest_snapshot(
+            manifest_path=frozen.manifest_path,
+            expected_run_id="run-1",
+            expected_required_data_root=frozen.required_root,
+        )
+    )
+    snapshot = resolve_bound_close_advice_required_data_plan_snapshot(
+        manifest_path=frozen.manifest_path,
+        manifest=manifest,
+        expected_run_id="run-1",
+    )
+    assert snapshot is not None
+    payload, plan_path, plan_bytes = snapshot
+    plan_path.write_text("{}\n", encoding="utf-8")
+
+    assert json.loads(plan_bytes) == payload
+    assert plan_path.read_bytes() != plan_bytes
+
+
+def test_frozen_close_advice_rejects_parent_manifest_generation_mismatch(
+    tmp_path: Path,
+) -> None:
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+
+    result = run_close_advice(**frozen.run_kwargs(tmp_path, required_data_snapshot_manifest_sha256="0" * 64))
+
+    assert result["status"] == "snapshot_integrity_failed"
+    assert result["snapshot_authority"] == "invalid"
+    assert "generation mismatch" in result["integrity_failure"]["evidence"][
+        "message"
+    ]
+
+
+def test_frozen_close_advice_keeps_known_symbol_failure_as_data_gap(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.decision_state_fingerprint import canonical_sha256
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(tmp_path)
+    manifest = json.loads(frozen.manifest_path.read_text(encoding="utf-8"))
+    manifest["symbols"]["NVDA"] = {
+        "status": "failed",
+        "reason": "get_option_chain failed: PacketErr.Timeout",
+        "error_type": "RequiredDataFetchError",
+    }
+    manifest["summary"] = {"symbols_total": 1, "ready": 0, "failed": 1}
+    manifest["status"] = "failed"
+    manifest.pop("content_sha256")
+    manifest["content_sha256"] = canonical_sha256(manifest)
+    frozen.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    assert result["snapshot_authority"] == "valid"
+    assert result["status"] == "degraded"
+    assert result["evaluation_gap_rows"] == 1
+    assert result["flag_counts"]["required_data_snapshot_unavailable"] == 1
+    assert result["report_manifest"]["status"] == "success"
+
+
+def test_frozen_integrity_failure_invalidates_old_success_report(
+    tmp_path: Path,
+) -> None:
+    from src.application.close_advice_report_manifest import (
+        validate_close_advice_report_manifest,
+    )
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    kwargs = frozen.run_kwargs(tmp_path)
+    first = run_close_advice(**kwargs)
+    assert first["snapshot_authority"] == "valid"
+    old_csv = (output_dir / "close_advice.csv").read_bytes()
+    quote_csv = required_root / "parsed" / "NVDA_required_data.csv"
+    quote_csv.write_bytes(quote_csv.read_bytes() + b"\n")
+
+    second = run_close_advice(**kwargs)
+
+    assert second["status"] == "snapshot_integrity_failed"
+    assert second["snapshot_authority"] == "invalid"
+    assert (output_dir / "close_advice.csv").read_bytes() == old_csv
+    validation = validate_close_advice_report_manifest(
+        csv_path=output_dir / "close_advice.csv",
+        desired_market="US",
+        account="lx",
+    )
+    assert validation["ok"] is False
+    assert validation["reason"] == "close_advice_manifest_not_success"
+    assert validation["status"] == "failed"
+
+
+def test_close_report_manifest_binds_run_and_quote_mode(tmp_path: Path) -> None:
+    from src.application.close_advice_report_manifest import (
+        validate_close_advice_report_manifest,
+    )
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    result = run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    assert result["snapshot_authority"] == "valid"
+    valid = validate_close_advice_report_manifest(
+        csv_path=output_dir / "close_advice.csv",
+        desired_market="US",
+        account="lx",
+        expected_run_id="run-1",
+        expected_quote_mode="frozen_snapshot",
+    )
+    wrong_run = validate_close_advice_report_manifest(
+        csv_path=output_dir / "close_advice.csv",
+        expected_run_id="run-2",
+    )
+    wrong_mode = validate_close_advice_report_manifest(
+        csv_path=output_dir / "close_advice.csv",
+        expected_quote_mode="legacy_mutable",
+    )
+
+    assert valid["ok"] is True
+    assert wrong_run["reason"] == "close_advice_report_run_mismatch"
+    assert wrong_mode["reason"] == "close_advice_report_quote_mode_mismatch"
+
+
+def test_frozen_missing_exact_contract_is_position_scoped_without_fetch(
+    tmp_path: Path,
+) -> None:
+    from src.application import close_advice_runner as runner
+
+    frozen = _frozen_workspace(tmp_path, quote_strike=105)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    assert not hasattr(runner, "_ensure_required_data_coverage_for_positions")
+    assert not hasattr(runner, "_fetch_missing_quotes_via_opend")
+
+    result = runner.run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    assert result["snapshot_authority"] == "valid"
+    assert result["status"] == "degraded"
+    assert result["evaluation_gap_rows"] == 1
+    assert result["flag_counts"]["required_data_missing_contract"] == 1
+    assert result["notify_rows"] == 0
+    assert result["quote_fetch_diagnostics"]["network_fetch_attempts"] == 0
+    assert result["quote_fetch_diagnostics"]["position_requirements_missing"] == 1
+
+
+def test_frozen_evaluation_consumes_validated_receipt_bytes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from src.application import close_advice_runner as runner
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    quote_csv = required_root / "parsed" / "NVDA_required_data.csv"
+    original_bytes = quote_csv.read_bytes()
+    original_resolve = runner.resolve_frozen_required_data_csv_bytes_batch
+    original_load = runner._load_frozen_required_data_quotes
+    resolve_calls = 0
+
+    def _resolve_then_tamper(**kwargs):
+        nonlocal resolve_calls
+        resolved = original_resolve(**kwargs)
+        resolve_calls += 1
+        if resolve_calls == 1:
+            quote_csv.write_text("tampered\n", encoding="utf-8")
+        return resolved
+
+    def _load_then_restore(**kwargs):
+        quotes = original_load(**kwargs)
+        quote_csv.write_bytes(original_bytes)
+        return quotes
+
+    monkeypatch.setattr(
+        runner,
+        "resolve_frozen_required_data_csv_bytes_batch",
+        _resolve_then_tamper,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_frozen_required_data_quotes",
+        _load_then_restore,
+    )
+
+    result = runner.run_close_advice(**frozen.run_kwargs(tmp_path))
+
+    assert result["snapshot_authority"] == "valid"
+    assert result["evaluable_rows"] == 0
+    row = pd.read_csv(output_dir / "close_advice.csv").iloc[0]
+    assert row["close_mid"] == 2.0
+    assert quote_csv.read_bytes() == original_bytes
+    assert resolve_calls == 2
+
+
+def test_unbound_snapshot_fails_closed_before_evaluation(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.decision_state_fingerprint import canonical_sha256
+    from src.application import close_advice_runner as runner
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.pop("close_advice_required_data_plan_relpath")
+    manifest.pop("close_advice_required_data_plan_sha256")
+    manifest.pop("content_sha256")
+    manifest["content_sha256"] = canonical_sha256(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+    result = runner.run_close_advice(**frozen.run_kwargs(tmp_path, plan=False))
+
+    assert result["snapshot_authority"] == "invalid"
+    assert result["status"] == "snapshot_integrity_failed"
+    assert "plan is unavailable" in result["integrity_failure"]["evidence"]["message"]
+
+def test_unsafe_bound_plan_path_fails_snapshot_authority(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.decision_state_fingerprint import canonical_sha256
+    from src.application.close_advice_runner import run_close_advice
+
+    frozen = _frozen_workspace(tmp_path)
+    config, context_path, required_root, output_dir, manifest_path = frozen
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["close_advice_required_data_plan_relpath"] = "../outside.json"
+    manifest.pop("content_sha256")
+    manifest["content_sha256"] = canonical_sha256(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    result = run_close_advice(**frozen.run_kwargs(tmp_path, plan=False))
+
+    assert result["status"] == "snapshot_integrity_failed"
+    assert result["snapshot_authority"] == "invalid"
+    assert (
+        result["integrity_failure"]["evidence"]["error_type"]
+        == "CloseAdviceRequiredDataPlanError"
+    )

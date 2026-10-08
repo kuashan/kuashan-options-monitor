@@ -1,0 +1,2274 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from copy import deepcopy
+from pathlib import Path
+
+import pytest
+import yaml
+
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.config_defaults import DEFAULT_CONFIG, DEFAULT_CONFIG_REF
+from src.application.config_yaml_accounts import mutate_yaml_account_config
+from src.application.config_profiles import apply_profiles
+from src.application.config_validator import validate_config
+from src.application.config_yaml import (
+    RESOLVED_KEY,
+    build_yaml_runtime_config_file,
+    build_yaml_bot_config_file,
+    explain_yaml_config_key,
+    market_user_config_fingerprint,
+    resolve_yaml_bot_config,
+    resolve_yaml_runtime_config,
+    runtime_strategy_keys_to_yaml_authoring,
+    yaml_to_market_user_config,
+)
+from src.application.config_yaml_init import init_yaml_config
+from src.application.config_yaml_symbols import mutate_yaml_symbol_config, set_yaml_symbol_config
+from src.application.pipeline_watchlist import resolve_watchlist_item_runtime_config
+from src.application.runtime_config_freshness import (
+    GENERATED_KEY,
+    RuntimeConfigFreshnessError,
+    check_runtime_config_freshness,
+    ensure_runtime_config_freshness,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_yaml(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _contains_mapping_key(value: object, key: str) -> bool:
+    if isinstance(value, dict):
+        return key in value or any(
+            _contains_mapping_key(item, key) for item in value.values()
+        )
+    if isinstance(value, list):
+        return any(_contains_mapping_key(item, key) for item in value)
+    return False
+
+
+def _minimal_yaml() -> str:
+    return """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+    futu:
+      host: 127.0.0.1
+      port: 11111
+      trd_env: REAL
+  sy:
+    type: futu
+    futu_account_id: "REAL_87654321"
+    futu:
+      host: 127.0.0.1
+      port: 22222
+      trd_env: REAL
+
+features:
+  close_advice: false
+
+bot:
+  enabled: true
+  context_window_messages: 6
+  default_market_scope: us
+  llm:
+    provider: ""
+    base_url: ""
+    model: ""
+    api_key_env: OM_LLM_API_KEY
+    confidence_min: 0.75
+    timeout_seconds: 20
+    max_output_tokens: 512
+
+markets:
+  us:
+    accounts: [lx, sy]
+    symbols:
+      - NVDA
+      - FUTU
+    overrides:
+      FUTU:
+        sell_put:
+          dte: [20, 45]
+          strike: [55, 85]
+        covered_call:
+          enabled: true
+          dte: [20, 60]
+          strike: [90, 120]
+        combo_yield: true
+
+  hk:
+    accounts: [lx]
+    symbols:
+      - "0700.HK"
+
+inbound:
+  feishu_ws:
+    ack_reaction: THUMBSUP
+"""
+
+
+@pytest.mark.parametrize('key', ['multi_account_max_workers', 'account_max_workers'])
+@pytest.mark.parametrize('value', [0, -1, True, 1.5, 'two', '2.0', None])
+def test_account_worker_config_rejects_invalid_value_before_build_write(
+    tmp_path: Path, key: str, value: object,
+) -> None:
+    doc = yaml.safe_load(_minimal_yaml())
+    doc['runtime'] = {key: value}
+    source = _write_yaml(tmp_path / 'config.yaml', yaml.safe_dump(doc))
+    output = tmp_path / 'config.us.json'
+
+    with pytest.raises(AgentToolError, match=f'runtime\\.{key}'):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=source)
+    with pytest.raises(AgentToolError, match=f'runtime\\.{key}'):
+        build_yaml_runtime_config_file(
+            repo_root=REPO_ROOT, market='us', config_path=source,
+            output_config_path=output,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize('key,expected', [
+    ('multi_account_max_wokers', 'multi_account_max_workers'),
+    ('account_max_worker', 'account_max_workers'),
+])
+def test_account_worker_config_rejects_obvious_typo(
+    tmp_path: Path, key: str, expected: str,
+) -> None:
+    doc = yaml.safe_load(_minimal_yaml())
+    doc['runtime'] = {key: 2}
+    source = _write_yaml(tmp_path / 'config.yaml', yaml.safe_dump(doc))
+    output = tmp_path / 'config.us.json'
+
+    with pytest.raises(AgentToolError, match=f'runtime\\.{key}.*runtime\\.{expected}'):
+        build_yaml_runtime_config_file(
+            repo_root=REPO_ROOT, market='us', config_path=source,
+            output_config_path=output,
+        )
+    assert not output.exists()
+
+
+def test_account_worker_config_preserves_legacy_and_modern_precedence(tmp_path: Path) -> None:
+    doc = yaml.safe_load(_minimal_yaml())
+    doc['runtime'] = {'account_max_workers': 1, 'multi_account_max_workers': 9}
+    source = _write_yaml(tmp_path / 'config.yaml', yaml.safe_dump(doc))
+    cfg, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=source)
+    validate_config(deepcopy(cfg))
+    assert cfg['runtime']['account_max_workers'] == 1
+    assert cfg['runtime']['multi_account_max_workers'] == 9
+
+    doc['runtime'] = {'account_max_workers': 1}
+    source.write_text(yaml.safe_dump(doc), encoding='utf-8')
+    cfg, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=source)
+    assert cfg['runtime']['account_max_workers'] == 1
+
+    doc.pop('runtime')
+    source.write_text(yaml.safe_dump(doc), encoding='utf-8')
+    cfg, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=source)
+    assert 'multi_account_max_workers' not in cfg['runtime']
+    assert 'account_max_workers' not in cfg['runtime']
+
+
+_US_FUTU_YAML_HEAD = """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+"""
+
+_US_HOLDINGS_YAML_HEAD = """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [FUTU]
+"""
+
+
+_FUTU_ACCOUNTS_YAML = """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+"""
+
+_BOT_DEFAULTS_YAML = """\
+bot:
+  enabled: true
+"""
+
+
+def test_yaml_config_rejects_opening_threshold_typo_before_runtime_build(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+    overrides:
+      NVDA:
+        sell_put:
+          min_annualized_net_retur: 0.99
+""",
+    )
+
+    with pytest.raises(AgentToolError) as exc_info:
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+    message = str(exc_info.value)
+    assert "markets.us.overrides.NVDA.sell_put" in message
+    assert "min_annualized_net_retur" in message
+    assert "min_annualized_net_return" in message
+
+
+def test_yaml_market_wheel_config_is_independent_and_account_scoped(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            "  us:\n    accounts: [lx, sy]\n",
+            "  us:\n"
+            "    accounts: [lx, sy]\n"
+            "    features:\n"
+            "      wheel:\n"
+            "        accounts: [lx]\n"
+            "        min_delta: 0.99\n"
+            "        call:\n"
+            "          dte: [30, 45]\n"
+            "          min_abs_delta: 0.26\n"
+            "        put:\n"
+            "          min_dte: 14\n"
+            "          max_dte: 35\n"
+            "        activation_by_account:\n"
+            "          lx:\n"
+            "            generation: 2\n"
+            "            activated_at_ms: 1700000000000\n"
+            "            deactivated_at_ms: null\n",
+            1,
+        ),
+    )
+
+    config, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert "enabled" not in config["wheel"]
+    assert config["wheel"]["accounts"] == ["lx"]
+    assert config["wheel"]["call"]["min_dte"] == 30
+    assert config["wheel"]["call"]["max_dte"] == 45
+    assert config["wheel"]["call"]["min_abs_delta"] == 0.26
+    assert config["wheel"]["call"]["max_abs_delta"] == 0.35
+    assert config["wheel"]["put"]["min_dte"] == 14
+    assert config["wheel"]["put"]["max_dte"] == 35
+    assert config["wheel"]["put"]["min_abs_delta"] == 0.25
+    assert config["wheel"]["activation_by_account"]["lx"] == {
+        "generation": 2,
+        "activated_at_ms": 1_700_000_000_000,
+        "deactivated_at_ms": None,
+    }
+    assert config["symbols"][0]["sell_call"]["enabled"] is False
+
+
+def test_yaml_wheel_rejects_unknown_field(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            "  us:\n    accounts: [lx, sy]\n",
+            "  us:\n"
+            "    accounts: [lx, sy]\n"
+            "    features:\n"
+            "      wheel:\n"
+            "        max_lifecycle_days: 90\n",
+            1,
+        ),
+    )
+
+    with pytest.raises(AgentToolError, match="max_lifecycle_days"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+
+def test_yaml_config_rejects_retired_ai_decision_advice_at_root(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml()
+        + """\
+ai_decision_advice:
+  enabled: false
+""",
+    )
+
+    with pytest.raises(AgentToolError) as exc_info:
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+    assert (
+        str(exc_info.value)
+        == "CONFIG_ERROR: config.yaml.ai_decision_advice is retired and must be removed"
+    )
+
+
+@pytest.mark.parametrize("market", ("us", "hk"))
+def test_yaml_config_rejects_retired_ai_decision_advice_in_market(
+    tmp_path: Path,
+    market: str,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            f"  {market}:\n",
+            f"  {market}:\n"
+            "    ai_decision_advice:\n"
+            "      enabled: true\n",
+            1,
+        ),
+    )
+
+    with pytest.raises(AgentToolError) as exc_info:
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market=market,
+            config_path=config_path,
+        )
+
+    assert (
+        str(exc_info.value)
+        == f"CONFIG_ERROR: markets.{market}.ai_decision_advice is retired and must be removed"
+    )
+
+
+def test_yaml_config_keeps_generic_error_for_nearby_unknown_ai_key(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml()
+        + """\
+ai_decision_advise:
+  enabled: true
+""",
+    )
+
+    with pytest.raises(AgentToolError) as exc_info:
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+    assert (
+        str(exc_info.value)
+        == "CONFIG_ERROR: config.yaml.ai_decision_advise is not supported in config.yaml"
+    )
+
+
+def test_runtime_config_rejects_retired_ai_decision_advice_key() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        validate_config({"ai_decision_advice": {"enabled": False}})
+
+    assert (
+        str(exc_info.value)
+        == "[CONFIG_ERROR] ai_decision_advice is retired and must be removed"
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ("pipeline_symbol_max_workers", "watchlist_max_workers"),
+)
+def test_runtime_config_rejects_retired_symbol_worker_keys(key: str) -> None:
+    with pytest.raises(SystemExit, match=rf"runtime\.{key} is no longer supported"):
+        validate_config(
+            {
+                "symbols": [{"symbol": "NVDA"}],
+                "runtime": {key: 1},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("setting", "message"),
+    [
+        ({"type": "external_holdings"}, "type"),
+        ({"type": "futu", "futu_account_id": "REAL_12345678", "holdings_account": ""}, "holdings_account is retired"),
+    ],
+)
+def test_yaml_config_rejects_retired_account_binding(tmp_path: Path, setting: dict, message: str) -> None:
+    doc = yaml.safe_load(_US_FUTU_YAML_HEAD)
+    doc["accounts"]["lx"] = setting
+    path = _write_yaml(tmp_path / "config.yaml", yaml.safe_dump(doc))
+
+    with pytest.raises(AgentToolError, match=message):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=path)
+
+
+@pytest.mark.parametrize(
+    ("portfolio", "message"),
+    [
+        ({"source_by_account": {"lx": "futu"}}, "source_by_account is retired"),
+        ({"source_by_account": {"lx": "auto"}}, "source_by_account is retired"),
+        ({"source": "holdings"}, "source=holdings is retired"),
+    ],
+)
+def test_runtime_config_rejects_retired_portfolio_binding(portfolio: dict, message: str) -> None:
+    cfg = {"accounts": ["lx"], "symbols": [{"symbol": "NVDA"}], "portfolio": portfolio}
+
+    with pytest.raises(SystemExit, match=message):
+        validate_config(cfg)
+
+
+def test_old_account_config_candidate_build_preserves_backup_and_ledger(tmp_path: Path) -> None:
+    old_doc = yaml.safe_load(_US_FUTU_YAML_HEAD)
+    old_doc["accounts"]["ext1"] = {"type": "external_holdings", "holdings_account": "Feishu EXT"}
+    old_doc["markets"]["us"]["accounts"].append("ext1")
+    old_doc["portfolio"] = {"source_by_account": {"ext1": "holdings"}}
+    source = _write_yaml(tmp_path / "config.yaml", yaml.safe_dump(old_doc))
+    old_bytes = source.read_bytes()
+    backup = tmp_path / "config.yaml.backup"
+    backup.write_bytes(old_bytes)
+    ledger = tmp_path / "option_positions.sqlite3"
+    ledger.write_bytes(b"isolated-ledger-sentinel")
+
+    with pytest.raises(AgentToolError):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=source)
+
+    candidate = deepcopy(old_doc)
+    del candidate["accounts"]["ext1"]
+    candidate["markets"]["us"]["accounts"].remove("ext1")
+    del candidate["portfolio"]["source_by_account"]
+    assert backup.read_bytes() == old_bytes
+    source.write_text(yaml.safe_dump(candidate), encoding="utf-8")
+    output = tmp_path / "config.us.json"
+    build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT, market="us", config_path=source, output_config_path=output
+    )
+    rebuilt = json.loads(output.read_text(encoding="utf-8"))
+
+    assert rebuilt["accounts"] == ["lx"]
+    assert "ext1" not in rebuilt["account_settings"]
+    assert "source_by_account" not in rebuilt["portfolio"]
+    assert ledger.read_bytes() == b"isolated-ledger-sentinel"
+
+
+def test_yaml_config_resolves_user_overrides_and_defaults(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    cfg, meta = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+    assert meta["source_format"] == "yaml"
+    assert cfg["accounts"] == ["lx", "sy"]
+    assert cfg["account_settings"]["lx"]["futu"]["account_id"] == "REAL_12345678"
+    assert cfg["account_settings"]["sy"]["futu"]["account_id"] == "REAL_87654321"
+    assert "source_by_account" not in cfg["portfolio"]
+    assert cfg["close_advice"]["enabled"] is False
+    assert "assistant" not in cfg
+    assert "inbound" not in cfg
+    assert cfg["symbols"][0]["symbol"] == "NVDA"
+    assert cfg["symbols"][0]["sell_put"]["min_dte"] == 7
+    futu = cfg["symbols"][1]
+    assert futu["symbol"] == "FUTU"
+    assert futu["sell_put"]["min_dte"] == 20
+    assert futu["sell_put"]["max_dte"] == 45
+    assert futu["sell_put"]["min_strike"] == 55
+    assert futu["sell_put"]["max_strike"] == 85
+    assert "covered_call" not in futu
+    assert futu["sell_call"]["enabled"] is True
+    assert futu["sell_call"]["min_dte"] == 20
+    assert futu["sell_call"]["max_dte"] == 60
+    assert futu["sell_call"]["min_strike"] == 90
+    assert futu["sell_call"]["max_strike"] == 120
+    assert futu["combo_yield"]["enabled"] is True
+    sell_put_template = cfg["templates"]["put_base"]["sell_put"]
+    sell_call_template = cfg["templates"]["call_base"]["sell_call"]
+    for side_cfg in (sell_put_template, sell_call_template):
+        assert side_cfg["strategy"] == "insurance_underwriting"
+        assert "concentration" not in side_cfg
+        assert "score_weights" not in side_cfg
+        assert "short_vol" not in side_cfg
+        assert side_cfg["min_iv_rv_ratio"] == 1.10
+        assert side_cfg["min_iv_minus_rv"] == 0.05
+        assert "reject_event_risk" not in side_cfg
+        assert "event_source_fail_closed" not in side_cfg
+    for side_cfg in (futu["sell_put"], futu["sell_call"]):
+        assert "concentration" not in side_cfg
+        assert "score_weights" not in side_cfg
+        assert "short_vol" not in side_cfg
+    assert cfg[GENERATED_KEY]["source_format"] == "yaml"
+    assert cfg[GENERATED_KEY]["sources"][0]["inline"] is True
+    assert cfg[GENERATED_KEY]["sources"][0]["ref"] == DEFAULT_CONFIG_REF
+    assert cfg[RESOLVED_KEY]["market"] == "us"
+    assert cfg[RESOLVED_KEY]["default_source"] == DEFAULT_CONFIG_REF
+
+    validate_config(json.loads(json.dumps(cfg)))
+
+
+def test_yaml_config_accepts_market_schedule_override(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            "  us:\n    accounts: [lx, sy]\n",
+            "  us:\n"
+            "    accounts: [lx, sy]\n"
+            "    schedule:\n"
+            "      gates:\n"
+            "        - type: before\n"
+            "          timezone: Asia/Shanghai\n"
+            "          time: '03:10'\n"
+            "          day_offset_from_window_start: 1\n",
+            1,
+        ),
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert cfg["schedule"]["gates"][0]["time"] == "03:10"
+    validate_config(json.loads(json.dumps(cfg)))
+
+
+def test_yaml_config_rejects_schedule_typo(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            "  us:\n    accounts: [lx, sy]\n",
+            "  us:\n"
+            "    accounts: [lx, sy]\n"
+            "    schedule:\n"
+            "      gtaes: []\n",
+            1,
+        ),
+    )
+
+    with pytest.raises(AgentToolError, match="schedule contains unsupported keys: gtaes"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+
+def test_yaml_config_rejects_string_combo_yield_enabled(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace(
+            "        combo_yield: true",
+            '        combo_yield:\n          enabled: "false"',
+        ),
+    )
+
+    with pytest.raises(AgentToolError, match="combo_yield.enabled must be a boolean"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_rejects_retired_combo_yield_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _minimal_yaml().replace("        combo_yield: true", "        yield_enhancement: true"),
+    )
+
+    with pytest.raises(AgentToolError, match="yield_enhancement has been removed; use combo_yield"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_runtime_strategy_conversion_rejects_retired_combo_yield_key() -> None:
+    with pytest.raises(AgentToolError, match="yield_enhancement has been removed; use combo_yield"):
+        runtime_strategy_keys_to_yaml_authoring({"yield_enhancement": {"enabled": True}})
+
+
+def _wheel_yaml(*, put_min_dte: int = 14, generation: int = 2) -> str:
+    return _minimal_yaml().replace(
+        "  us:\n    accounts: [lx, sy]\n",
+        "  us:\n"
+        "    accounts: [lx, sy]\n"
+        "    features:\n"
+        "      wheel:\n"
+        "        accounts: [lx]\n"
+        "        call:\n"
+        "          min_dte: 30\n"
+        "          max_dte: 45\n"
+        "        put:\n"
+        f"          min_dte: {put_min_dte}\n"
+        "          max_dte: 35\n"
+        "        activation_by_account:\n"
+        "          lx:\n"
+        f"            generation: {generation}\n"
+        "            activated_at_ms: 1700000000000\n"
+        "            deactivated_at_ms: null\n",
+        1,
+    )
+
+
+def test_yaml_runtime_build_warns_before_a_bound_window_starts_drifting(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _wheel_yaml())
+    runtime_path = tmp_path / "config.us.json"
+    first = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=False,
+    )
+    # Nothing to compare against on the first build, so nothing to warn about, and the
+    # payload keeps its existing shape rather than carrying empty keys.
+    assert "wheel_policy_drift" not in first
+    assert "warnings" not in first
+    before = runtime_path.read_bytes()
+
+    # A symbol edit cannot move any account's policy hash, so it must stay silent.
+    config_path.write_text(
+        _wheel_yaml().replace("      - FUTU\n", "      - FUTU\n      - AMD\n"), encoding="utf-8"
+    )
+    quiet = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=True,
+    )
+    assert "wheel_policy_drift" not in quiet
+    assert "warnings" not in quiet
+
+    # A threshold edit does move it, so the dry run warns without writing anything.
+    config_path.write_text(_wheel_yaml(put_min_dte=21), encoding="utf-8")
+    warned = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=True,
+    )
+    assert warned["wheel_policy_drift"]["policy_accounts"] == ["lx"]
+    assert warned["wheel_policy_drift"]["boundary_accounts"] == []
+    assert warned["write_applied"] is False
+    assert runtime_path.read_bytes() == before
+    assert len(warned["warnings"]) == 1
+    message = warned["warnings"][0]
+    assert "lx" in message
+    assert "wheel activation accept-policy --market us" in message
+    assert "--apply --confirm" in message
+    assert str(runtime_path) in message
+
+    # The warning is advisory: the real build still writes the snapshot.
+    applied = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=False,
+    )
+    assert applied["write_applied"] is True
+    assert applied["wheel_policy_drift"]["policy_accounts"] == ["lx"]
+    assert runtime_path.read_bytes() != before
+
+
+def test_yaml_runtime_build_separates_boundary_drift_from_policy_drift(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _wheel_yaml())
+    runtime_path = tmp_path / "config.us.json"
+    build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=False,
+    )
+
+    config_path.write_text(_wheel_yaml(generation=3), encoding="utf-8")
+    warned = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        output_config_path=runtime_path,
+        dry_run=True,
+    )
+
+    assert warned["wheel_policy_drift"]["policy_accounts"] == []
+    assert warned["wheel_policy_drift"]["boundary_accounts"] == ["lx"]
+    # No command is offered, because no policy command can clear a boundary break.
+    assert "accept-policy" not in warned["warnings"][0]
+    assert "policy acceptance cannot clear this" in warned["warnings"][0]
+
+
+def test_yaml_runtime_build_defaults_to_canonical_runtime_path(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    out = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+        runtime_root=tmp_path / "runtime",
+        dry_run=True,
+    )
+
+    assert out["output_config_path"] == str((tmp_path / "runtime" / "config.us.json").resolve())
+    assert "/resolved/" not in out["output_config_path"]
+
+
+def test_yaml_config_rejects_symbol_from_another_market(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+markets:
+  us:
+    accounts: [lx]
+    symbols: ["0700.HK"]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="resolves to HK but is configured under markets.us"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    (
+        (
+            """\
+notifications:
+  providre: feishu_app
+  target: wechat:ops
+""",
+            "notifications contains unsupported keys: providre",
+        ),
+        (
+            """\
+notifications:
+  provider: wechat_clawbot
+  target: wechat:ops
+  bot_token: plaintext-secret
+""",
+            "notifications.bot_token must not contain inline secret material",
+        ),
+        (
+            """\
+watchdog:
+  retry_enabled: "false"
+""",
+            "watchdog.retry_enabled must be a boolean",
+        ),
+    ),
+)
+def test_yaml_config_rejects_unsafe_control_plane_values(
+    tmp_path: Path,
+    section: str,
+    expected: str,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + f"""\
+{section}
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match=expected):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_combo_yield_keeps_only_authored_fields_explicit(tmp_path: Path) -> None:
+    from src.application.combo_yield_config import derive_combo_yield_policy
+
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA, FUTU]
+    overrides:
+      NVDA:
+        combo_yield: true
+      FUTU:
+        combo_yield:
+          enabled: true
+          min_net_credit_retention: 0.70
+          call:
+            min_delta: 0.12
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+    policies = {}
+    for item in cfg["symbols"]:
+        resolved = resolve_watchlist_item_runtime_config(
+            item=item,
+            profiles=cfg["templates"],
+            apply_profiles_fn=apply_profiles,
+        )
+        policies[item["symbol"]] = derive_combo_yield_policy(
+            resolved["combo_yield"],
+            market="us",
+        )
+
+    defaulted = policies["NVDA"]
+    assert defaulted.explicit_fields == ("enabled",)
+    assert "output_mode" not in defaulted.config
+    assert defaulted.config["min_net_credit_retention"] == 0.60
+    assert defaulted.config["call"] == {"min_delta": 0.15, "max_delta": 0.35}
+
+    overridden = policies["FUTU"]
+    assert overridden.explicit_fields == ("call", "enabled", "min_net_credit_retention")
+    assert overridden.config["min_net_credit_retention"] == 0.70
+    assert overridden.config["call"] == {"min_delta": 0.12, "max_delta": 0.35}
+    assert "output_mode" not in overridden.config
+
+
+def test_yaml_config_keeps_explicit_sell_put_underwriting_thresholds(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+templates:
+  put_base:
+    sell_put:
+      min_annualized_net_return: 0.10
+      min_net_income: 50.0
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+    overrides:
+      NVDA:
+        use: put_base
+        sell_put:
+          max_strike: 150
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+    template = cfg["templates"]["put_base"]["sell_put"]
+    assert template["min_annualized_net_return"] == 0.10
+    assert template["min_net_income"] == 50.0
+
+    resolved = resolve_watchlist_item_runtime_config(
+        item=cfg["symbols"][0],
+        profiles=cfg["templates"],
+        apply_profiles_fn=apply_profiles,
+    )
+    assert resolved["sell_put"]["min_annualized_net_return"] == 0.10
+    assert resolved["sell_put"]["min_net_income"] == 50.0
+    assert "min_net_income" not in resolved["_global_sell_put_liquidity"]
+    validate_config(json.loads(json.dumps(cfg)))
+
+
+def test_yaml_config_accepts_legacy_sell_call_authoring_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+    overrides:
+      NVDA:
+        sell_call:
+          enabled: true
+          dte: [20, 45]
+          strike: [150, 180]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+    assert cfg["symbols"][0]["sell_call"]["enabled"] is True
+    assert cfg["symbols"][0]["sell_call"]["min_dte"] == 20
+    assert cfg["symbols"][0]["sell_call"]["max_strike"] == 180
+    validate_config(json.loads(json.dumps(cfg)))
+
+
+def test_yaml_config_rejects_covered_call_and_sell_call_conflict(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+    overrides:
+      NVDA:
+        covered_call:
+          enabled: false
+        sell_call:
+          enabled: false
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="cannot define both covered_call and sell_call"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_explain_maps_covered_call_authoring_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    out = explain_yaml_config_key(
+        repo_root=REPO_ROOT,
+        market="us",
+        key="symbols.1.covered_call.min_dte",
+        config_path=config_path,
+    )
+
+    assert out["exists"] is True
+    assert out["value"] == 20
+    assert out["runtime_path"] == "symbols.1.sell_call.min_dte"
+    assert any("covered_call" in item and "sell_call" in item for item in out["notes"])
+
+
+def test_yaml_config_maps_covered_call_passthrough_authoring_keys(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+templates:
+  call_base:
+    covered_call:
+      min_strike_cost_multiplier: 1.05
+symbol_defaults:
+  covered_call:
+    enabled: false
+alert_policy:
+  covered_call:
+    medium_annual: 0.07
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+    assert "covered_call" not in cfg["templates"]["call_base"]
+    assert cfg["templates"]["call_base"]["sell_call"]["min_strike_cost_multiplier"] == 1.05
+    assert "covered_call" not in cfg["symbols"][0]
+    assert cfg["symbols"][0]["sell_call"]["enabled"] is False
+    assert "covered_call" not in cfg["alert_policy"]
+    assert cfg["alert_policy"]["sell_call"]["medium_annual"] == 0.07
+
+
+def test_yaml_symbol_set_adds_hk_call_only_symbol_as_dry_run(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    before = config_path.read_text(encoding="utf-8")
+
+    out = set_yaml_symbol_config(
+        repo_root=REPO_ROOT,
+        market="hk",
+        symbol="09898",
+        config_path=config_path,
+        covered_call_min_strike=85,
+        apply=False,
+    )
+
+    assert out["dry_run"] is True
+    assert out["write_applied"] is False
+    assert out["summary"]["canonical_symbol"] == "9898.HK"
+    assert out["summary"]["symbol_added"] is True
+    assert out["summary"]["entry"] == {
+        "sell_put": {"enabled": False},
+        "covered_call": {"enabled": True, "min_strike": 85.0},
+        "use": ["call_base"],
+    }
+    assert out["validation"]["hk"]["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_yaml_symbol_set_updates_sell_put_max_strike_as_dry_run(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    before = config_path.read_text(encoding="utf-8")
+
+    out = set_yaml_symbol_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        symbol="FUTU",
+        config_path=config_path,
+        sell_put_max_strike=90,
+        apply=False,
+    )
+
+    assert out["dry_run"] is True
+    assert out["write_applied"] is False
+    assert out["summary"]["canonical_symbol"] == "FUTU"
+    assert out["summary"]["changed_paths"] == ["markets.us.overrides.FUTU.sell_put.max_strike"]
+    assert out["summary"]["entry"]["sell_put"]["max_strike"] == 90.0
+    assert out["validation"]["us"]["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_yaml_symbol_set_updates_combo_yield_enabled_as_dry_run(tmp_path: Path) -> None:
+    doc = yaml.safe_load(_minimal_yaml())
+    doc["markets"]["hk"]["symbols"].append("3690.HK")
+    doc["markets"]["hk"]["overrides"] = {
+        "3690.HK": {
+            "sell_put": {"enabled": True},
+            "covered_call": {"enabled": True},
+            "combo_yield": {"enabled": False},
+        }
+    }
+    config_path = _write_yaml(tmp_path / "config.yaml", yaml.safe_dump(doc, sort_keys=False))
+    before = config_path.read_text(encoding="utf-8")
+
+    out = set_yaml_symbol_config(
+        repo_root=REPO_ROOT,
+        market="hk",
+        symbol="3690.HK",
+        config_path=config_path,
+        combo_yield_enabled=True,
+        apply=False,
+    )
+
+    assert out["dry_run"] is True
+    assert out["write_applied"] is False
+    assert out["summary"]["changed_paths"] == ["markets.hk.overrides.3690.HK.combo_yield.enabled"]
+    assert out["summary"]["entry"]["combo_yield"]["enabled"] is True
+    assert out["summary"]["entry"]["sell_put"]["enabled"] is True
+    assert out["summary"]["entry"]["covered_call"]["enabled"] is True
+    assert out["validation"]["hk"]["ok"] is True
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_yaml_symbol_edit_rejects_retired_combo_yield_path(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    with pytest.raises(AgentToolError, match="yield_enhancement has been removed; use combo_yield"):
+        mutate_yaml_symbol_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            payload={
+                "action": "edit",
+                "symbol": "FUTU",
+                "set": {"yield_enhancement.enabled": True},
+            },
+            config_path=config_path,
+            apply=False,
+        )
+
+
+def test_yaml_symbol_set_apply_rebuilds_runtime_configs(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    runtime_root = tmp_path / "runtime"
+
+    out = set_yaml_symbol_config(
+        repo_root=REPO_ROOT,
+        market="hk",
+        symbol="09898",
+        config_path=config_path,
+        covered_call_min_strike=85,
+        apply=True,
+        rebuild_runtime_root=runtime_root,
+    )
+
+    assert out["dry_run"] is False
+    assert out["write_applied"] is True
+    assert out["backup_path"]
+    assert Path(out["backup_path"]).exists()
+    doc = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert "9898.HK" in doc["markets"]["hk"]["symbols"]
+    assert doc["markets"]["hk"]["overrides"]["9898.HK"] == {
+        "sell_put": {"enabled": False},
+        "covered_call": {"enabled": True, "min_strike": 85.0},
+        "use": ["call_base"],
+    }
+    hk_runtime = json.loads((runtime_root / "config.hk.json").read_text(encoding="utf-8"))
+    item = next(row for row in hk_runtime["symbols"] if row["symbol"] == "9898.HK")
+    assert item["sell_put"]["enabled"] is False
+    assert item["sell_call"]["enabled"] is True
+    assert item["sell_call"]["min_strike"] == 85.0
+    assert (runtime_root / "config.us.json").exists()
+    assert (runtime_root / "resolved" / "config.bot.json").exists()
+
+
+def test_yaml_account_add_is_preview_only_by_default(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    before = config_path.read_bytes()
+
+    out = mutate_yaml_account_config(
+        repo_root=REPO_ROOT,
+        action="add",
+        market="us",
+        account_label="new",
+        account_type="futu",
+        futu_acc_id="999000000000000003",
+        futu_host="127.0.0.1",
+        futu_port=33333,
+        config_path=config_path,
+    )
+
+    assert out["dry_run"] is True
+    assert out["write_applied"] is False
+    assert out["summary"]["accounts"] == ["lx", "sy", "new"]
+    assert out["summary"]["futu_acc_id_masked"] == "...0003"
+    assert config_path.read_bytes() == before
+    assert not (tmp_path / "config.us.json").exists()
+
+
+def test_yaml_account_add_apply_publishes_one_generation(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    runtime_root = tmp_path / "runtime"
+
+    out = mutate_yaml_account_config(
+        repo_root=REPO_ROOT,
+        action="add",
+        market="us",
+        account_label="new",
+        account_type="futu",
+        futu_acc_id="999000000000000003",
+        futu_host="127.0.0.1",
+        futu_port=33333,
+        config_path=config_path,
+        rebuild_runtime_root=runtime_root,
+        apply=True,
+    )
+
+    assert out["write_applied"] is True
+    source_doc = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert source_doc["accounts"]["new"]["type"] == "futu"
+    assert source_doc["markets"]["us"]["accounts"] == ["lx", "sy", "new"]
+    assert source_doc["markets"]["hk"]["accounts"] == ["lx"]
+    us_runtime = json.loads((runtime_root / "config.us.json").read_text(encoding="utf-8"))
+    hk_runtime = json.loads((runtime_root / "config.hk.json").read_text(encoding="utf-8"))
+    assert us_runtime["accounts"] == ["lx", "sy", "new"]
+    assert hk_runtime["accounts"] == ["lx"]
+    assert us_runtime[RESOLVED_KEY]["config_yaml_sha256"] == out["source_revision"]["after_sha256"]
+    assert hk_runtime[RESOLVED_KEY]["config_yaml_sha256"] == out["source_revision"]["after_sha256"]
+
+
+def test_yaml_account_remove_keeps_global_definition_used_by_other_market(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    out = mutate_yaml_account_config(
+        repo_root=REPO_ROOT,
+        action="remove",
+        market="us",
+        account_label="lx",
+        config_path=config_path,
+        apply=True,
+    )
+
+    source_doc = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert out["summary"]["removed_global_account"] is False
+    assert source_doc["markets"]["us"]["accounts"] == ["sy"]
+    assert source_doc["markets"]["hk"]["accounts"] == ["lx"]
+    assert "lx" in source_doc["accounts"]
+
+
+def test_yaml_symbol_set_preserves_existing_legacy_sell_call_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+  hk:
+    accounts: [lx]
+    symbols: [0700.HK]
+    overrides:
+      0700.HK:
+        use:
+        - call_base
+        sell_call:
+          enabled: true
+          min_strike: 550
+""",
+    )
+
+    out = set_yaml_symbol_config(
+        repo_root=REPO_ROOT,
+        market="hk",
+        symbol="700",
+        config_path=config_path,
+        covered_call_min_strike=560,
+        apply=False,
+    )
+
+    assert out["summary"]["entry"]["sell_call"]["min_strike"] == 560.0
+    assert out["summary"]["entry"]["sell_put"]["enabled"] is False
+    assert "covered_call" not in out["summary"]["entry"]
+
+
+def test_yaml_symbol_set_rejects_empty_setting(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    with pytest.raises(AgentToolError, match="at least one symbol setting is required"):
+        set_yaml_symbol_config(
+            repo_root=REPO_ROOT,
+            market="hk",
+            symbol="09898",
+            config_path=config_path,
+            apply=False,
+        )
+
+
+def test_yaml_bot_config_merges_system_defaults(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD
+        + """\
+inbound:
+  feishu_ws:
+    ack_reaction: THUMBSUP
+  wechat_clawbot:
+    allowed_senders: wechat:user_1
+    poll_interval_sec: 0.5
+""",
+    )
+
+    cfg, _meta = resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+    assert cfg["bot"]["enabled"] is False
+    assert "toolsets" not in cfg["bot"]
+    assert cfg["bot"]["llm"]["api_key_env"] == "OM_LLM_API_KEY"
+    assert cfg["inbound"]["feishu_ws"]["reply_enabled"] is True
+    assert cfg["inbound"]["feishu_ws"]["queue_size"] == 100
+    assert cfg["inbound"]["feishu_ws"]["ack_reaction"] == "THUMBSUP"
+    assert cfg["inbound"]["wechat_clawbot"]["label"] == "default"
+    assert cfg["inbound"]["wechat_clawbot"]["allowed_senders"] == "wechat:user_1"
+    assert cfg["inbound"]["wechat_clawbot"]["reply_enabled"] is True
+    assert cfg["inbound"]["wechat_clawbot"]["max_reply_chars"] == 3500
+    assert cfg["inbound"]["wechat_clawbot"]["poll_interval_sec"] == 0.5
+    assert cfg["inbound"]["wechat_clawbot"]["keepalive_interval_sec"] == 1800.0
+
+
+def test_yaml_bot_config_unwraps_explicit_system_defaults(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD,
+    )
+    system_path = tmp_path / "system.json"
+    system_path.write_text(
+        json.dumps(
+            {
+                "defaults": {
+                    "bot": {'enabled': True, 'context_window_messages': 3, 'default_market_scope': 'hk', 'llm': {'provider': 'openai'}},
+                    "inbound": {"feishu_ws": {"ack_reaction": "SMILE", "queue_size": 7}},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    cfg, _meta = resolve_yaml_bot_config(
+        repo_root=REPO_ROOT,
+        config_path=config_path,
+        system_config_path=system_path,
+    )
+
+    assert cfg["bot"]["enabled"] is True
+    assert cfg["bot"]["enabled"] is True
+    assert cfg["bot"]["context_window_messages"] == 3
+    assert cfg["bot"]["default_market_scope"] == "hk"
+    assert cfg["bot"]["llm"]["provider"] == "openai"
+    assert cfg["inbound"]["feishu_ws"]["ack_reaction"] == "SMILE"
+    assert cfg["inbound"]["feishu_ws"]["queue_size"] == 7
+
+    output_path = tmp_path / "config.bot.json"
+    build_yaml_bot_config_file(
+        repo_root=REPO_ROOT,
+        config_path=config_path,
+        system_config_path=system_path,
+        output_config_path=output_path,
+    )
+    generated = json.loads(output_path.read_text(encoding="utf-8"))
+    assert f"--system-config {system_path}" in generated[GENERATED_KEY]["rebuild_command"]
+
+
+def test_yaml_bot_config_resolves_active_model_profile(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD
+        + _BOT_DEFAULTS_YAML
+        + """\
+  active_model: deepseek-default
+  models:
+    deepseek-default:
+      provider: deepseek
+      model: deepseek-chat
+      api_key_env: DEEPSEEK_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+    openai-default:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OM_LLM_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""",
+    )
+
+    cfg, _meta = resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+    assistant = cfg["bot"]
+    assert "models" not in assistant
+    assert "active_model" not in assistant
+    assert assistant["llm"]["provider"] == "deepseek"
+    assert assistant["llm"]["base_url"] == "https://api.deepseek.com"
+    assert assistant["llm"]["model"] == "deepseek-chat"
+    assert assistant["llm"]["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert assistant["llm"]["context_window_tokens"] == 24000
+    assert "max_attempts" not in assistant["llm"]
+    resolved = cfg[RESOLVED_KEY]["bot_models"]
+    assert resolved["active_model"] == "deepseek-default"
+    assert resolved["profile_count"] == 2
+    assert resolved["resolved_profile"]["provider"] == "deepseek"
+
+
+def test_yaml_bot_model_profile_requires_declared_context_window(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _BOT_DEFAULTS_YAML
+        + """\
+  active_model: deepseek-default
+  models:
+    deepseek-default:
+      provider: deepseek
+      model: deepseek-chat
+      api_key_env: DEEPSEEK_API_KEY
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="context_window_tokens must be an integer"):
+        resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+
+def test_yaml_bot_config_allows_local_ollama_without_api_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _BOT_DEFAULTS_YAML
+        + """\
+  active_model: local
+  models:
+    local:
+      provider: ollama
+      model: gpt-oss:20b
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""",
+    )
+
+    cfg, _meta = resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+    assert cfg["bot"]["llm"] == {
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model": "gpt-oss:20b",
+        "api_key_env": "",
+        "context_window_tokens": 24000,
+        "max_output_tokens": 2048,
+    }
+
+
+def test_yaml_bot_config_rejects_unknown_active_model_profile(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD
+        + _BOT_DEFAULTS_YAML
+        + """\
+  active_model: missing
+  models:
+    deepseek-default:
+      provider: deepseek
+      model: deepseek-chat
+      api_key_env: DEEPSEEK_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="unknown model profile"):
+        resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+
+def test_yaml_bot_config_rejects_user_configurable_hooks(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD
+        + _BOT_DEFAULTS_YAML
+        + """\
+  hooks:
+    pre_tool_use: custom
+""",
+    )
+
+    with pytest.raises(SystemExit, match="bot has unsupported keys: hooks"):
+        resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+
+def test_yaml_bot_config_rejects_retired_bot_keys(tmp_path: Path) -> None:
+    config_path = _write_yaml(tmp_path / "config.yaml", _US_HOLDINGS_YAML_HEAD + _BOT_DEFAULTS_YAML + "  channel_scenes: [operations_diagnostics]\n  human_review: false\n")
+    with pytest.raises(SystemExit, match="unsupported keys"):
+        resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+
+def test_yaml_bot_model_profiles_reject_inline_api_key(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_HOLDINGS_YAML_HEAD
+        + _BOT_DEFAULTS_YAML
+        + """\
+  active_model: unsafe
+  models:
+    unsafe:
+      provider: deepseek
+      model: deepseek-chat
+      api_key: sk-secret
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="must not store secret values"):
+        resolve_yaml_bot_config(repo_root=REPO_ROOT, config_path=config_path)
+
+
+def test_default_config_matches_legacy_system_json() -> None:
+    system_json = json.loads((REPO_ROOT / "configs" / "system.json").read_text(encoding="utf-8"))
+
+    assert DEFAULT_CONFIG == system_json
+
+
+def test_config_init_writes_starter_yaml_and_runtime_configs(tmp_path: Path) -> None:
+    output_path = tmp_path / "config.yaml"
+    runtime_dir = tmp_path / "runtime"
+
+    out = init_yaml_config(
+        repo_root=REPO_ROOT,
+        output_config_yaml_path=output_path,
+        runtime_output_dir=runtime_dir,
+        futu_acc_id="12345678",
+        account_label="lx",
+        us_symbols=["AAPL"],
+        hk_symbols=["0005.HK"],
+    )
+
+    assert out["ok"] is True
+    assert out["write_applied"] is True
+    assert output_path.exists()
+    assert (runtime_dir / "config.us.json").exists()
+    assert (runtime_dir / "config.hk.json").exists()
+    payload = yaml.safe_load(output_path.read_text(encoding="utf-8"))
+    assert payload["accounts"]["lx"]["futu_account_id"] == "12345678"
+    assert payload["bot"]["enabled"] is False
+    assert payload["bot"]["enabled"] is False
+    assert "toolsets" not in payload["bot"]
+    assert payload["bot"]["context_window_messages"] == 8
+    assert "default_market_scope" not in payload["bot"]
+    assert payload["bot"]["active_model"] == "deepseek-default"
+    assert payload["bot"]["models"]["deepseek-default"]["model"] == "deepseek-v4-pro"
+    assert payload["bot"]["models"]["deepseek-default"]["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert set(payload["bot"]["models"]) == {"deepseek-default"}
+    assert "max_output_tokens" not in payload["bot"]["models"]["deepseek-default"]
+    assert payload["markets"]["us"]["accounts"] == ["lx"]
+    assert payload["markets"]["us"]["symbols"] == ["AAPL"]
+    assert payload["markets"]["hk"]["symbols"] == ["0005.HK"]
+    us_cfg = json.loads((runtime_dir / "config.us.json").read_text(encoding="utf-8"))
+    hk_cfg = json.loads((runtime_dir / "config.hk.json").read_text(encoding="utf-8"))
+    bot_cfg = json.loads((runtime_dir / "config.bot.json").read_text(encoding="utf-8"))
+    assert [item["symbol"] for item in us_cfg["symbols"]] == ["AAPL"]
+    assert [item["symbol"] for item in hk_cfg["symbols"]] == ["0005.HK"]
+    assert us_cfg[GENERATED_KEY]["source_format"] == "yaml"
+    assert "assistant" not in us_cfg
+    assert "inbound" not in us_cfg
+    assert hk_cfg[GENERATED_KEY]["market"] == "hk"
+    assert us_cfg["runtime"] == hk_cfg["runtime"]
+    assert bot_cfg["bot"]["enabled"] is False
+    assert bot_cfg["bot"]["enabled"] is False
+    assert "toolsets" not in bot_cfg["bot"]
+    assert bot_cfg["bot"]["context_window_messages"] == 8
+    assert "default_market_scope" not in bot_cfg["bot"]
+    assert "active_model" not in bot_cfg["bot"]
+    assert "models" not in bot_cfg["bot"]
+    assert bot_cfg["bot"]["llm"]["base_url"] == "https://api.deepseek.com"
+    assert bot_cfg["bot"]["llm"]["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert bot_cfg["bot"]["llm"]["timeout_seconds"] == 90
+    assert bot_cfg["bot"]["llm"]["context_window_tokens"] == 1_000_000
+    assert bot_cfg["bot"]["llm"].get("max_output_tokens") is None
+    assert bot_cfg["inbound"]["feishu_ws"]["ack_reaction"] == "THUMBSUP"
+
+
+@pytest.mark.parametrize("market", ["us", "hk"])
+def test_config_init_requires_explicit_symbols_without_writing(tmp_path: Path, market: str) -> None:
+    output_path = tmp_path / "config.yaml"
+    with pytest.raises(AgentToolError, match=f"{market} symbols are required"):
+        init_yaml_config(account_label="lx", repo_root=REPO_ROOT, output_config_yaml_path=output_path,
+                         markets=[market], dry_run=False)
+    assert not output_path.exists()
+
+
+def test_config_init_hk_only_has_no_us_market_or_sample_symbols(tmp_path: Path) -> None:
+    out = init_yaml_config(account_label="lx", repo_root=REPO_ROOT, output_config_yaml_path=tmp_path / "config.yaml",
+                           markets=["hk"], hk_symbols=["0005.HK"], dry_run=True)
+    payload = yaml.safe_load(out["yaml"])
+    assert list(payload["markets"]) == ["hk"]
+    assert payload["markets"]["hk"]["symbols"] == ["0005.HK"]
+    assert "0700.HK" not in out["yaml"]
+
+
+@pytest.mark.parametrize(
+    "invalid_scope",
+    [
+        {"account_label": "../escaped"},
+        {"account_label": "lx.sy"},
+    ],
+)
+def test_config_init_invalid_account_scope_has_dry_run_apply_parity_and_preserves_existing(
+    tmp_path: Path,
+    invalid_scope: dict[str, str],
+) -> None:
+    output_path = tmp_path / "config.yaml"
+    runtime_dir = tmp_path / "runtime"
+    preserved = "accounts:\n  lx:\n    type: futu\n"
+    output_path.write_text(preserved, encoding="utf-8")
+
+    for dry_run in (True, False):
+        with pytest.raises(AgentToolError, match="invalid"):
+            init_yaml_config(
+                repo_root=REPO_ROOT,
+                output_config_yaml_path=output_path,
+                runtime_output_dir=runtime_dir,
+                dry_run=dry_run,
+                force=True,
+                us_symbols=["AAPL"],
+                hk_symbols=["0005.HK"],
+                **invalid_scope,
+            )
+        assert output_path.read_text(encoding="utf-8") == preserved
+        assert not runtime_dir.exists()
+
+
+def test_config_init_cli_supports_dry_run(tmp_path: Path, capsys) -> None:
+    from src.interfaces.cli.main import main
+
+    output_path = tmp_path / "config.yaml"
+    runtime_dir = tmp_path / "runtime"
+
+    rc = main([
+        "config",
+        "init", "--account-label", "lx",
+        "--output",
+        str(output_path),
+        "--runtime-output-dir",
+        str(runtime_dir),
+        "--us-symbol", "AAPL",
+        "--hk-symbol", "0005.HK",
+        "--symbol-strategy", "AAPL=csp", "--csp-max-strike", "AAPL=100",
+        "--symbol-strategy", "0005.HK=cc", "--cc-min-strike", "0005.HK=50",
+        "--dry-run",
+    ])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True
+    assert out["dry_run"] is True
+    assert out["write_applied"] is False
+    assert "markets:" in out["yaml"]
+    assert not output_path.exists()
+    assert not runtime_dir.exists()
+
+
+def test_config_init_cli_rejects_bare_symbol(tmp_path: Path, capsys) -> None:
+    from src.interfaces.cli.main import main
+
+    output_path = tmp_path / "config.yaml"
+    rc = main([
+        "config", "init", "--market", "us", "--us-symbol", "AAPL",
+        "--output", str(output_path),
+    ])
+    assert rc == 2
+    assert "symbol-strategy" in capsys.readouterr().out
+    assert not output_path.exists()
+
+
+def test_yaml_config_requires_explicit_market(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD,
+    )
+
+    with pytest.raises(AgentToolError, match="markets.hk is required"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="hk", config_path=config_path)
+
+
+def test_yaml_config_rejects_tabs(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        "accounts:\n\tlx:\n    type: futu\n",
+    )
+
+    with pytest.raises(AgentToolError, match="must use spaces"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_rejects_global_combo_yield_switch(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+features:
+  combo_yield: true
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="not a global feature switch"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_rejects_write_gates(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+writes:
+  feishu: true
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="is not a config.yaml field"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_rejects_trade_intake_write_policy(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+trade_intake:
+  mode: apply
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match=r"trade_intake\.mode is not supported"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_yaml_config_migrates_trade_intake_holdings_sync_alias(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+trade_intake:
+  holdings_sync:
+    enabled: true
+    debounce_sec: 1
+    request_timeout_sec: 30
+    max_attempts: 2
+    retry_backoff_sec: 1
+    queue_capacity: 10
+    recent_deal_limit: 20
+    state_dir: ignored
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert cfg["trade_intake"]["mode"] == "apply"
+    assert "holdings_sync" not in cfg["trade_intake"]
+    assert cfg["portfolio_management"] == {"enabled": True}
+    warning = capsys.readouterr().err
+    assert "TRADE_INTAKE_HOLDINGS_SYNC_DEPRECATED" in warning
+    for key in (
+        "debounce_sec",
+        "request_timeout_sec",
+        "max_attempts",
+        "retry_backoff_sec",
+        "queue_capacity",
+        "recent_deal_limit",
+        "state_dir",
+    ):
+        assert key in warning
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_yaml_config_accepts_root_portfolio_management(
+    tmp_path: Path,
+    enabled: bool,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + f"""\
+portfolio_management:
+  enabled: {str(enabled).lower()}
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert cfg["portfolio_management"] == {"enabled": enabled}
+
+
+def test_yaml_config_rejects_market_scoped_or_conflicting_pm_gate(
+    tmp_path: Path,
+) -> None:
+    market_scoped = _write_yaml(
+        tmp_path / "market.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+    portfolio_management:
+      enabled: true
+""",
+    )
+    with pytest.raises(AgentToolError, match="portfolio_management"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=market_scoped,
+        )
+
+    conflict = _write_yaml(
+        tmp_path / "conflict.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+portfolio_management:
+  enabled: true
+trade_intake:
+  holdings_sync:
+    enabled: true
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+    with pytest.raises(AgentToolError, match="cannot both be set"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=conflict,
+        )
+
+
+def test_yaml_config_accepts_settlement_observation_kill_switch(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+trade_intake:
+  settlement_observation:
+    enabled: false
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert cfg["trade_intake"]["settlement_observation"] == {
+        "enabled": False
+    }
+
+
+@pytest.mark.parametrize(
+    "settlement_yaml",
+    [
+        'enabled: "false"',
+        "enabled: true\n    retry_policy: custom",
+    ],
+)
+def test_yaml_config_rejects_invalid_settlement_observation(
+    tmp_path: Path,
+    settlement_yaml: str,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + f"""\
+trade_intake:
+  settlement_observation:
+    {settlement_yaml}
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="settlement_observation"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+
+def test_yaml_config_accepts_account_scoped_combo_reconciliation(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+trade_intake:
+  combo_reconciliation:
+    accounts:
+      lx: auto
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    cfg, _meta = resolve_yaml_runtime_config(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_path,
+    )
+
+    assert cfg["trade_intake"]["combo_reconciliation"] == {
+
+        "accounts": {"lx": "auto"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("combo_yaml", "expected_error"),
+    [
+        (
+            "default_mode: observe\n    accounts: {}",
+            "is not supported",
+        ),
+        (
+            "accounts:\n      LX: confirm",
+            "account labels must be lowercase",
+        ),
+        (
+            "accounts:\n      unknown: confirm",
+            "is not a configured account",
+        ),
+    ],
+)
+def test_yaml_config_rejects_invalid_combo_reconciliation(
+    tmp_path: Path,
+    combo_yaml: str,
+    expected_error: str,
+) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + f"""\
+trade_intake:
+  combo_reconciliation:
+    {combo_yaml}
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match=expected_error):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+
+def test_yaml_config_rejects_invalid_trade_intake_holdings_sync(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _FUTU_ACCOUNTS_YAML
+        + """\
+trade_intake:
+  holdings_sync:
+    enabled: "true"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="holdings_sync.enabled must be a boolean"):
+        resolve_yaml_runtime_config(
+            repo_root=REPO_ROOT,
+            market="us",
+            config_path=config_path,
+        )
+
+
+def test_yaml_config_rejects_override_for_symbol_not_in_market(tmp_path: Path) -> None:
+    config_path = _write_yaml(
+        tmp_path / "config.yaml",
+        _US_FUTU_YAML_HEAD
+        + """\
+    overrides:
+      FUTU:
+        sell_put:
+          dte: [20, 45]
+""",
+    )
+
+    with pytest.raises(AgentToolError, match="must also appear in symbols"):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+
+
+def test_config_build_cli_supports_yaml_source(tmp_path: Path, capsys) -> None:
+    from src.interfaces.cli.main import main
+
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+    output_path = tmp_path / "resolved" / "config.us.json"
+
+    rc = main([
+        "config",
+        "build",
+        "--source",
+        "yaml",
+        "--market",
+        "us",
+        "--config-yaml",
+        str(config_path),
+        "--output",
+        str(output_path),
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["source_format"] == "yaml"
+    assert payload["write_applied"] is True
+    assert output_path.exists()
+    cfg = json.loads(output_path.read_text(encoding="utf-8"))
+    assert cfg[GENERATED_KEY]["source_format"] == "yaml"
+    assert cfg[RESOLVED_KEY]["config_yaml_path"].endswith("config.yaml")
+    assert not _contains_mapping_key(cfg, "output_mode")
+    validate_config(cfg)
+
+
+def test_config_validate_cli_supports_yaml_source(tmp_path: Path, capsys) -> None:
+    from src.interfaces.cli.main import main
+
+    config_path = _write_yaml(tmp_path / "config.yaml", _minimal_yaml())
+
+    rc = main([
+        "config",
+        "validate",
+        "--source",
+        "yaml",
+        "--market",
+        "us",
+        "--config-yaml",
+        str(config_path),
+    ])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["source_format"] == "yaml"
+
+
+def _market_source(config: dict) -> dict:
+    return next(item for item in config[GENERATED_KEY]['sources'] if item['role'] == 'market_user')
+
+
+@pytest.mark.parametrize('market', ['us', 'hk'])
+@pytest.mark.parametrize('change,stale_markets', [
+    ('bot_model', set()), ('bot_context', set()), ('bot_enabled', set()),
+    ('comments', set()), ('us_symbols', {'us'}), ('hk_symbols', {'hk'}),
+    ('us_schedule', {'us'}), ('us_accounts', {'us'}), ('selected_account', {'us', 'hk'}),
+    ('shared_runtime', {'us', 'hk'}),
+])
+def test_yaml_freshness_tracks_market_inputs(tmp_path: Path, market: str, change: str, stale_markets: set[str]) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market=market, config_path=path)
+    before = deepcopy(config)
+    doc = yaml.safe_load(_minimal_yaml())
+    if change == 'bot_model':
+        doc['bot']['llm']['model'] = 'another-model'
+    elif change == 'bot_context':
+        doc['bot']['context_window_messages'] = 20
+    elif change == 'bot_enabled':
+        doc['bot']['enabled'] = False
+    elif change == 'us_symbols':
+        doc['markets']['us']['symbols'].append('AAPL')
+    elif change == 'hk_symbols':
+        doc['markets']['hk']['symbols'].append('9988.HK')
+    elif change == 'us_schedule':
+        doc['markets']['us']['schedule'] = {'timeout_sec': 333}
+    elif change == 'us_accounts':
+        doc['markets']['us']['accounts'] = ['lx']
+    elif change == 'selected_account':
+        doc['accounts']['lx']['futu_account_id'] = 'REAL_99999'
+    elif change == 'shared_runtime':
+        doc['runtime'] = {'symbol_timeout_sec': 123}
+    path.write_text('# new comment\n' + yaml.safe_dump(doc, sort_keys=True), encoding='utf-8')
+    source_before = (path.read_bytes(), path.stat().st_mtime_ns)
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market=market)
+    assert result['ok'] is (market not in stale_markets)
+    if market in stale_markets:
+        assert any(error['code'] == 'source_changed' for error in result['errors'])
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == source_before
+    assert config == before
+
+
+@pytest.mark.parametrize('source_format', ['yaml', 'layered'])
+def test_yaml_legacy_and_other_formats_keep_raw_sha_checks(tmp_path: Path, source_format: str) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    if source_format == 'yaml':
+        _market_source(config).pop('effective')
+    config[GENERATED_KEY]['source_format'] = source_format
+    assert check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')['ok']
+    path.write_text(_minimal_yaml() + '\n# assistant-only edit\n', encoding='utf-8')
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert result['errors'][0]['code'] == 'source_changed'
+
+
+@pytest.mark.parametrize('patch', [
+    {'loaded': False}, {'loaded': None}, {'loaded': 1}, {'inline': True},
+    {'inline': 'false'}, {'enabled': False}, {'optional': True},
+    {'path': ''}, {'path': None}, {'path': ['config.yaml']}, {'path': '\x00'},
+    {'sha256': None}, {'sha256': 'bad'}, {'effective': None}, {'effective': {}},
+    {'effective': []},
+    {'effective': {'kind': 'unknown', 'market': 'us', 'sha256': 'a' * 64}},
+    {'effective': {'kind': 'yaml-market-user-v1', 'market': 'hk', 'sha256': 'a' * 64}},
+    {'effective': {'kind': 'yaml-market-user-v1', 'market': 'us', 'sha256': 'not-a-digest'}},
+])
+def test_yaml_freshness_rejects_invalid_new_source_before_shortcuts(tmp_path: Path, patch: dict) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    _market_source(config).update(patch)
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert any(error['code'] == 'invalid_source_metadata' for error in result['errors'])
+
+
+@pytest.mark.parametrize('role', ['system', 'market_user'])
+@pytest.mark.parametrize('damage', ['missing', 'duplicate'])
+def test_yaml_freshness_rejects_missing_or_duplicate_required_roles(tmp_path: Path, role: str, damage: str) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    sources = config[GENERATED_KEY]['sources']
+    item = next(item for item in sources if item['role'] == role)
+    if damage == 'missing':
+        sources.remove(item)
+    else:
+        sources.append(deepcopy(item))
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert any(error['code'] == f'{damage}_source_record' for error in result['errors'])
+
+
+@pytest.mark.parametrize('content', [b'\xff', b'[not: valid', b'- list root', b'markets: {}',
+                                      b'markets:\n\tus: {}', None])
+def test_yaml_freshness_source_failure_is_structured(tmp_path: Path, content: bytes | None) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    if content is None:
+        path.unlink()
+    else:
+        path.write_bytes(content)
+        _market_source(config)['sha256'] = hashlib.sha256(content).hexdigest()
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert result['errors'][0]['code'] == 'source_check_failed'
+    assert result['errors'][0]['role'] == 'market_user'
+    assert 'rebuild_command' in result
+
+
+def test_yaml_freshness_read_error_is_structured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    original_read = Path.read_bytes
+
+    def unreadable(self: Path) -> bytes:
+        if self == path:
+            raise PermissionError('private diagnostic value')
+        return original_read(self)
+
+    monkeypatch.setattr(Path, 'read_bytes', unreadable)
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert result['errors'][0]['error_type'] == 'PermissionError'
+    assert 'private diagnostic value' not in json.dumps(result)
+
+
+def test_yaml_invalid_source_envelope_stops_before_io(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    config[GENERATED_KEY]['sources'].append({'role': 'system', 'loaded': True, 'path': '\x00'})
+    reads = []
+
+    def unexpected_read(self: Path) -> bytes:
+        reads.append(self)
+        raise OSError('must reject the envelope before reading sources')
+
+    monkeypatch.setattr(Path, 'read_bytes', unexpected_read)
+    result = check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert not result['ok']
+    assert [error['code'] for error in result['errors']] == ['duplicate_source_record']
+    with pytest.raises(RuntimeConfigFreshnessError) as exc:
+        ensure_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')
+    assert exc.value.result == result
+    assert reads == []
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), float('-inf')])
+def test_yaml_market_fingerprint_rejects_nonfinite_values_on_build_and_check(tmp_path: Path, value: float) -> None:
+    path = _write_yaml(tmp_path / 'config.yaml', _minimal_yaml())
+    config, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    doc = yaml.safe_load(_minimal_yaml())
+    doc['runtime'] = {'symbol_timeout_sec': value}
+    path.write_text(yaml.safe_dump(doc), encoding='utf-8')
+    with pytest.raises(ValueError):
+        resolve_yaml_runtime_config(repo_root=REPO_ROOT, market='us', config_path=path)
+    assert not check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')['ok']
+
+
+def test_account_setting_builder_never_returns_null_for_unsupported_type() -> None:
+    from src.application.config_yaml_accounts import _build_account_setting
+
+    with pytest.raises(AgentToolError, match="unsupported account type"):
+        _build_account_setting(
+            current=None, account="lx", account_type="other", futu_acc_id=None,
+            market_label=None, enabled=None, trade_intake_enabled=None,
+            futu_host=None, futu_port=None,
+        )
+
+
+def test_account_setting_builder_rejects_retired_bitable_instead_of_dropping_it() -> None:
+    from src.application.config_yaml_accounts import _build_account_setting
+
+    with pytest.raises(AgentToolError, match=r"accounts\.lx\.bitable is retired"):
+        _build_account_setting(
+            current={"type": "futu", "futu": {"account_id": "1"}, "bitable": {"app_token": "old"}},
+            account="lx", account_type="futu", futu_acc_id=None,
+            market_label=None, enabled=None, trade_intake_enabled=None,
+            futu_host=None, futu_port=None,
+        )
+
+
+def test_yaml_mapping_order_does_not_change_combo_policy_or_fingerprint() -> None:
+    from src.application.combo_yield_config import derive_combo_yield_policy
+
+    doc = yaml.safe_load(_minimal_yaml())
+    combo = {'enabled': True, 'min_net_credit_retention': 0.7, 'call': {'min_delta': 0.12, 'max_delta': 0.18}}
+    doc['markets']['us']['overrides']['FUTU']['combo_yield'] = combo
+    before = yaml_to_market_user_config(doc, market='us')
+    combo['call'] = dict(reversed(list(combo['call'].items())))
+    doc['markets']['us']['overrides']['FUTU']['combo_yield'] = dict(reversed(list(combo.items())))
+    after = yaml_to_market_user_config(doc, market='us')
+    assert market_user_config_fingerprint(before, market='us') == market_user_config_fingerprint(after, market='us')
+    before_policy = derive_combo_yield_policy(before['symbols'][1]['combo_yield'], market='us')
+    after_policy = derive_combo_yield_policy(after['symbols'][1]['combo_yield'], market='us')
+    assert before_policy == after_policy
+    assert before_policy.config['call']['min_delta'] == 0.12
+    assert before_policy.config['min_net_credit_retention'] == 0.7
+    # Symbol lists have real ordering semantics and must not be canonicalized as sets.
+    after['symbols'].reverse()
+    assert market_user_config_fingerprint(before, market='us') != market_user_config_fingerprint(after, market='us')
+
+
+def test_yaml_build_metadata_uses_exact_single_read_even_if_source_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_bytes = ('# preserve CRLF and comment\r\n' + _minimal_yaml().replace('\n', '\r\n')).encode('utf-8')
+    path = tmp_path / 'config.yaml'
+    path.write_bytes(source_bytes)
+    output = tmp_path / 'config.us.json'
+    original_read = Path.read_bytes
+    reads = []
+
+    def read_then_edit(self: Path) -> bytes:
+        content = original_read(self)
+        if self == path:
+            reads.append(content)
+            self.write_bytes(content.replace(b'- NVDA', b'- AAPL'))
+        return content
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, 'read_bytes', read_then_edit)
+        result = build_yaml_runtime_config_file(repo_root=REPO_ROOT, market='us', config_path=path, output_config_path=output)
+    config = json.loads(output.read_text())
+    assert len(reads) == 1
+    expected_sha = hashlib.sha256(source_bytes).hexdigest()
+    assert _market_source(config)['sha256'] == expected_sha
+    assert config[RESOLVED_KEY]['config_yaml_sha256'] == expected_sha
+    assert result['config_yaml_sha256'] == expected_sha
+    assert config['symbols'][0]['symbol'] == 'NVDA'
+    assert _market_source(config)['effective'] == market_user_config_fingerprint(
+        yaml_to_market_user_config(yaml.safe_load(source_bytes), market='us'), market='us',
+    )
+    assert not check_runtime_config_freshness(config, repo_root=REPO_ROOT, market='us')['ok']
+
+
+@pytest.mark.parametrize("leg", ["call", "put"])
+def test_yaml_combo_long_delta_partial_override_survives_policy(tmp_path: Path, leg: str) -> None:
+    from src.application.combo_yield_config import derive_combo_yield_policy, resolve_combo_yield_cfg
+    config_path = _write_yaml(tmp_path / "config.yaml", _FUTU_ACCOUNTS_YAML + f"""
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+    overrides:
+      NVDA:
+        combo_yield:
+          enabled: true
+          {leg}:
+            min_delta: 0.2
+""")
+    cfg, _ = resolve_yaml_runtime_config(repo_root=REPO_ROOT, market="us", config_path=config_path)
+    resolved = resolve_watchlist_item_runtime_config(item=cfg["symbols"][0], profiles=cfg["templates"], apply_profiles_fn=apply_profiles)
+    policy = derive_combo_yield_policy(resolve_combo_yield_cfg(resolved), market="us")
+    assert policy.config[leg] == {"min_delta": 0.2, "max_delta": 0.35}
+    other = "put" if leg == "call" else "call"
+    assert policy.config[other] == {"min_delta": 0.15, "max_delta": 0.35}

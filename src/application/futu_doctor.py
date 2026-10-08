@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+"""Futu/OpenD doctor checks for application and assistant runtime."""
+
+import importlib.util
+import json
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from src.application.opend_utils import normalize_underlier
+from src.application.opend_market_snapshot_fetching import get_underlier_observation_opend
+from src.infrastructure.futu_gateway import build_ready_futu_quote_gateway
+from src.infrastructure.opend_watchdog import port_open, run_watchdog_check
+
+
+REQUIRED_SNAPSHOT_COLS = [
+    "code",
+    "last_price",
+    "bid_price",
+    "ask_price",
+    "volume",
+    "option_open_interest",
+    "option_implied_volatility",
+    "option_delta",
+    "option_contract_multiplier",
+]
+
+
+@dataclass(frozen=True)
+class SymbolFieldResult:
+    symbol: str
+    underlier_code: str | None
+    ok: bool
+    option_fields_ok: bool = False
+    scan_prerequisites_ok: bool = False
+    underlier_observation: dict[str, Any] | None = None
+    chain_rows: int = 0
+    snap_rows: int = 0
+    missing_snapshot_cols: list[str] | None = None
+    spot: float | None = None
+    note: str | None = None
+    error: str | None = None
+
+
+def sdk_status() -> dict[str, Any]:
+    futu_found = importlib.util.find_spec("futu") is not None
+    return {
+        "futu_sdk_importable": futu_found,
+        "ok": bool(futu_found),
+    }
+
+
+def telnet_status(*, host: str = "127.0.0.1", port: int = 22222) -> dict[str, Any]:
+    open_ok = port_open(str(host), int(port), timeout=0.8)
+    return {
+        "host": str(host),
+        "port": int(port),
+        "listening": bool(open_ok),
+        "ok": bool(open_ok),
+        "message": (
+            "OpenD Telnet is listening"
+            if open_ok
+            else "OpenD Telnet is not listening; set telnet_ip=127.0.0.1 and telnet_port=22222 in FutuOpenD.xml"
+        ),
+    }
+
+
+def _rows(value: Any) -> list[dict[str, Any]]:
+    if hasattr(value, "to_dict"):
+        value = value.to_dict("records")
+    if isinstance(value, list):
+        return [dict(row) for row in value if isinstance(row, dict)]
+    return []
+
+
+def check_required_option_fields(
+    *,
+    symbols: list[str],
+    host: str,
+    port: int,
+    limit: int = 10,
+) -> dict[str, Any]:
+    results: list[SymbolFieldResult] = []
+
+    for sym in symbols:
+        underlier = None
+        gateway = None
+        try:
+            underlier = normalize_underlier(sym)
+            gateway = build_ready_futu_quote_gateway(
+                host=host,
+                port=int(port),
+                is_option_chain_cache_enabled=False,
+            )
+            chain = _rows(gateway.get_option_chain(code=underlier.code))
+            if not chain:
+                results.append(
+                    SymbolFieldResult(
+                        symbol=sym,
+                        underlier_code=underlier.code,
+                        ok=False,
+                        error="get_option_chain ret=0 empty",
+                    )
+                )
+                continue
+
+            codes = [
+                str(row.get("code"))
+                for row in chain[: int(limit)]
+                if row.get("code")
+            ]
+            snap = _rows(gateway.get_snapshot(codes))
+            if not snap:
+                results.append(
+                    SymbolFieldResult(
+                        symbol=sym,
+                        underlier_code=underlier.code,
+                        ok=False,
+                        chain_rows=int(len(chain)),
+                        error="get_market_snapshot ret=0 empty",
+                    )
+                )
+                continue
+
+            snapshot_columns = {key for row in snap for key in row}
+            missing = [col for col in REQUIRED_SNAPSHOT_COLS if col not in snapshot_columns]
+            observation = get_underlier_observation_opend(
+                gateway, underlier.code, market=underlier.market, base_dir=None,
+            )
+            option_fields_ok = not missing
+            scan_prerequisites_ok = option_fields_ok and observation.status == "ready"
+            note = None if scan_prerequisites_ok else (
+                "opening prerequisites unavailable: " + (observation.reason_code or "option_fields_missing")
+            )
+
+            results.append(
+                SymbolFieldResult(
+                    symbol=sym,
+                    underlier_code=underlier.code,
+                    ok=scan_prerequisites_ok,
+                    option_fields_ok=option_fields_ok,
+                    scan_prerequisites_ok=scan_prerequisites_ok,
+                    underlier_observation=observation.to_dict(),
+                    chain_rows=int(len(chain)),
+                    snap_rows=int(len(snap)),
+                    missing_snapshot_cols=missing,
+                    spot=observation.last_price,
+                    note=note,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                SymbolFieldResult(
+                    symbol=sym,
+                    underlier_code=(underlier.code if underlier else None),
+                    ok=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            )
+        finally:
+            if gateway is not None:
+                gateway.close()
+
+    return {
+        "host": str(host),
+        "port": int(port),
+        "results": [asdict(row) for row in results],
+    }
+
+
+def required_fields_ok(required_fields: dict[str, Any] | None, *, symbols: list[str]) -> bool:
+    if not symbols:
+        return True
+    if not isinstance(required_fields, dict):
+        return False
+    rows = required_fields.get("results") if isinstance(required_fields.get("results"), list) else []
+    if not rows:
+        return False
+    return all(bool(isinstance(row, dict) and row.get("ok")) for row in rows)
+
+
+def run_futu_doctor_checks(
+    *,
+    host: str,
+    port: int,
+    telnet_host: str = "127.0.0.1",
+    telnet_port: int = 22222,
+    symbols: list[str] | None = None,
+    ensure: bool = False,
+    timeout_sec: int | None = None,
+    required_capability: str = "both",
+    expected_account_ids: list[str] | tuple[str, ...] | None = None,
+    trd_env: str = "REAL",
+) -> dict[str, Any]:
+    del timeout_sec
+    symbol_list = [str(s).strip() for s in (symbols or []) if str(s).strip()]
+    sdk = sdk_status()
+
+    capability = str(required_capability or "").strip().lower()
+    watchdog = run_watchdog_check(
+        host=str(host),
+        port=int(port),
+        ensure=bool(ensure),
+        required_capability=capability,
+        expected_account_ids=expected_account_ids,
+        trd_env=trd_env,
+    ).to_payload()
+    watchdog_ok = bool(watchdog.get("ok"))
+    telnet = telnet_status(host=str(telnet_host), port=int(telnet_port))
+
+    required_fields = None
+    required_fields_raw = ""
+    if bool(sdk.get("ok")) and watchdog_ok and symbol_list and capability in {"quote", "both"}:
+        try:
+            required_fields = check_required_option_fields(
+                symbols=symbol_list,
+                host=str(host),
+                port=int(port),
+            )
+        except Exception as exc:
+            required_fields_raw = f"{type(exc).__name__}: {exc}"
+            required_fields = {
+                "host": str(host),
+                "port": int(port),
+                "results": [
+                    {
+                        "symbol": symbol,
+                        "underlier_code": None,
+                        "ok": False,
+                        "error": required_fields_raw,
+                    }
+                    for symbol in symbol_list
+                ],
+            }
+    fields_ok = (
+        True
+        if capability == "broker"
+        else required_fields_ok(required_fields, symbols=symbol_list)
+    )
+    ok = bool(sdk.get("ok")) and watchdog_ok and fields_ok
+
+    return {
+        "ok": ok,
+        "host": str(host),
+        "port": int(port),
+        "telnet_host": str(telnet_host),
+        "telnet_port": int(telnet_port),
+        "source": "futu",
+        "required_capability": capability,
+        "sdk": sdk,
+        "telnet": telnet,
+        "watchdog_ok": watchdog_ok,
+        "watchdog_returncode": (0 if watchdog_ok else 2),
+        "watchdog": watchdog,
+        "watchdog_raw": json.dumps(watchdog, ensure_ascii=False),
+        "required_fields_ok": fields_ok,
+        "required_fields_returncode": (0 if fields_ok else 2),
+        "required_fields": required_fields,
+        "required_fields_raw": required_fields_raw,
+    }
+
+
+__all__ = [
+    "REQUIRED_SNAPSHOT_COLS",
+    "SymbolFieldResult",
+    "check_required_option_fields",
+    "required_fields_ok",
+    "run_futu_doctor_checks",
+    "sdk_status",
+    "telnet_status",
+]

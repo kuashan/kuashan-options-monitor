@@ -1,0 +1,135 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any
+
+from src.application.account_config import account_settings_from_config, build_account_portfolio_source_plan
+from src.application.config_loader import normalize_portfolio_broker_config
+from src.application.portfolio_management import (
+    normalize_portfolio_management_config,
+)
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.runtime_config_freshness import RuntimeConfigIdentityError, ensure_runtime_config_identity
+from src.application.runtime_config_paths import absolutize_portfolio_data_config
+from src.application.runtime_paths import resolve_runtime_root
+from src.application.settings import build_effective_env
+
+
+DEFAULT_CONFIGS = {
+    "us": "config.us.json",
+    "hk": "config.hk.json",
+}
+
+
+def repo_base() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_runtime_config_path(
+    *,
+    config_key: str | None = None,
+    config_path: str | Path | None = None,
+) -> Path:
+    if config_path is not None and str(config_path).strip():
+        path = Path(config_path).expanduser()
+        if not path.is_absolute():
+            path = path.resolve()
+        return path
+
+    key = str(config_key or "").strip().lower()
+    if key not in DEFAULT_CONFIGS:
+        raise AgentToolError(
+            code="CONFIG_ERROR",
+            message="config_key must be us or hk when config_path is omitted",
+        )
+
+    runtime = resolve_runtime_root(repo_root=repo_base())
+    return (runtime.runtime_root / DEFAULT_CONFIGS[key]).resolve()
+
+def load_runtime_config(
+    *,
+    config_key: str | None = None,
+    config_path: str | Path | None = None,
+    expected_market: str | None = None,
+    require_generated: bool = True,
+    require_identity: bool = True,
+) -> tuple[Path, dict[str, Any]]:
+    path = resolve_runtime_config_path(config_key=config_key, config_path=config_path)
+    if not path.exists():
+        raise AgentToolError(
+            code="CONFIG_ERROR",
+            message=f"runtime config not found: {path.name}",
+            hint="Create the repo-local config file, set OM_RUNTIME_ROOT, or pass config_path explicitly.",
+        )
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AgentToolError(
+            code="CONFIG_ERROR",
+            message=f"failed to parse runtime config: {path.name}",
+            details={"error": f"{type(exc).__name__}: {exc}"},
+        ) from exc
+    if not isinstance(raw, dict):
+        raise AgentToolError(
+            code="CONFIG_ERROR",
+            message="runtime config must be a JSON object",
+            details={"path": path.name},
+        )
+    cfg = absolutize_portfolio_data_config(raw, config_path=path)
+    cfg = normalize_portfolio_broker_config(cfg)
+    try:
+        cfg = normalize_portfolio_management_config(cfg)
+    except ValueError as exc:
+        raise AgentToolError(code="CONFIG_ERROR", message=str(exc)) from exc
+    if require_identity:
+        try:
+            ensure_runtime_config_identity(
+                cfg,
+                explicit_market=expected_market,
+                config_key=config_key,
+                runtime_config_path=path,
+                require_generated=require_generated,
+            )
+        except RuntimeConfigIdentityError as exc:
+            raise AgentToolError(
+                code="CONFIG_ERROR",
+                message=str(exc),
+                hint="Create config.yaml, then rebuild with `om config build --source yaml --market <market>`.",
+                details=exc.result,
+            ) from exc
+    portfolio = cfg.get("portfolio") if isinstance(cfg.get("portfolio"), dict) else {}
+    try:
+        account_settings_from_config(cfg)
+        build_account_portfolio_source_plan(cfg, account=portfolio.get("account"))
+    except ValueError as exc:
+        raise AgentToolError(code="CONFIG_ERROR", message=str(exc)) from exc
+    cfg["config_source_path"] = str(path)
+    return path, cfg
+
+
+def resolve_output_root(output_dir: str | Path | None = None) -> Path:
+    if output_dir is not None and str(output_dir).strip():
+        path = Path(output_dir).expanduser()
+        if not path.is_absolute():
+            path = (repo_base() / path).resolve()
+        return path
+    env_dir = str(build_effective_env().get("OM_OUTPUT_DIR") or "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    return (repo_base() / "output_shared" / "agent_tools").resolve()
+
+
+def write_tools_enabled() -> bool:
+    from src.application.settings.effective import resolve_write_gates
+    return resolve_write_gates(build_effective_env().values)["agent_write_tools_enabled"]
+
+
+__all__ = [
+    "DEFAULT_CONFIGS",
+    "load_runtime_config",
+    "repo_base",
+    "resolve_output_root",
+    "resolve_runtime_config_path",
+    "write_tools_enabled",
+]

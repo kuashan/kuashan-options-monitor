@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import ast
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _write_fake_python(path: Path, *, version: str, log: Path | None = None) -> Path:
+    status = 0 if tuple(int(part) for part in version.split(".")) >= (3, 12, 0) else 42
+    log_line = f"printf '%s\\n' \"$*\" >> {shlex_quote(str(log))}\n" if log else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "if [[ \"${1:-}\" == \"-c\" ]]; then\n"
+        f"  printf '%s\\n' {shlex_quote(version)}\n"
+        f"  exit {status}\n"
+        "fi\n"
+        f"{log_line}"
+        "printf '%s\\n' \"$*\"\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+
+    return shlex.quote(value)
+
+
+def _copy_launcher_repo(tmp_path: Path, launcher: str = "om") -> Path:
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy2(ROOT / launcher, repo / launcher)
+    shutil.copy2(ROOT / "scripts" / "python_runtime.sh", repo / "scripts" / "python_runtime.sh")
+    (repo / launcher).chmod(0o755)
+    return repo
+
+
+def _runtime_env(fake_bin: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("OM_PYTHON", None)
+    env.pop("PYTHON", None)
+    env["PATH"] = os.pathsep.join([str(fake_bin), "/usr/bin", "/bin"])
+    return env
+
+
+def _run(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv, text=True, capture_output=True, env=env, cwd=cwd, check=False
+    )
+
+
+def _selector(
+    selector: str, target: Path, env: dict[str, str], *, label: str, shell: str = "bash"
+) -> subprocess.CompletedProcess[str]:
+    return _run(
+        [
+            shell,
+            "-c",
+            f'source "$1" && {selector} "$2"',
+            label,
+            str(ROOT / "scripts" / "python_runtime.sh"),
+            str(target),
+        ],
+        env=env,
+    )
+
+
+def test_om_python_override_explicitly_bypasses_incompatible_repo_venv(tmp_path: Path) -> None:
+    repo = _copy_launcher_repo(tmp_path)
+    _write_fake_python(repo / ".venv" / "bin" / "python", version="3.11.9")
+    log = tmp_path / "override.log"
+    override = _write_fake_python(tmp_path / "override-python", version="3.12.4", log=log)
+    env = _runtime_env(tmp_path / "empty-bin")
+    env["OM_PYTHON"] = str(override)
+
+    result = _run(["bash", str(repo / "om"), "config", "validate"], env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "-m src.interfaces.cli.main config validate" in log.read_text(encoding="utf-8")
+
+
+def test_incompatible_repo_venv_blocks_python_and_path_fallback(tmp_path: Path) -> None:
+    repo = _copy_launcher_repo(tmp_path)
+    old = _write_fake_python(repo / ".venv" / "bin" / "python", version="3.11.9")
+    fallback_log = tmp_path / "fallback.log"
+    fallback = _write_fake_python(tmp_path / "fake-bin" / "python3.12", version="3.12.4", log=fallback_log)
+    env = _runtime_env(fallback.parent)
+    env["PYTHON"] = str(fallback)
+
+    result = _run(["bash", str(repo / "om"), "--help"], env=env)
+
+    assert result.returncode != 0
+    assert "Python >= 3.12 is required" in result.stderr
+    assert str(old) in result.stderr
+    assert "observed=3.11.9" in result.stderr
+    assert not fallback_log.exists()
+
+
+def test_repo_selector_preserves_venv_python_symlink_entrypoint(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    external = _write_fake_python(tmp_path / "runtime" / "python3.12", version="3.12.3")
+    repo_python = repo / ".venv" / "bin" / "python"
+    repo_python.parent.mkdir(parents=True)
+    repo_python.symlink_to(external)
+    env = _runtime_env(tmp_path / "empty-bin")
+
+    result = _selector("om_select_repo_python", repo, env, label="repo-test")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(repo_python)
+
+
+def test_missing_repo_venv_prefers_python312_and_forwards_agent_argv(tmp_path: Path) -> None:
+    repo = _copy_launcher_repo(tmp_path, launcher="om-agent")
+    log = tmp_path / "python312.log"
+    python312 = _write_fake_python(tmp_path / "fake-bin" / "python3.12", version="3.12.2", log=log)
+    env = _runtime_env(python312.parent)
+
+    result = _run(["bash", str(repo / "om-agent"), "spec"], env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert "-m src.interfaces.agent.cli spec" in log.read_text(encoding="utf-8")
+
+
+def test_old_python3_is_only_a_diagnostic_final_candidate(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    old = _write_fake_python(tmp_path / "fake-bin" / "python3", version="3.9.6")
+    (old.parent / "bash").symlink_to("/bin/bash")
+    env = _runtime_env(old.parent)
+    env["PATH"] = str(old.parent)
+
+    result = _selector(
+        "om_select_repo_python", repo, env, label="runtime-test", shell="/bin/bash"
+    )
+
+    assert result.returncode != 0
+    assert "candidate=PATH python3" in result.stderr
+    assert "observed=3.9.6" in result.stderr
+    assert str(old) in result.stderr
+
+
+def test_pre_commit_uses_python312_when_default_python3_is_old(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".githooks").mkdir(parents=True)
+    (repo / "scripts").mkdir()
+    shutil.copy2(ROOT / ".githooks" / "pre-commit", repo / ".githooks" / "pre-commit")
+    shutil.copy2(ROOT / "scripts" / "python_runtime.sh", repo / "scripts" / "python_runtime.sh")
+    (repo / "scripts" / "guardrails_check.py").write_text("", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+
+    fake_bin = tmp_path / "fake-bin"
+    _write_fake_python(fake_bin / "python3", version="3.9.6")
+    log = tmp_path / "guardrails.log"
+    _write_fake_python(fake_bin / "python3.12", version="3.12.4", log=log)
+
+    result = _run(["bash", str(repo / ".githooks" / "pre-commit")],
+                  env=_runtime_env(fake_bin), cwd=repo)
+
+    assert result.returncode == 0, result.stderr
+    assert "scripts/guardrails_check.py --staged" in log.read_text(encoding="utf-8")
+
+
+def test_bootstrap_selector_rejects_interpreter_inside_target_venv(tmp_path: Path) -> None:
+    target = tmp_path / "repo" / ".venv"
+    target_python = _write_fake_python(target / "bin" / "python", version="3.12.3")
+    env = _runtime_env(tmp_path / "empty-bin")
+    env["PYTHON"] = str(target_python)
+
+    result = _selector("om_select_bootstrap_python", target, env, label="bootstrap-test")
+
+    assert result.returncode != 0
+    assert "bootstrap interpreter must be outside" in result.stderr
+    assert str(target) in result.stderr
+
+
+def test_bootstrap_selector_rejects_interpreter_through_symlinked_target_venv(tmp_path: Path) -> None:
+    shared = tmp_path / "cache" / "shared-venv"
+    _write_fake_python(shared / "bin" / "python", version="3.12.3")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    target = repo / ".venv"
+    target.symlink_to(shared, target_is_directory=True)
+    env = _runtime_env(tmp_path / "empty-bin")
+    env["PYTHON"] = str(target / "bin" / "python")
+
+    result = _selector("om_select_bootstrap_python", target, env, label="bootstrap-test")
+
+    assert result.returncode != 0
+    assert "bootstrap interpreter must be outside" in result.stderr
+    assert f"target_venv={shared}" in result.stderr
+
+
+def test_bootstrap_selector_rejects_external_alias_to_target_interpreter(tmp_path: Path) -> None:
+    target = tmp_path / "repo" / ".venv"
+    target_python = _write_fake_python(target / "bin" / "python", version="3.12.3")
+    alias = tmp_path / "fake-bin" / "python3.12"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(target_python)
+    env = _runtime_env(tmp_path / "empty-bin")
+    env["PYTHON"] = str(alias)
+
+    result = _selector("om_select_bootstrap_python", target, env, label="bootstrap-test")
+
+    assert result.returncode != 0
+    assert "bootstrap interpreter must be outside" in result.stderr
+    assert f"executable={target_python}" in result.stderr
+
+
+def test_bootstrap_selector_ignores_existing_target_venv(tmp_path: Path) -> None:
+    target = tmp_path / "repo" / ".venv"
+    _write_fake_python(target / "bin" / "python", version="3.11.9")
+    external = _write_fake_python(tmp_path / "fake-bin" / "python3.12", version="3.12.3")
+    env = _runtime_env(external.parent)
+
+    result = _selector("om_select_bootstrap_python", target, env, label="bootstrap-test")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(external)
+
+
+def test_src_and_domain_guards_are_python39_parseable_and_fail_fast() -> None:
+    for package in ("src", "domain"):
+        init_path = ROOT / package / "__init__.py"
+        ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path), feature_version=(3, 9))
+        result = _run(
+            [sys.executable, "-c", f"import sys; sys.version_info = (3, 9, 18); import {package}"],
+            cwd=ROOT,
+        )
+        assert result.returncode != 0
+        assert "options-monitor requires Python >= 3.12" in result.stderr
+        assert "observed=3.9.18" in result.stderr
+
+
+def test_current_operational_docs_do_not_reintroduce_ambiguous_python_bootstrap() -> None:
+    current_docs = (
+        ROOT / "AGENTS.md",
+        ROOT / "RUNBOOK.md",
+        ROOT / "docs" / "AGENT_GETTING_STARTED.md",
+        ROOT / "docs" / "DEPLOY_LINUX_MAC.md",
+        ROOT / "docs" / "RELEASE_PROCESS.md",
+        ROOT / "docs" / "TOOL_REFERENCE.md",
+    )
+
+    for path in current_docs:
+        text = path.read_text(encoding="utf-8")
+        assert "python3 -m venv .venv" not in text
+        assert "uv venv --python python3" not in text
+        assert "`python3 -m src.application" not in text
+
+    assert "./.venv/bin/python scripts/generate_dependency_graph.py --check" in (
+        ROOT / "scripts" / "generate_dependency_graph.py"
+    ).read_text(encoding="utf-8")
+    assert "./om run trade-intake --config ... --mode apply --yes" in (
+        ROOT / "RUNBOOK.md"
+    ).read_text(encoding="utf-8")

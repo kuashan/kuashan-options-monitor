@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from domain.domain.ledger import ContractKey, ProjectionResult, TradeEvent, project_trade_events
+from domain.domain.ledger.events import LedgerDiagnostic
+from domain.domain.ledger.position_fields import (
+    effective_contracts_open,
+    effective_expiration_ymd,
+    effective_multiplier,
+    effective_strike,
+    normalize_status,
+    safe_float,
+)
+from domain.domain.option_position_identity import normalize_side
+from domain.domain.trade_contract_identity import derive_trade_side, require_option_multiplier
+
+
+@dataclass(frozen=True)
+class ReconciliationIssue:
+    code: str
+    severity: str
+    lot_id: str
+    message: str
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "severity": self.severity,
+            "lot_id": self.lot_id,
+            "message": self.message,
+            "details": dict(self.details),
+        }
+
+
+@dataclass(frozen=True)
+class ReconciliationReport:
+    legacy_open_lot_count: int
+    ledger_open_lot_count: int
+    issues: list[ReconciliationIssue]
+
+    @property
+    def has_errors(self) -> bool:
+        return any(item.severity == "error" for item in self.issues)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "legacy_open_lot_count": self.legacy_open_lot_count,
+            "ledger_open_lot_count": self.ledger_open_lot_count,
+            "issues": [item.to_dict() for item in self.issues],
+            "has_errors": self.has_errors,
+        }
+
+
+@dataclass(frozen=True)
+class ShadowReplayResult:
+    source: str
+    source_record_count: int
+    imported_event_count: int
+    projection: ProjectionResult
+    import_diagnostics: list[LedgerDiagnostic] = field(default_factory=list)
+    reconciliation: ReconciliationReport | None = None
+
+    @property
+    def has_errors(self) -> bool:
+        return (
+            any(item.severity == "error" for item in self.import_diagnostics)
+            or self.projection.has_errors
+            or bool(self.reconciliation and self.reconciliation.has_errors)
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": self.source,
+            "source_record_count": self.source_record_count,
+            "imported_event_count": self.imported_event_count,
+            "projection": self.projection.to_dict(),
+            "import_diagnostics": [item.to_dict() for item in self.import_diagnostics],
+            "reconciliation": self.reconciliation.to_dict() if self.reconciliation is not None else None,
+            "has_errors": self.has_errors,
+        }
+
+
+def import_position_lot_snapshot(
+    records: list[dict[str, Any]],
+    *,
+    source: str = "legacy_position_lots",
+) -> tuple[list[TradeEvent], list[LedgerDiagnostic]]:
+    imported: list[TradeEvent] = []
+    diagnostics: list[LedgerDiagnostic] = []
+    for item in records:
+        event, item_diagnostics = position_lot_snapshot_to_open_event(item, source=source)
+        diagnostics.extend(item_diagnostics)
+        if event is not None:
+            imported.append(event)
+    return imported, diagnostics
+
+
+def shadow_replay_position_lot_snapshot(
+    records: list[dict[str, Any]],
+    *,
+    source: str = "legacy_position_lots",
+) -> ShadowReplayResult:
+    imported, diagnostics = import_position_lot_snapshot(records, source=source)
+    projection = project_trade_events(imported)
+    reconciliation = reconcile_position_lot_snapshot(records, projection)
+    return ShadowReplayResult(
+        source=source,
+        source_record_count=len(records),
+        imported_event_count=len(imported),
+        projection=projection,
+        import_diagnostics=diagnostics,
+        reconciliation=reconciliation,
+    )
+
+
+def position_lot_snapshot_to_open_event(
+    item: dict[str, Any],
+    *,
+    source: str,
+) -> tuple[TradeEvent | None, list[LedgerDiagnostic]]:
+    lot_id = str(item.get("lot_id") or item.get("record_id") or "").strip()
+    fields = item.get("fields") if isinstance(item.get("fields"), dict) else item
+    diagnostics: list[LedgerDiagnostic] = []
+    if not lot_id or not isinstance(fields, dict):
+        diagnostics.append(
+            LedgerDiagnostic(
+                event_id=f"snapshot:{lot_id}",
+                severity="error",
+                code="snapshot_record_invalid",
+                message="position_lot snapshot record_id and fields are required",
+            )
+        )
+        return None, diagnostics
+    if normalize_status(fields.get("status")) == "close" or effective_contracts_open(fields) <= 0:
+        return None, diagnostics
+    try:
+        contract_key = _contract_key_from_position_fields(fields)
+        raw_payload: dict[str, Any] = {
+            "record_id": lot_id,
+            # No legacy ``fields`` snapshot: the imported event carries the
+            # contract key and the quantities, and the published payload is a
+            # pure function of the projected lot (I-1). Seeding the historical
+            # row verbatim is what let legacy spellings reach a converged payload.
+            "source": source,
+        }
+        # §9.2 step 3: the contract key no longer carries the position side, so the
+        # imported snapshot event must publish the trade side derived from the
+        # legacy lot ``side`` field instead.
+        snapshot_side = derive_trade_side("open", fields.get("side"))
+        if snapshot_side:
+            raw_payload["side"] = snapshot_side
+        event = TradeEvent(
+            event_id=f"snapshot:{source}:{lot_id}",
+            event_type="open",
+            event_time_ms=int(fields.get("opened_at") or fields.get("last_action_at") or 0),
+            contract_key=contract_key,
+            contracts=effective_contracts_open(fields),
+            price=float(safe_float(fields.get("premium")) or 0.0),
+            currency=str(fields.get("currency") or ""),
+            source=source,
+            multiplier=require_option_multiplier(fields.get("multiplier")),
+            lot_id=lot_id,
+            raw_payload=raw_payload,
+        )
+    except Exception as exc:
+        diagnostics.append(
+            LedgerDiagnostic(
+                event_id=f"snapshot:{source}:{lot_id}",
+                severity="error",
+                code="snapshot_import_failed",
+                message="position_lot snapshot import failed",
+                details={"record_id": lot_id, "error": str(exc)},
+            )
+        )
+        return None, diagnostics
+    return event, diagnostics
+
+
+def reconcile_position_lot_snapshot(
+    records: list[dict[str, Any]],
+    projection: ProjectionResult,
+) -> ReconciliationReport:
+    legacy_open = _legacy_open_lots_by_id(records)
+    ledger_open = {
+        lot.lot_id: lot
+        for lot in projection.lots
+        if lot.contracts_open > 0
+    }
+    issues: list[ReconciliationIssue] = []
+    for lot_id, legacy in legacy_open.items():
+        lot = ledger_open.get(lot_id)
+        if lot is None:
+            issues.append(
+                ReconciliationIssue(
+                    code="missing_in_ledger",
+                    severity="error",
+                    lot_id=lot_id,
+                    message="legacy open lot is missing in ledger projection",
+                )
+            )
+            continue
+        if lot.contract_key != legacy["contract_key"] or (
+            legacy["position_side"] and lot.position_side != legacy["position_side"]
+        ):
+            issues.append(
+                ReconciliationIssue(
+                    code="identity_mismatch",
+                    severity="error",
+                    lot_id=lot_id,
+                    message="legacy open lot identity differs from ledger projection",
+                    details={
+                        "legacy_contract_key": legacy["contract_key"].to_dict(),
+                        "ledger_contract_key": lot.contract_key.to_dict(),
+                    },
+                )
+            )
+        if int(lot.contracts_open) != int(legacy["contracts_open"]):
+            issues.append(
+                ReconciliationIssue(
+                    code="quantity_mismatch",
+                    severity="error",
+                    lot_id=lot_id,
+                    message="legacy open lot quantity differs from ledger projection",
+                    details={
+                        "legacy_contracts_open": int(legacy["contracts_open"]),
+                        "ledger_contracts_open": int(lot.contracts_open),
+                    },
+                )
+            )
+    for lot_id in sorted(set(ledger_open) - set(legacy_open)):
+        issues.append(
+            ReconciliationIssue(
+                code="missing_in_legacy",
+                severity="error",
+                lot_id=lot_id,
+                message="ledger projection open lot is missing in legacy snapshot",
+            )
+        )
+    return ReconciliationReport(
+        legacy_open_lot_count=len(legacy_open),
+        ledger_open_lot_count=len(ledger_open),
+        issues=issues,
+    )
+
+
+def _legacy_open_lots_by_id(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for item in records:
+        lot_id = str(item.get("lot_id") or item.get("record_id") or "").strip()
+        fields = item.get("fields") if isinstance(item.get("fields"), dict) else item
+        if not lot_id or not isinstance(fields, dict):
+            continue
+        if normalize_status(fields.get("status")) == "close" or effective_contracts_open(fields) <= 0:
+            continue
+        try:
+            out[lot_id] = {
+                "contract_key": _contract_key_from_position_fields(fields),
+                "position_side": normalize_side(fields.get("side")),
+                "contracts_open": effective_contracts_open(fields),
+            }
+        except Exception:
+            continue
+    return out
+
+
+def _contract_key_from_position_fields(fields: dict[str, Any]) -> ContractKey:
+    return ContractKey.from_values(
+        broker=fields.get("broker") or fields.get("market"),
+        account=fields.get("account"),
+        underlying_symbol=fields.get("symbol"),
+        option_type=fields.get("option_type"),
+        strike=effective_strike(fields),
+        expiration_ymd=fields.get("expiration_ymd") or effective_expiration_ymd(fields),
+    )

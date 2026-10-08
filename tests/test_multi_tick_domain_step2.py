@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+
+def _notify(account, notify_decision_by_account, scheduler_decision):
+    from domain.domain.multi_tick import decide_should_notify
+
+    return decide_should_notify(
+        account=account,
+        notify_decision_by_account=notify_decision_by_account,
+        scheduler_decision=scheduler_decision,
+    )
+
+
+def test_apply_scan_run_decision_force_and_smoke_keep_existing_semantics() -> None:
+    from domain.domain.multi_tick import apply_scan_run_decision
+
+    should_run, reason = apply_scan_run_decision(
+        should_run_global=False,
+        reason_global='interval_not_due',
+        force_mode=True,
+        smoke=True,
+    )
+
+    assert should_run is False
+    assert reason == 'interval_not_due | force | force: bypass guard | smoke_skip_pipeline'
+
+
+def test_decide_should_notify_prefers_account_and_fallbacks_to_scheduler_fields() -> None:
+    assert _notify('lx', {'lx': True}, {'should_notify': False, 'is_notify_window_open': False}) is True
+
+    assert _notify('sy', {}, {'should_notify': True, 'is_notify_window_open': False}) is False
+
+    assert _notify('sy', {}, {'should_notify': True}) is True
+
+    assert _notify('sy', {'sy': False}, {'is_notify_window_open': True}) is False
+
+
+def test_decide_should_notify_accepts_scheduler_view() -> None:
+    from domain.domain.engine import SchedulerDecisionView
+
+    assert _notify(
+        'sy', {}, SchedulerDecisionView(should_run_scan=True, is_notify_window_open=True, reason='ok'),
+    ) is True
+
+
+def test_decide_should_notify_normalizes_scheduler_payload_via_dto_builder() -> None:
+    from domain.domain import multi_tick as mod
+
+    old_build_scheduler_decision_dto = mod.build_scheduler_decision_dto
+    try:
+        mod.build_scheduler_decision_dto = lambda _raw: {  # type: ignore[assignment]
+            'should_run_scan': True,
+            'is_notify_window_open': True,
+            'reason': 'normalized',
+        }
+        assert _notify(
+            'sy', {}, {'should_notify': False, 'is_notify_window_open': False},
+        ) is True
+    finally:
+        mod.build_scheduler_decision_dto = old_build_scheduler_decision_dto  # type: ignore[assignment]
+
+
+def test_decide_should_notify_accepts_account_scheduler_dto() -> None:
+    assert _notify('sy', {'sy': {'should_notify': True}}, {'is_notify_window_open': False}) is True
+
+
+def test_decide_should_notify_treats_none_account_payload_as_scheduler_fallback() -> None:
+    assert _notify('sy', {'sy': None}, {'should_notify': True}) is True
+
+
+def test_decide_should_notify_prefers_canonical_account_field_over_legacy() -> None:
+    assert _notify(
+        'sy', {'sy': {'is_notify_window_open': False, 'should_notify': True}}, {'is_notify_window_open': True},
+    ) is False
+
+
+def test_decide_should_notify_accepts_account_scheduler_view() -> None:
+    from domain.domain.engine import AccountSchedulerDecisionView
+
+    assert _notify(
+        'sy', {'sy': AccountSchedulerDecisionView(is_notify_window_open=True)}, {'is_notify_window_open': False},
+    ) is True
+
+
+def test_decide_should_notify_normalizes_account_payload_via_view() -> None:
+    from domain.domain import multi_tick as mod
+
+    calls = {'n': 0}
+    old_from_payload = mod.AccountSchedulerDecisionView.from_payload
+    try:
+        mod.AccountSchedulerDecisionView.from_payload = classmethod(  # type: ignore[method-assign]
+            lambda cls, _payload, *, scheduler_decision: (
+                calls.__setitem__('n', calls['n'] + 1),
+                cls(is_notify_window_open=bool(scheduler_decision.is_notify_window_open)),
+            )[1]
+        )
+        assert _notify('sy', {'sy': {'should_notify': True}}, {'is_notify_window_open': True}) is True
+        assert calls['n'] == 1
+    finally:
+        mod.AccountSchedulerDecisionView.from_payload = old_from_payload  # type: ignore[method-assign]
+
+
+def test_decide_should_notify_routes_account_payload_via_account_scheduler_dto_builder() -> None:
+    from domain.domain import multi_tick as mod
+
+    seen = {'raw': None, 'scheduler_decision': None}
+    old_build_account_scheduler_decision_dto = mod.build_account_scheduler_decision_dto
+    old_from_payload = mod.AccountSchedulerDecisionView.from_payload
+    try:
+        mod.build_account_scheduler_decision_dto = lambda raw, *, scheduler_decision: (  # type: ignore[assignment]
+            seen.__setitem__('raw', raw),
+            seen.__setitem__('scheduler_decision', scheduler_decision),
+            {'is_notify_window_open': True},
+        )[2]
+        mod.AccountSchedulerDecisionView.from_payload = classmethod(  # type: ignore[method-assign]
+            lambda cls, payload, *, scheduler_decision: (
+                seen.__setitem__('scheduler_decision', scheduler_decision),
+                cls(is_notify_window_open=bool(payload.get('is_notify_window_open'))),
+            )[1]
+        )
+        assert _notify('sy', {'sy': True}, {'is_notify_window_open': False}) is True
+        assert seen['raw'] is True
+        assert bool(getattr(seen['scheduler_decision'], 'is_notify_window_open', False)) is False
+    finally:
+        mod.build_account_scheduler_decision_dto = old_build_account_scheduler_decision_dto  # type: ignore[assignment]
+        mod.AccountSchedulerDecisionView.from_payload = old_from_payload  # type: ignore[method-assign]
+
+
+def test_decide_should_notify_uses_canonical_account_dto_without_rebuilding() -> None:
+    from domain.domain import multi_tick as mod
+
+    calls = {'n': 0}
+    old_build_account_scheduler_decision_dto = mod.build_account_scheduler_decision_dto
+    try:
+        mod.build_account_scheduler_decision_dto = lambda raw, *, scheduler_decision: (  # type: ignore[assignment]
+            calls.__setitem__('n', calls['n'] + 1),
+            {'is_notify_window_open': False},
+        )[1]
+        assert _notify(
+            'sy',
+            {'sy': {'schema_kind': 'scheduler_decision_account', 'schema_version': '1.0',
+                    'is_notify_window_open': True, 'should_notify': False}},
+            {'is_notify_window_open': False},
+        ) is True
+        assert calls['n'] == 0
+    finally:
+        mod.build_account_scheduler_decision_dto = old_build_account_scheduler_decision_dto  # type: ignore[assignment]
+
+
+def test_decide_should_notify_uses_canonical_scheduler_dto_without_rebuilding() -> None:
+    from domain.domain import multi_tick as mod
+
+    calls = {'n': 0}
+    old_build_scheduler_decision_dto = mod.build_scheduler_decision_dto
+    try:
+        mod.build_scheduler_decision_dto = lambda _raw: (  # type: ignore[assignment]
+            calls.__setitem__('n', calls['n'] + 1),
+            {'is_notify_window_open': False},
+        )[1]
+        assert _notify(
+            'sy',
+            {},
+            {'schema_kind': 'scheduler_decision', 'schema_version': '1.0',
+             'should_run_scan': True, 'is_notify_window_open': True, 'reason': 'ok'},
+        ) is True
+        assert calls['n'] == 0
+    finally:
+        mod.build_scheduler_decision_dto = old_build_scheduler_decision_dto  # type: ignore[assignment]
+
+
+def test_build_failure_audit_fields_distinguishes_io_vs_decision() -> None:
+    from domain.domain.engine import build_failure_audit_fields
+
+    io_out = build_failure_audit_fields(
+        failure_kind='io_error',
+        failure_stage='scan_scheduler',
+        failure_adapter='scheduler',
+    )
+    assert io_out == {
+        'failure_kind': 'io_error',
+        'failure_stage': 'scan_scheduler',
+        'failure_adapter': 'scheduler',
+    }
+
+    decision_out = build_failure_audit_fields(
+        failure_kind='decision_error',
+        failure_stage='scheduler_decision',
+    )
+    assert decision_out == {
+        'failure_kind': 'decision_error',
+        'failure_stage': 'scheduler_decision',
+    }
+
+
+def test_filter_notify_candidates_matches_existing_predicate() -> None:
+    from domain.domain.multi_tick import filter_notify_candidates
+    from src.application.multi_tick.misc import AccountResult
+
+    results = [
+        AccountResult('a', True, True, 'ok', 'x'),
+        AccountResult('b', True, True, 'ok', '今日无需要主动提醒的内容。'),
+        AccountResult('c', True, False, 'ok', 'x'),
+        AccountResult('d', True, True, 'ok', '   '),
+    ]
+
+    selected = filter_notify_candidates(results)
+    assert [r.account for r in selected] == ['a']
+
+
+def test_filter_notify_candidates_delegates_to_engine() -> None:
+    from domain.domain import multi_tick as mod
+
+    called = {'n': 0}
+    old = mod.filter_notify_candidates_engine
+    try:
+        mod.filter_notify_candidates_engine = lambda results: (  # type: ignore[assignment]
+            called.__setitem__('n', called['n'] + 1),
+            list(results),
+        )[1]
+        out = mod.filter_notify_candidates([1, 2, 3])
+        assert out == [1, 2, 3]
+        assert called['n'] == 1
+    finally:
+        mod.filter_notify_candidates_engine = old  # type: ignore[assignment]
+
+
+def test_build_no_account_notification_payloads_keeps_existing_fields() -> None:
+    from domain.domain.multi_tick_result import build_no_account_notification_payloads
+    from src.application.multi_tick.misc import AccountResult
+
+    calls = {'n': 0}
+
+    def _now() -> str:
+        calls['n'] += 1
+        return f'2026-04-11T11:44:0{calls["n"]}Z'
+
+    results = [
+        AccountResult('a', True, True, 'ok', 'x'),
+        AccountResult('b', False, False, 'skip', ''),
+    ]
+
+    shared, per_account = build_no_account_notification_payloads(
+        now_utc_fn=_now,
+        results=results,
+        run_dir='/tmp/run',
+    )
+
+    assert shared['reason'] == 'no_account_notification'
+    assert shared['accounts'] == ['a', 'b']
+    assert shared['results'][0]['account'] == 'a'
+    assert per_account['a']['account'] == 'a'
+    assert per_account['a']['result']['decision_reason'] == 'ok'
+    assert per_account['b']['run_dir'] == '/tmp/run'
+    assert calls['n'] == 3
+
+    failed_shared, failed_per_account = build_no_account_notification_payloads(
+        now_utc_fn=_now,
+        results=results,
+        run_dir='/tmp/run',
+        reason='daily_brief_multi_market_delivery_unsupported',
+        error_code='daily_brief_multi_market_delivery_unsupported',
+    )
+    assert failed_shared['reason'] == 'daily_brief_multi_market_delivery_unsupported'
+    assert failed_shared['error_code'] == 'daily_brief_multi_market_delivery_unsupported'
+    assert failed_per_account['a']['error_code'] == 'daily_brief_multi_market_delivery_unsupported'
+
+
+def test_build_shared_last_run_payload_merges_prev_and_caps_history() -> None:
+    from domain.domain.multi_tick_result import build_shared_last_run_payload
+
+    prev = {
+        'legacy': 1,
+        'history': [{'id': 1}, {'id': 2}],
+    }
+    run_meta = {'id': 3, 'sent': True}
+
+    out = build_shared_last_run_payload(prev_payload=prev, run_meta=run_meta, history_limit=2)
+    assert out['legacy'] == 1
+    assert out['id'] == 3
+    assert out['history'] == [{'id': 2}, {'id': 3, 'sent': True}]

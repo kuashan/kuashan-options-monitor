@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+repo_name="$(basename "$repo_root")"
+
+if [[ "$repo_name" == *"options-monitor-prod"* ]] || [[ "$repo_root" == *"/options-monitor-prod"* ]]; then
+  echo "[guardrails] blocked: commits are forbidden in prod repo: $repo_root" >&2
+  exit 1
+fi
+
+source "$repo_root/scripts/python_runtime.sh"
+python_bin="$(om_select_repo_python "$repo_root")"
+
+exec "$python_bin" "$repo_root/scripts/guardrails_check.py" \
+  --staged \
+  --check-doc-wording \
+  --check-runtime-config-tracking \
+  --check-sensitive-artifacts

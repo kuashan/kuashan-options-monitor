@@ -1,0 +1,31 @@
+from __future__ import annotations
+
+from domain.domain.fetch_source import is_futu_fetch_source, normalize_fetch_source, resolve_symbol_fetch_source
+
+
+def test_normalize_fetch_source_accepts_futu_aliases() -> None:
+    assert normalize_fetch_source("futu") == "opend"
+    assert normalize_fetch_source("futu_api") == "opend"
+    assert normalize_fetch_source("futu-opend") == "opend"
+    assert normalize_fetch_source("opend") == "opend"
+    assert is_futu_fetch_source("futu") is True
+
+
+def test_normalize_fetch_source_preserves_explicit_non_futu_sources() -> None:
+    assert normalize_fetch_source("yfinance") == "yfinance"
+    assert normalize_fetch_source("yahoo") == "yahoo"
+    assert is_futu_fetch_source("yahoo") is False
+
+
+def test_normalize_fetch_source_defaults_to_futu_opend() -> None:
+    assert normalize_fetch_source(None) == "opend"
+
+
+def test_resolve_symbol_fetch_source_preserves_explicit_source_choice() -> None:
+    assert resolve_symbol_fetch_source({}) == ("opend", "default_opend")
+    assert resolve_symbol_fetch_source({"source": "yahoo"}) == ("yahoo", "configured_yahoo")
+    assert resolve_symbol_fetch_source({"source": "futu"}) == ("opend", "configured_opend")
+    assert resolve_symbol_fetch_source({"source": "futu", "_source_resolution": "ignored_legacy_resolution"}) == (
+        "opend",
+        "configured_opend",
+    )

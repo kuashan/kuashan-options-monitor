@@ -1,0 +1,2132 @@
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+import tempfile
+import threading
+from types import SimpleNamespace
+
+import pytest
+
+import src.application.trades.auto_intake as auto_intake
+
+from src.application.layered_config import build_layered_runtime_config_from_user_config
+from src.application.runtime_config_freshness import GENERATED_KEY, build_inline_generated_metadata
+
+
+BASE = Path(__file__).resolve().parents[1]
+AUTO_INTAKE_CLI_TIMEOUT_SEC = 15
+
+
+def test_intake_result_failures_have_journal_warning_level(capsys) -> None:
+    failed = {"status": "failed", "account": "lx", "deal_id": "d-1"}
+    receipt_missing = {"status": "handled", "account": "lx", "deal_id": "d-2",
+                       "receipt": {"status": "skipped", "reason": "skipped_no_route"}}
+    success = {"status": "handled", "account": "lx", "deal_id": "d-3"}
+    for result in (failed, failed, receipt_missing, success):
+        auto_intake._log(auto_intake._format_result_summary(result))
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 4
+    assert all(line.startswith("<4>[WARN] AUTO_TRADE_INTAKE") for line in lines[:3])
+    assert lines[3].startswith("AUTO_TRADE_INTAKE")
+
+
+def _listener_source(tmp_path: Path, account: str, port: int) -> dict:
+    return {
+        "id": account,
+        "account": account,
+        "enabled": True,
+        "mode": "apply",
+        "host": "127.0.0.1",
+        "port": port,
+        "state_path": Path(f"state/{account}.json"),
+        "audit_path": Path(f"audit/{account}.jsonl"),
+        "status_path": Path(f"status/{account}.json"),
+        "inbox_path": Path(f"inbox/{account}.sqlite3"),
+        "backfill_checkpoint_path": Path(f"backfill/{account}.json"),
+        "reconnect_sec": 5,
+        "receipt": {"enabled": True},
+        "backfill": {"enabled": False},
+        "account_mapping": {f"REAL_{account.upper()}": account},
+        "futu_account_ids": [f"REAL_{account.upper()}"],
+        "combo_reconciliation_mode": "off",
+    }
+
+
+def _run_auto_intake(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run the auto-intake CLI as a subprocess with the shared cwd/capture/timeout."""
+    return subprocess.run(
+        [sys.executable, "-m", "src.application.trades.auto_intake", *args],
+        cwd=str(BASE),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=AUTO_INTAKE_CLI_TIMEOUT_SEC,
+    )
+
+
+def test_skipped_stock_recovery_requires_exact_snapshot_and_does_not_send(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    from src.application.trades.inbox import (read_trade_payload, resume_skipped_trade_payload,
+                                              record_trade_payload_refresh_intent,
+                                              claim_trade_payload_refresh_intent)
+    from src.application.trades.inbox_authority import resolve_execution_inbox_path
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    state_path = tmp_path / "state.json"
+    payload = {
+        "deal_id": "stock-before-option", "code": "HK.03690",
+        "futu_account_id": "REAL_LX", "trd_side": "BUY", "qty": 1500,
+        "price": 77.5, "create_time": "2026-09-29 16:00:00",
+        "status": "OK",
+        "external_id_namespace": "futu.deal", "environment": "REAL",
+        "_trade_intake_source": {"account": "lx", "futu_account_id": "REAL_LX"},
+    }
+    result = auto_intake._process_payload(
+        payload, repo=repo, state_path=state_path, audit_path=tmp_path / "audit.jsonl",
+        account_mapping={"REAL_LX": "lx"}, futu_account_ids=["REAL_LX"],
+        apply_changes=True, host="127.0.0.1", port=11111, source="backfill",
+        allow_external_lookup=False,
+    )
+    assert (result["status"], result["reason"]) == ("skipped", "not_option_deal")
+    inbox = resolve_execution_inbox_path(repo, tmp_path / "unused.sqlite3")
+    record_trade_payload_refresh_intent(
+        inbox, inbox_id=result["inbox_id"],
+        intent={"request_id": "previous-pm-refresh", "account": "lx"},
+    )
+    with pytest.raises(ValueError, match="pending PM refresh intent"):
+        auto_intake._skipped_recovery_snapshot(
+            inbox_path=inbox, inbox_id=result["inbox_id"], state_path=state_path,
+            ledger_path=repo.db_path,
+        )
+    assert claim_trade_payload_refresh_intent(inbox, inbox_id=result["inbox_id"])
+    preview = auto_intake._skipped_recovery_snapshot(
+        inbox_path=inbox, inbox_id=result["inbox_id"], state_path=state_path,
+        ledger_path=repo.db_path,
+    )
+    assert len(preview["recovery_hash"]) == 64
+    assert preview["receipt_suppressed"] and preview["portfolio_refresh_suppressed"]
+    assert preview["prior_portfolio_refresh_attempted"] is True
+    source = _listener_source(tmp_path, "lx", 11111)
+    source["state_path"] = state_path
+    source["audit_path"] = tmp_path / "audit.jsonl"
+    cfg = {"enabled": True, "mode": "apply", "state_path": state_path,
+           "audit_path": tmp_path / "audit.jsonl", "status_path": tmp_path / "status.json",
+           "receipt": {"enabled": False}, "backfill": {"enabled": False},
+           "account_mapping": {"REAL_LX": "lx"}, "futu_account_ids": ["REAL_LX"],
+           "sources": [source]}
+    monkeypatch.setattr(auto_intake, "load_config", lambda **_: {})
+    monkeypatch.setattr(auto_intake, "resolve_trade_intake_config",
+                        lambda *_, **kwargs: {**cfg, "mode": kwargs.get("mode_override") or "apply"})
+    monkeypatch.setattr(auto_intake, "resolve_position_ledger_sqlite_path", lambda **_: repo.db_path)
+    monkeypatch.setattr(auto_intake, "open_position_ledger_from_runtime_config", lambda **_: (None, repo))
+    args = ["--config", str(tmp_path / "config.json"), "--runtime-root", str(tmp_path),
+            "--inbox-id", result["inbox_id"], "--recover-skipped"]
+    assert auto_intake.main(args) == 0
+    cli_preview = json.loads(capsys.readouterr().out)
+    assert cli_preview["recovery_hash"] == preview["recovery_hash"]
+    apply_args = [*args, "--mode", "apply", "--confirm", "--actor", "operator",
+                  "--writers-stopped", "--expected-recovery-hash"]
+    assert auto_intake.main([*apply_args, "wrong"]) == 2
+    capsys.readouterr()
+    assert read_trade_payload(inbox, inbox_id=result["inbox_id"])["status"] == "handled"
+    original_state = state_path.read_bytes()
+    state_path.write_bytes(original_state + b" ")
+    assert auto_intake.main([*apply_args, preview["recovery_hash"]]) == 2
+    capsys.readouterr()
+    assert read_trade_payload(inbox, inbox_id=result["inbox_id"])["status"] == "handled"
+    state_path.write_bytes(original_state)
+    assert resume_skipped_trade_payload(inbox, inbox_id=result["inbox_id"], operator="operator",
+                                        economic_payload_hash="wrong", repo=repo) is False
+    assert read_trade_payload(inbox, inbox_id=result["inbox_id"])["status"] == "handled"
+    assert auto_intake.main([*apply_args, preview["recovery_hash"]]) == 2
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["receipt_notification_owner"] == "lifecycle_outbox", applied
+    assert applied["receipt_suppression_reason"] == "historical_recovery"
+    assert repo.list_trade_lifecycle_notifications() == []
+    assert resume_skipped_trade_payload(inbox, inbox_id=result["inbox_id"], operator="operator",
+                                        economic_payload_hash=preview["economic_payload_hash"], repo=repo)
+    assert resume_skipped_trade_payload(inbox, inbox_id=result["inbox_id"], operator="operator",
+                                        economic_payload_hash=preview["economic_payload_hash"], repo=repo)
+    from src.application.trades.inbox import claim_trade_payload, resume_trade_payload
+    assert claim_trade_payload(inbox, inbox_id=result["inbox_id"], repo=repo) is None
+    assert not resume_trade_payload(inbox, inbox_id=result["inbox_id"], operator="ordinary", repo=repo)
+    for source_name in ("push", "backfill"):
+        ordinary = auto_intake._process_payload(
+            payload, repo=repo, state_path=state_path, audit_path=tmp_path / "audit.jsonl",
+            account_mapping={"REAL_LX": "lx"}, futu_account_ids=["REAL_LX"],
+            apply_changes=True, host="127.0.0.1", port=11111, source=source_name,
+            allow_external_lookup=False,
+        )
+        assert ordinary["status"] != "applied"
+        assert read_trade_payload(inbox, inbox_id=result["inbox_id"])["result"]["recovery_mode"] == "skipped_stock"
+    assert auto_intake.main([
+        "--config", str(tmp_path / "config.json"), "--runtime-root", str(tmp_path),
+        "--inbox-id", result["inbox_id"], "--mode", "apply", "--confirm",
+    ]) in {0, 2}
+    capsys.readouterr()
+    assert read_trade_payload(inbox, inbox_id=result["inbox_id"])["result"]["recovery_mode"] == "skipped_stock"
+    assert auto_intake._skipped_recovery_snapshot(
+        inbox_path=inbox, inbox_id=result["inbox_id"], state_path=state_path,
+        ledger_path=repo.db_path,
+    )["recovery_hash"]
+
+
+def _write_runtime_config(tmp_path: Path) -> Path:
+    user_path = BASE / "configs" / "examples" / "user.example.us.json"
+    user_config = json.loads(user_path.read_text(encoding="utf-8"))
+    cfg, _meta = build_layered_runtime_config_from_user_config(
+        repo_root=BASE,
+        market="us",
+        user_config=user_config,
+        user_config_ref=str(user_path),
+    )
+    cfg[GENERATED_KEY] = build_inline_generated_metadata(
+        repo_root=BASE,
+        market="us",
+        system_config_path=BASE / "configs" / "system.json",
+        user_config=user_config,
+        user_config_ref=str(user_path),
+    )
+    path = tmp_path / "config.us.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _write_open_deal_payload(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "deal_id": "example-open-0700hk-20260429-480p-1",
+                "order_id": "example-order-open-1",
+                "trd_acc_id": "REAL_12345678",
+                "code": "0700.HK",
+                "option_type": "PUT",
+                "side": "SELL",
+                "position_effect": "OPEN",
+                "qty": 2,
+                "price": 3.93,
+                "strike": 480,
+                "multiplier": 100,
+                "expiration": "20260429",
+                "currency": "HKD",
+                "create_time": "2026-04-09 13:10:25",
+                "status": "OK",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_auto_trade_intake_open_example_dry_run_without_explicit_data_config(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    deal_path = _write_open_deal_payload(tmp_path / "auto_trade_intake.open.json")
+    _initialize_preview_ledger(tmp_path, config_path)
+    result = _run_auto_intake("--config", str(config_path), "--runtime-root", str(tmp_path), "--mode", "dry-run", "--deal-json", str(deal_path))
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "dry_run"
+    assert payload["action"] == "open"
+
+
+def test_auto_trade_intake_apply_mode_requires_confirm(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    deal_path = _write_open_deal_payload(tmp_path / "auto_trade_intake.open.json")
+    result = _run_auto_intake("--config", str(config_path), "--mode", "apply", "--deal-json", str(deal_path))
+
+    assert result.returncode == 2
+    assert "use --confirm or --yes" in result.stdout
+
+
+def test_auto_trade_intake_retry_failed_requires_deal_json(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    result = _run_auto_intake("--config", str(config_path), "--mode", "dry-run", "--retry-failed")
+
+    assert result.returncode == 2
+    assert "--retry-failed requires --deal-json or --inbox-id replay" in result.stdout
+
+
+def test_auto_trade_intake_dry_run_flag_is_reconcile_state_only(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    result = _run_auto_intake("--config", str(config_path), "--dry-run")
+
+    assert result.returncode == 2
+    assert (
+        "--dry-run is only supported with --reconcile-state or "
+        "--compensate-receipts"
+    ) in result.stdout
+
+
+def test_auto_trade_intake_once_defaults_state_paths_to_runtime_root(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    result = _run_auto_intake(
+        "--config", str(config_path), "--mode", "dry-run", "--once",
+        env={**dict(os.environ), "OM_RUNTIME_ROOT": str(runtime_root)},
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["state_path"] == str((runtime_root / "output_shared" / "state" / "auto_trade_intake_state.json").resolve())
+    assert payload["audit_path"] == str((runtime_root / "output_shared" / "state" / "auto_trade_intake_audit.jsonl").resolve())
+    assert payload["status_path"] == str((runtime_root / "output_shared" / "state" / "auto_trade_intake_status.json").resolve())
+    assert payload["runtime_root"] == str(runtime_root.resolve())
+    assert payload["runtime_root_source"] == "env:OM_RUNTIME_ROOT"
+
+
+def test_auto_trade_intake_once_accepts_explicit_runtime_root_over_env(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    explicit_runtime_root = tmp_path / "runtime-argument"
+    env_runtime_root = tmp_path / "runtime-env"
+    result = _run_auto_intake(
+        "--config", str(config_path), "--runtime-root", str(explicit_runtime_root), "--mode", "dry-run", "--once",
+        env={**dict(os.environ), "OM_RUNTIME_ROOT": str(env_runtime_root)},
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["runtime_root"] == str(explicit_runtime_root.resolve())
+    assert payload["runtime_root_source"] == "argument"
+    assert payload["state_path"] == str((explicit_runtime_root / "output_shared" / "state" / "auto_trade_intake_state.json").resolve())
+    assert payload["audit_path"] == str((explicit_runtime_root / "output_shared" / "state" / "auto_trade_intake_audit.jsonl").resolve())
+    assert payload["status_path"] == str((explicit_runtime_root / "output_shared" / "state" / "auto_trade_intake_status.json").resolve())
+
+
+@pytest.mark.parametrize("source_count", (1, 2))
+def test_listener_main_owns_exactly_one_lifecycle_batch_dispatcher(
+    monkeypatch,
+    tmp_path: Path,
+    source_count: int,
+) -> None:
+    sources = [
+        _listener_source(tmp_path, account, 11111 + index)
+        for index, account in enumerate(("lx", "sy")[:source_count])
+    ]
+    intake_cfg = {
+        "enabled": True,
+        "mode": "apply",
+        "state_path": Path("state.json"),
+        "audit_path": Path("audit.jsonl"),
+        "status_path": Path("status.json"),
+        "receipt": {"enabled": True},
+        "backfill": {"enabled": False},
+        "combo_reconciliation": {
+
+            "accounts": {},
+        },
+        "account_mapping": {
+            f"REAL_{account.upper()}": account
+            for account in ("lx", "sy")[:source_count]
+        },
+        "futu_account_ids": [
+            f"REAL_{account.upper()}"
+            for account in ("lx", "sy")[:source_count]
+        ],
+        "sources": sources,
+    }
+    instances: list[object] = []
+
+    class _Dispatcher:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.start_count = 0
+            self.close_count = 0
+            instances.append(self)
+
+        def start(self):
+            self.start_count += 1
+
+        def close(self):
+            self.close_count += 1
+
+        def snapshot(self):
+            return {
+                "schema_version": (
+                    "trade_lifecycle_batch_dispatcher_status.v1"
+                ),
+                "status": (
+                    "running" if self.start_count else "initialized"
+                ),
+            }
+
+    observed_statuses: list[dict] = []
+
+    def _run_source(**kwargs):
+        observed_statuses.append(
+            kwargs["lifecycle_dispatcher_status_fn"]()
+        )
+        return 0
+
+    def _run_sources(sources, *, run_source):
+        stop_event = threading.Event()
+        return max(run_source(source, stop_event) for source in sources)
+
+    monkeypatch.setattr(auto_intake, "load_config", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_trade_intake_config",
+        lambda *_args, **_kwargs: intake_cfg,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "open_position_ledger_from_runtime_config",
+        lambda **_kwargs: (None, object()),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_trade_lifecycle_notification_batch_route",
+        lambda **_kwargs: {
+            "provider": "feishu_app",
+            "channel": "bot",
+            "target": "secret-target",
+            "target_fingerprint": "target-fingerprint",
+            "route_fingerprint": "route-fingerprint",
+            "route_available": True,
+        },
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "LifecycleReceiptBatchDispatcher",
+        _Dispatcher,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_run_listener_source_loop",
+        _run_source,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_coordinate_listener_sources",
+        _run_sources,
+    )
+
+    rc = auto_intake.main(
+        [
+            "--config",
+            str(tmp_path / "config.us.json"),
+            "--runtime-root",
+            str(tmp_path),
+            "--mode",
+            "apply",
+            "--confirm",
+        ]
+    )
+
+    assert rc == 0
+    assert len(instances) == 1
+    dispatcher = instances[0]
+    assert dispatcher.start_count == 1
+    assert dispatcher.close_count == 1
+    assert dispatcher.kwargs["allowed_accounts"] == [
+        account for account in ("lx", "sy")[:source_count]
+    ]
+    assert len(observed_statuses) == source_count
+    assert {item["status"] for item in observed_statuses} == {"running"}
+
+
+@pytest.mark.parametrize(
+    ("apply_changes", "receipt_enabled", "reason"),
+    (
+        (False, True, "dry_run"),
+        (True, False, "receipt_disabled"),
+    ),
+)
+def test_lifecycle_dispatcher_is_not_built_for_dry_run_or_disabled_receipts(
+    monkeypatch,
+    tmp_path: Path,
+    apply_changes: bool,
+    receipt_enabled: bool,
+    reason: str,
+) -> None:
+    source = _listener_source(tmp_path, "lx", 11111)
+    source["receipt"] = {"enabled": receipt_enabled}
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_trade_lifecycle_notification_batch_route",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled dispatcher must not resolve a route")
+        ),
+    )
+
+    dispatcher, status_fn = (
+        auto_intake._build_lifecycle_receipt_batch_dispatcher(
+            repo=object(),
+            base=tmp_path,
+            cfg={},
+            intake_cfg={
+                "receipt": {"enabled": receipt_enabled},
+                "sources": [source],
+            },
+            apply_changes=apply_changes,
+        )
+    )
+
+    assert dispatcher is None
+    assert status_fn()["status"] == "disabled"
+    assert status_fn()["reason"] == reason
+
+
+def test_lifecycle_dispatcher_is_not_built_when_route_is_unavailable(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    source = _listener_source(tmp_path, "lx", 11111)
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_trade_lifecycle_notification_batch_route",
+        lambda **_kwargs: {
+            "provider": "feishu_app",
+            "channel": "bot",
+            "route_available": False,
+        },
+    )
+
+    dispatcher, status_fn = (
+        auto_intake._build_lifecycle_receipt_batch_dispatcher(
+            repo=object(),
+            base=tmp_path,
+            cfg={},
+            intake_cfg={
+                "receipt": {"enabled": True},
+                "sources": [source],
+            },
+            apply_changes=True,
+        )
+    )
+
+    assert dispatcher is None
+    assert status_fn()["status"] == "unavailable"
+    assert status_fn()["reason"] == "route_unavailable"
+
+
+def test_source_listener_has_no_lifecycle_provider_send_path() -> None:
+    import inspect
+
+    source = inspect.getsource(auto_intake._run_listener_source_loop)
+
+    assert "send_trade_lifecycle_outbox_payload" not in source
+    assert "dispatch_notification" not in source
+
+
+def test_source_loop_retries_checkpoint_before_building_settlement_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    order: list[str] = []
+
+    class Repo:
+        def list_trade_lifecycle_attempt_audit_heads_for_account(
+            self,
+            *,
+            account: str,
+        ) -> list[dict]:
+            assert account == "lx"
+            return []
+
+    class Listener:
+        def __init__(self, **_kwargs):
+            return None
+
+        def start(self, **_kwargs):
+            return None
+
+        def check_health(self):
+            return None
+
+        def close(self):
+            return None
+
+    class History:
+        def __init__(self, **_kwargs):
+            return None
+
+        def fetch(self):
+            return []
+
+        def close(self):
+            return None
+
+    class Gateway:
+        def close(self):
+            return None
+
+    class Stop:
+        stopped = False
+        waits = 0
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, _seconds):
+            self.waits += 1
+            if self.waits >= 2:
+                self.stopped = True
+            return self.stopped
+
+    original_checkpoint = (
+        auto_intake.append_lifecycle_attempt_checkpoint_seal
+    )
+    checkpoint_attempts = 0
+
+    def checkpoint(*args, **kwargs):
+        nonlocal checkpoint_attempts
+        checkpoint_attempts += 1
+        order.append(str(kwargs["reason"]))
+        if checkpoint_attempts == 1:
+            raise OSError("disk full")
+        return original_checkpoint(*args, **kwargs)
+
+    monotonic = 0
+
+    def next_monotonic():
+        nonlocal monotonic
+        monotonic += 61
+        return float(monotonic)
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", History)
+    monkeypatch.setattr(
+        auto_intake,
+        "append_lifecycle_attempt_checkpoint_seal",
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "build_futu_gateway",
+        lambda **_kwargs: order.append("gateway") or Gateway(),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_futu_quote_route",
+        lambda _cfg: SimpleNamespace(
+            ok=False,
+            errors=("quote unavailable",),
+            status="unavailable",
+            host=None,
+            port=None,
+        ),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "reconcile_due_lifecycle_cases_for_source",
+        lambda *_args, **kwargs: order.append("runtime")
+        or {
+            "seal_status": "not_required",
+            "run_seal": None,
+            "process_counters": kwargs["process_metrics"],
+        },
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "trade_inbox_summary",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "list_retryable_trade_payloads",
+        lambda *_args, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_refresh_lifecycle_delivery_status",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(auto_intake.time, "monotonic", next_monotonic)
+    source = {
+        "id": "lx",
+        "account": "lx",
+        "host": "127.0.0.1",
+        "port": 11111,
+        "state_path": tmp_path / "state.json",
+        "audit_path": tmp_path / "audit.jsonl",
+        "status_path": tmp_path / "status.json",
+        "inbox_path": tmp_path / "inbox.sqlite3",
+        "backfill_checkpoint_path": tmp_path / "backfill.json",
+        "account_mapping": {"1001": "lx"},
+        "futu_account_ids": ["1001"],
+        "backfill": {"enabled": False},
+    }
+
+    rc = auto_intake._run_listener_source_loop(
+        source=source,
+        repo=Repo(),
+        cfg={},
+        cfg_path=tmp_path / "config.json",
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+        intake_cfg={
+            "mode": "apply",
+            "enabled": True,
+            "backfill": {"enabled": False},
+        },
+        apply_changes=True,
+        receipt_callback=lambda _context: {},
+        process_lock=threading.RLock(),
+        stop_event=Stop(),
+    )
+
+    assert rc == 0
+    assert order == [
+        "process_startup",
+        "prior_seal_persist_failed",
+        "gateway",
+        "runtime",
+    ]
+
+
+def test_disabled_settlement_observation_retries_seal_without_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    order: list[str] = []
+    captured: dict[str, dict] = {}
+    checkpoint_attempts = 0
+
+    class Listener:
+        def __init__(self, *, on_deal, **_kwargs):
+            self.on_deal = on_deal
+
+        def start(self, **_kwargs):
+            self.on_deal({"deal_id": "deal-1", "futu_account_id": "REAL_LX"})
+
+        def check_health(self):
+            return None
+
+        def close(self):
+            return None
+
+    class History:
+        def __init__(self, **_kwargs):
+            return None
+
+        def close(self):
+            return None
+
+    class Stop:
+        stopped = False
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, _seconds):
+            self.stopped = True
+            return True
+
+    def checkpoint(*_args, **_kwargs):
+        nonlocal checkpoint_attempts
+        checkpoint_attempts += 1
+        if checkpoint_attempts == 1:
+            order.append("checkpoint_failed")
+            raise OSError("disk full")
+        order.append("checkpoint")
+
+    def enqueue(*_args, payload, **_kwargs):
+        captured["payload"] = dict(payload)
+        order.append("enqueue")
+        return "inbox-1"
+
+    def retryable_rows(*_args, **_kwargs):
+        return [{
+            "inbox_id": "inbox-1",
+            "source": "push",
+            "payload": captured["payload"],
+        }]
+
+    def mark_retryable(*_args, **kwargs):
+        assert "OSError: disk full" in kwargs["error"]
+        order.append("retryable")
+
+    def process(*_args, **_kwargs):
+        order.append("process")
+        return {
+            "status": "skipped",
+            "reason": "not_option_deal",
+            "deal_id": "deal-1",
+        }
+
+    def reconcile_due(*_args, **kwargs):
+        assert kwargs["broker_gateway"] is None
+        assert kwargs["quote_gateway"] is None
+        assert kwargs["settlement_collector_factory"] is None
+        order.append("runtime")
+        return {
+            "seal_status": "not_required",
+            "run_seal": None,
+            "process_counters": kwargs["process_metrics"],
+        }
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", History)
+    monkeypatch.setattr(
+        auto_intake,
+        "append_lifecycle_attempt_checkpoint_seal",
+        checkpoint,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "build_futu_gateway",
+        lambda **_kwargs: pytest.fail("settlement gateway must stay disabled"),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "ensure_lifecycle_timing_after_intake",
+        lambda *_args, **_kwargs: pytest.fail("lifecycle timing must stay disabled"),
+    )
+    monkeypatch.setattr(auto_intake, "enqueue_trade_payload", enqueue)
+    monkeypatch.setattr(auto_intake, "mark_trade_payload_retryable", mark_retryable)
+    monkeypatch.setattr(auto_intake, "list_retryable_trade_payloads", retryable_rows)
+    monkeypatch.setattr(auto_intake, "_process_payload", process)
+    monkeypatch.setattr(
+        auto_intake,
+        "settle_trade_payload_result",
+        lambda *_args, **_kwargs: order.append("settle"),
+    )
+    monkeypatch.setattr(auto_intake, "load_trade_intake_state", lambda *_args: {})
+    monkeypatch.setattr(
+        auto_intake,
+        "claim_trade_payload_refresh_intent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_dispatch_portfolio_refresh_intent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "reconcile_due_lifecycle_cases_for_source",
+        reconcile_due,
+    )
+    monkeypatch.setattr(auto_intake, "trade_inbox_summary", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        auto_intake,
+        "_refresh_lifecycle_delivery_status",
+        lambda *_args, **_kwargs: None,
+    )
+    source = _listener_source(tmp_path, "lx", 11111)
+    for key in (
+        "state_path",
+        "audit_path",
+        "status_path",
+        "inbox_path",
+        "backfill_checkpoint_path",
+    ):
+        source[key] = tmp_path / source[key]
+    source["settlement_observation"] = {"enabled": False}
+
+    rc = auto_intake._run_listener_source_loop(
+        source=source,
+        repo=object(),
+        cfg={},
+        cfg_path=tmp_path / "config.json",
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+        intake_cfg={"mode": "apply", "enabled": True},
+        apply_changes=True,
+        receipt_callback=lambda _context: {},
+        process_lock=threading.RLock(),
+        stop_event=Stop(),
+    )
+
+    assert rc == 0
+    assert order == [
+        "enqueue",
+        "checkpoint_failed",
+        "process",
+        "checkpoint",
+        "runtime",
+    ]
+    status = json.loads(source["status_path"].read_text())
+    assert status["last_lifecycle_intake_error"]["reason_codes"] == ["checkpoint_seal_pending"]
+
+def test_reconcile_intake_sources_defaults_to_every_account(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[Path] = []
+
+    def _reconcile(**kwargs):
+        calls.append(Path(kwargs["state_path"]))
+        return {
+            "planned_count": 1,
+            "applied_count": 0,
+            "backup_path": None,
+        }
+
+    monkeypatch.setattr(auto_intake, "reconcile_trade_intake_state", _reconcile)
+    sources = [
+        {
+            "id": "lx",
+            "account": "lx",
+            "state_path": tmp_path / "lx" / "state.json",
+            "audit_path": tmp_path / "lx" / "audit.jsonl",
+        },
+        {
+            "id": "sy",
+            "account": "sy",
+            "state_path": tmp_path / "sy" / "state.json",
+            "audit_path": tmp_path / "sy" / "audit.jsonl",
+        },
+    ]
+
+    out = auto_intake._reconcile_intake_sources(
+        sources=sources,
+        repo=object(),
+        account=None,
+        deal_ids=[],
+        apply_changes=False,
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+    )
+
+    assert calls == [
+        tmp_path / "lx" / "state.json",
+        tmp_path / "sy" / "state.json",
+    ]
+    assert out["source_count"] == 2
+    assert out["planned_count"] == 2
+    assert out["dry_run"] is True
+
+
+def test_auto_trade_intake_once_reports_multiple_account_sources(tmp_path: Path) -> None:
+    user_path = tmp_path / "user.us.json"
+    user_path.write_text(
+        json.dumps(
+            {
+                "account_settings": {
+                    "lx": {
+                        "type": "futu",
+                        "futu": {"account_id": "REAL_12345678", "host": "127.0.0.1", "port": 11111},
+                    },
+                    "sy": {
+                        "type": "futu",
+                        "futu": {"account_id": "REAL_87654321", "host": "127.0.0.1", "port": 11112},
+                    },
+                },
+                "symbols": [{"symbol": "NVDA", "sell_put": {"max_strike": 160}}],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    user_config = json.loads(user_path.read_text(encoding="utf-8"))
+    cfg, _meta = build_layered_runtime_config_from_user_config(
+        repo_root=BASE,
+        market="us",
+        user_config=user_config,
+        user_config_ref=str(user_path),
+    )
+    cfg[GENERATED_KEY] = build_inline_generated_metadata(
+        repo_root=BASE,
+        market="us",
+        system_config_path=BASE / "configs" / "system.json",
+        user_config=user_config,
+        user_config_ref=str(user_path),
+    )
+    config_path = tmp_path / "config.us.json"
+    config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    runtime_root = tmp_path / "runtime"
+
+    result = _run_auto_intake("--config", str(config_path), "--runtime-root", str(runtime_root), "--once")
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert [item["id"] for item in payload["sources"]] == ["lx", "sy"]
+    assert [item["port"] for item in payload["sources"]] == [11111, 11112]
+    assert payload["sources"][0]["state_path"] == str((runtime_root / "output_shared/state/trade_intake/lx/state.json").resolve())
+    assert payload["sources"][1]["status_path"] == str((runtime_root / "output_shared/state/trade_intake/sy/status.json").resolve())
+
+
+def test_deal_json_source_selection_uses_payload_futu_account_id() -> None:
+    from src.application.trades.auto_intake import _select_source_for_payload
+
+    sources = [
+        {
+            "id": "lx",
+            "account": "lx",
+            "host": "127.0.0.1",
+            "port": 11111,
+            "account_mapping": {"REAL_12345678": "lx"},
+            "futu_account_ids": ["REAL_12345678"],
+        },
+        {
+            "id": "sy",
+            "account": "sy",
+            "host": "127.0.0.1",
+            "port": 11112,
+            "account_mapping": {"REAL_87654321": "sy"},
+            "futu_account_ids": ["REAL_87654321"],
+        },
+    ]
+
+    selected = _select_source_for_payload(
+        sources,
+        payload={"deal_id": "deal-sy-1", "futu_account_id": "REAL_87654321"},
+        account_mapping={"REAL_12345678": "lx", "REAL_87654321": "sy"},
+        require_match=True,
+    )
+
+    assert selected["id"] == "sy"
+    assert selected["port"] == 11112
+
+
+def test_deal_json_apply_requires_source_match_when_multiple_sources() -> None:
+    import pytest
+
+    from src.application.trades.auto_intake import _select_source_for_payload
+
+    sources = [
+        {"id": "lx", "account": "lx", "futu_account_ids": ["REAL_12345678"]},
+        {"id": "sy", "account": "sy", "futu_account_ids": ["REAL_87654321"]},
+    ]
+
+    with pytest.raises(ValueError, match="requires payload futu_account_id/account"):
+        _select_source_for_payload(
+            sources,
+            payload={"deal_id": "deal-no-account"},
+            account_mapping={"REAL_12345678": "lx", "REAL_87654321": "sy"},
+            require_match=True,
+        )
+
+
+def test_deal_json_source_selection_rejects_account_mapping_conflict() -> None:
+    import pytest
+
+    from src.application.trades.auto_intake import _select_source_for_payload
+
+    sources = [
+        {"id": "lx", "account": "lx", "futu_account_ids": ["REAL_12345678"]},
+        {"id": "sy", "account": "sy", "futu_account_ids": ["REAL_87654321"]},
+    ]
+
+    with pytest.raises(ValueError, match="account conflicts"):
+        _select_source_for_payload(
+            sources,
+            payload={"deal_id": "deal-conflict", "account": "lx", "futu_account_id": "REAL_87654321"},
+            account_mapping={"REAL_12345678": "lx", "REAL_87654321": "sy"},
+            require_match=True,
+        )
+
+
+def test_push_source_binding_preserves_explicit_account_identity_before_inbox() -> None:
+    source = {
+        "id": "sy",
+        "account": "sy",
+        "host": "127.0.0.1",
+        "port": 11112,
+        "account_mapping": {"REAL_87654321": "sy"},
+        "futu_account_ids": ["REAL_87654321"],
+    }
+    push_payload = {
+        "deal_id": "deal-expiry-1",
+        "futu_account_id": "REAL_87654321",
+        "code": "HK.TCH260730P440000",
+        "price": 0.0,
+        "qty": 1.0,
+        "trd_side": "BUY_BACK",
+    }
+
+    bound = auto_intake._bind_push_payload_to_source(
+        push_payload,
+        source=source,
+        received_at_utc="2026-07-30T11:58:17+00:00",
+    )
+
+    assert bound["futu_account_id"] == "REAL_87654321"
+    assert bound["_trade_intake_source"] == {
+        "schema_version": "trade_intake_source.v1",
+        "transport": "push",
+        "source_id": "sy",
+        "account": "sy",
+        "futu_account_id": "REAL_87654321",
+        "opend_process": "FutuOpenD",
+        "opend_host": "127.0.0.1",
+        "opend_port": 11112,
+        "received_at_utc": "2026-07-30T11:58:17+00:00",
+    }
+
+
+def test_push_and_backfill_build_same_inbox_identity_regardless_of_arrival_order(
+    tmp_path: Path,
+) -> None:
+    from src.application.trades.deal_identity import broker_deal_key_from_payload
+    from src.application.trades.inbox import enqueue_trade_payload, trade_inbox_summary
+
+    source = {
+        "id": "sy",
+        "account": "sy",
+        "host": "127.0.0.1",
+        "port": 11112,
+        "account_mapping": {"REAL_87654321": "sy"},
+        "futu_account_ids": ["REAL_87654321"],
+    }
+    push_payload = auto_intake._bind_push_payload_to_source(
+        {"deal_id": "same-deal", "code": "HK.TCH260730P440000", "futu_account_id": "REAL_87654321"},
+        source=source,
+        received_at_utc="2026-07-30T11:58:17+00:00",
+    )
+    backfill_payload = {
+        "deal_id": "same-deal",
+        "code": "HK.TCH260730P440000",
+        "futu_account_id": "REAL_87654321",
+        "trd_acc_id": "REAL_87654321",
+    }
+    inputs = {
+        "push": push_payload,
+        "backfill": backfill_payload,
+    }
+    for first, second in (("push", "backfill"), ("backfill", "push")):
+        path = tmp_path / f"{first}-first.sqlite3"
+        ids = [
+            enqueue_trade_payload(
+                path,
+                payload=inputs[source_name],
+                source=source_name,
+                broker_deal_key=broker_deal_key_from_payload(
+                    inputs[source_name],
+                    account_mapping=source["account_mapping"],
+                ),
+            )
+            for source_name in (first, second)
+        ]
+
+        assert ids[0] == ids[1]
+        assert trade_inbox_summary(path)["pending_count"] == 1
+
+
+def test_push_source_binding_rejects_payload_from_another_account() -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="conflicts with OpenD source binding"):
+        auto_intake._bind_push_payload_to_source(
+            {
+                "deal_id": "wrong-account",
+                "futu_account_id": "REAL_87654321",
+            },
+            source={
+                "id": "lx",
+                "account": "lx",
+                "host": "127.0.0.1",
+                "port": 11111,
+                "account_mapping": {"REAL_12345678": "lx"},
+                "futu_account_ids": ["REAL_12345678"],
+            },
+            received_at_utc="2026-07-30T11:58:17+00:00",
+        )
+
+
+@pytest.mark.parametrize("account_ids", [["REAL_12345678"], ["REAL_12345678", "REAL_87654321"]])
+def test_push_source_binding_rejects_source_without_payload_account(account_ids) -> None:
+    import pytest
+
+    with pytest.raises(ValueError, match="requires verified futu_account_id"):
+        auto_intake._bind_push_payload_to_source(
+            {"deal_id": "ambiguous"},
+            source={
+                "id": "shared",
+                "host": "127.0.0.1",
+                "port": 11111,
+                "account_mapping": {
+                    "REAL_12345678": "lx",
+                    "REAL_87654321": "sy",
+                },
+                "futu_account_ids": account_ids,
+            },
+            received_at_utc="2026-07-30T11:58:17+00:00",
+        )
+
+
+def test_fee_target_requires_durable_intake_outcome() -> None:
+    payload = {
+        "deal_id": "deal-1",
+        "order_id": "order-1",
+        "futu_account_id": "REAL_LX",
+        "_trade_intake_source": {
+            "schema_version": "trade_intake_source.v1",
+            "account": "lx",
+            "futu_account_id": "REAL_LX",
+        },
+    }
+    mapping = {"REAL_LX": "lx"}
+    deal_key = "futu:lx:REAL_LX:deal-1"
+
+    assert auto_intake._durable_fee_target(
+        payload=payload,
+        result={"status": "skipped", "reason": "not_option_deal"},
+        state={
+            "processed_deal_ids": {
+                deal_key: {
+                    "status": "skipped",
+                    "reason": "not_option_deal",
+                }
+            }
+        },
+        account_mapping=mapping,
+    ) is None
+    assert auto_intake._durable_fee_target(
+        payload=payload,
+        result={"status": "applied"},
+        state={},
+        account_mapping=mapping,
+    ) == ("富途", "lx", "REAL_LX", "order-1")
+    assert auto_intake._durable_fee_target(
+        payload=payload,
+        result={"status": "skipped", "reason": "duplicate_deal_id"},
+        state={
+            "processed_deal_ids": {
+                deal_key: {"status": "applied"}
+            }
+        },
+        account_mapping=mapping,
+    ) == ("富途", "lx", "REAL_LX", "order-1")
+
+
+def test_listener_binds_push_source_before_enqueue(monkeypatch, tmp_path: Path) -> None:
+    import threading
+
+    captured: dict = {}
+
+    class _Listener:
+        def __init__(self, *, on_deal, **_kwargs):
+            self.on_deal = on_deal
+
+        def start(self, *, cancel_event, on_wait=None):
+            self.on_deal(
+                {
+                    "deal_id": "push-deal-1",
+                    "futu_account_id": "REAL_87654321",
+                    "code": "HK.TCH260730P440000",
+                }
+            )
+            cancel_event.set()
+
+        def check_health(self):
+            raise AssertionError("listener health should not run after test push stops the source")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", _Listener)
+    monkeypatch.setattr(
+        auto_intake,
+        "enqueue_trade_payload",
+        lambda _path, *, payload, source, broker_deal_key, **_kwargs: captured.update(
+            payload=dict(payload),
+            source=source,
+            broker_deal_key=broker_deal_key,
+        )
+        or "inbox-1",
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_process_payload",
+        lambda payload, **_kwargs: {
+            "status": "unresolved",
+            "action": "lifecycle",
+            "reason": "waiting_settlement_evidence",
+            "deal_id": payload["deal_id"],
+            "account": "sy",
+            "diagnostics": {"retryable": True},
+        },
+    )
+    monkeypatch.setattr(auto_intake, "settle_trade_payload_result", lambda *_args, **_kwargs: None)
+    stop = threading.Event()
+    source = {
+        "id": "sy",
+        "account": "sy",
+        "host": "127.0.0.1",
+        "port": 11112,
+        "state_path": tmp_path / "state.json",
+        "audit_path": tmp_path / "audit.jsonl",
+        "status_path": tmp_path / "status.json",
+        "inbox_path": tmp_path / "inbox.sqlite3",
+        "backfill_checkpoint_path": tmp_path / "backfill.json",
+        "reconnect_sec": 5,
+        "account_mapping": {"REAL_87654321": "sy"},
+        "futu_account_ids": ["REAL_87654321"],
+        "backfill": {"enabled": False},
+    }
+
+    rc = auto_intake._run_listener_source_loop(
+        source=source,
+        repo=object(),
+        cfg={},
+        cfg_path=tmp_path / "config.json",
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+        intake_cfg={
+            "mode": "dry-run",
+            "enabled": True,
+            "account_mapping": source["account_mapping"],
+            "backfill": {"enabled": False},
+        },
+        apply_changes=False,
+        receipt_callback=lambda _context: {},
+        process_lock=threading.RLock(),
+        stop_event=stop,
+    )
+
+    assert rc == 0
+    assert captured["source"] == "push"
+    assert captured["payload"]["futu_account_id"] == "REAL_87654321"
+    assert captured["payload"]["_trade_intake_source"]["source_id"] == "sy"
+    assert captured["payload"]["_trade_intake_source"]["opend_port"] == 11112
+    assert (
+        captured["broker_deal_key"]
+        == "futu:sy:REAL_87654321:push-deal-1"
+    )
+
+
+def test_listener_retry_preserves_source_without_dry_run_refresh_side_effects(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    stop = threading.Event()
+    order: list[str] = []
+
+    class _Listener:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self, *, cancel_event, on_wait=None):
+            pass
+
+        def check_health(self):
+            pass
+
+        def close(self):
+            pass
+
+    class _History:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    def _process(_payload, **kwargs):
+        order.append(f"process:{kwargs['source']}")
+        stop.set()
+        return {
+            "status": "skipped",
+            "reason": "not_option_deal",
+            "portfolio_refresh_intent": {
+                "account": "lx",
+                "request_id": "stock-refresh:abc",
+            },
+        }
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", _Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", _History)
+    monkeypatch.setattr(auto_intake, "_process_payload", _process)
+    monkeypatch.setattr(
+        auto_intake,
+        "list_retryable_trade_payloads",
+        lambda *_args, **_kwargs: [
+            {
+                "inbox_id": "inbox-1",
+                "source": "backfill",
+                "payload": {"deal_id": "stock-1"},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "settle_trade_payload_result",
+        lambda *_args, **_kwargs: order.append("settle"),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "claim_trade_payload_refresh_intent",
+        lambda *_args, **_kwargs: order.append("claim")
+        or {"account": "lx", "request_id": "stock-refresh:abc"},
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "_dispatch_portfolio_refresh_intent",
+        lambda *_args, **_kwargs: order.append("dispatch"),
+    )
+    monkeypatch.setattr(auto_intake, "trade_inbox_summary", lambda *_args, **_kwargs: {})
+
+    source = _listener_source(tmp_path, "lx", 11111)
+    for key in (
+        "state_path",
+        "audit_path",
+        "status_path",
+        "inbox_path",
+        "backfill_checkpoint_path",
+    ):
+        source[key] = tmp_path / source[key]
+    rc = auto_intake._run_listener_source_loop(
+        source=source,
+        repo=object(),
+        cfg={},
+        cfg_path=tmp_path / "config.json",
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+        intake_cfg={
+            "mode": "dry-run",
+            "enabled": True,
+            "backfill": {"enabled": False},
+        },
+        apply_changes=False,
+        receipt_callback=lambda _context: {},
+        process_lock=threading.RLock(),
+        stop_event=stop,
+    )
+
+    assert rc == 0
+    assert order == ["process:backfill"]
+
+
+def test_auto_trade_intake_open_dry_run_accepts_futu_option_code_with_lookup_fields(tmp_path: Path) -> None:
+    config_path = _write_runtime_config(tmp_path)
+    payload_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            payload_path = f.name
+            json.dump(
+                {
+                    "deal_id": "example-open-pop-20260528-150p-1",
+                    "order_id": "example-order-open-pop-1",
+                    "futu_account_id": "REAL_12345678",
+                    "code": "HK.POP260528P150000",
+                    "stock_name": "泡泡玛特",
+                    "trd_side": "SELL_SHORT",
+                    "qty": 1,
+                    "price": 6.3,
+                    "multiplier": 1000,
+                    "create_time": "2026-04-28 10:15:56",
+                    "status": "OK",
+                },
+                f,
+                ensure_ascii=False,
+            )
+        _initialize_preview_ledger(tmp_path, config_path)
+        result = _run_auto_intake("--config", str(config_path), "--runtime-root", str(tmp_path), "--mode", "dry-run", "--deal-json", payload_path)
+    finally:
+        if payload_path:
+            Path(payload_path).unlink(missing_ok=True)
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "dry_run"
+    assert payload["action"] == "open"
+    assert payload["account"] == "user1"
+
+
+@pytest.mark.parametrize("wrong_label", [False, True])
+def test_execution_file_cli_preview_apply_and_saved_inbox_view(tmp_path, monkeypatch, capsys, wrong_label):
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    from src.interfaces.cli.main import main as public_main
+    monkeypatch.setattr("src.application.trades.process_supervisor.run_trade_intake_process", auto_intake.main)
+    def run(argv):
+        return public_main(["run", "trade-intake", *argv])
+
+    sources = [_listener_source(tmp_path, account, 11111 + index)
+               for index, account in enumerate(("lx", "sy"))]
+    cfg = {"enabled": True, "mode": "apply", "state_path": Path("state.json"),
+           "audit_path": Path("audit.jsonl"), "status_path": Path("status.json"),
+           "receipt": {"enabled": False}, "backfill": {"enabled": False},
+           "account_mapping": {"REAL_LX": "lx", "REAL_SY": "sy"},
+           "futu_account_ids": ["REAL_LX", "REAL_SY"], "sources": sources}
+    monkeypatch.setattr(auto_intake, "load_config", lambda **_: {})
+    monkeypatch.setattr(auto_intake, "resolve_trade_intake_config",
+                        lambda *_, **kwargs: {**cfg, "mode": kwargs.get("mode_override") or "apply"})
+    ledger_path = tmp_path / "ledger.sqlite3"
+    SQLiteOptionPositionsRepository(ledger_path)
+    preview_bytes = ledger_path.read_bytes()
+    opened = []
+    def open_repo(**_):
+        opened.append(True)
+        return None, SQLiteOptionPositionsRepository(ledger_path)
+    monkeypatch.setattr(auto_intake, "open_position_ledger_from_runtime_config", open_repo)
+    monkeypatch.setattr(auto_intake, "resolve_position_ledger_sqlite_path", lambda **_: ledger_path)
+    row = {"schema_version": "trade_execution.v1",
+           "broker_account_ref": {"broker_id": "futu", "external_account_id": "REAL_LX",
+                                  "environment": "REAL", "broker_account_id": "futu:REAL:REAL_LX",
+                                  "account_label": "sy" if wrong_label else "lx"},
+           "instrument_ref": {"asset_type": "option", "market": "US", "symbol": "NVDA",
+                              "currency": "USD", "option_type": "put", "strike": "100",
+                              "expiration_ymd": "2026-09-18", "multiplier": "100"},
+           "external_id_namespace": "futu.deal", "external_execution_id": "file-cli",
+           "side": "sell", "position_effect": "open", "quantity": "1", "price": "2.50",
+           "currency": "USD", "occurred_at_utc": "2026-09-07T02:30:00Z",
+           "status": "OK"}
+    path = tmp_path / "executions.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    common = ["--config", str(tmp_path / "config.json"), "--runtime-root", str(tmp_path)]
+    assert run([*common, "--execution-file", str(path)]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["dry_run"] is True
+    assert opened == [] and ledger_path.read_bytes() == preview_bytes
+    assert run([*common, "--execution-file", str(path), "--mode", "apply"]) == 2
+    assert "use --confirm or --yes" in capsys.readouterr().out
+    assert opened == [] and ledger_path.read_bytes() == preview_bytes
+    assert run([*common, "--execution-file", str(path), "--inbox-id", "unused"]) == 2
+    assert "mutually exclusive" in capsys.readouterr().out
+    assert run([*common, "--execution-file", str(path), "--mode", "apply", "--confirm"]) == 0
+    applied = json.loads(capsys.readouterr().out)
+    item = applied["results"][0]
+    repo = SQLiteOptionPositionsRepository(ledger_path)
+    assert len(repo.list_trade_events()) == (0 if wrong_label else 1)
+    assert item["status"] == ("unresolved" if wrong_label else "applied")
+    assert repo.list_trade_lifecycle_notifications() == []
+    before = ledger_path.read_bytes()
+    if wrong_label:
+        assert run([*common, "--inbox-id", item["inbox_id"]]) == 2
+        assert "account conflicts" in capsys.readouterr().out
+        assert ledger_path.read_bytes() == before
+        assert run([*common, "--inbox-id", item["inbox_id"], "--mode", "apply", "--confirm"]) == 2
+        capsys.readouterr()
+        assert repo.list_trade_events() == []
+        return
+    assert run([*common, "--inbox-id", item["inbox_id"]]) == 0
+    saved = json.loads(capsys.readouterr().out)
+    assert saved["inbox_id"] == item["inbox_id"]
+    assert saved["delivery_purpose"] == "historical"
+    assert ledger_path.read_bytes() == before
+    assert len(opened) == 1
+
+    assert run([*common, "--inbox-id", item["inbox_id"], "--mode", "apply"]) == 2
+    assert "use --confirm or --yes" in capsys.readouterr().out
+    if wrong_label:
+        assert run([*common, "--inbox-id", item["inbox_id"], "--mode", "apply", "--confirm"]) == 2
+        assert "account conflicts" in capsys.readouterr().out
+        assert repo.list_trade_events() == []
+        return
+    assert run([*common, "--inbox-id", item["inbox_id"], "--mode", "apply", "--confirm"]) == 0
+    capsys.readouterr()
+    assert len(repo.list_trade_events()) == 1
+    if not wrong_label:
+        from src.application.trades.inbox import list_retryable_trade_payloads, read_trade_payload
+        from src.application.trades.inbox_authority import resolve_execution_inbox_path
+        class Crash(BaseException):
+            pass
+        dispatched = []
+        monkeypatch.setattr(auto_intake, "is_portfolio_management_enabled", lambda _: True)
+        class PMClient:
+            def request_holdings_refresh(self, **kwargs):
+                dispatched.append(kwargs)
+                raise TimeoutError("ambiguous test PM outcome")
+        monkeypatch.setattr(auto_intake, "resolve_portfolio_management_client", lambda *_, **__: PMClient())
+        stock = {**row, "external_execution_id": "stock-live-recovery", "side": "buy", "quantity": "100",
+                 "instrument_ref": {"asset_type": "stock", "market": "US", "symbol": "NVDA", "currency": "USD"}}
+        original_write = auto_intake.update_trade_intake_state_entries
+        def crash_after_state(path, state, **kwargs):
+            original_write(path, state, **kwargs)
+            raise Crash()
+        monkeypatch.setattr(auto_intake, "update_trade_intake_state_entries", crash_after_state)
+        with pytest.raises(Crash):
+            auto_intake._process_payload(
+                stock, repo=repo, state_path=tmp_path / "state/lx.json", audit_path=tmp_path / "audit/lx.jsonl",
+                account_mapping={"REAL_LX": "lx"}, futu_account_ids=["REAL_LX"], apply_changes=True,
+                host="127.0.0.1", port=11111, source="push", allow_external_lookup=False,
+            )
+        monkeypatch.setattr(auto_intake, "update_trade_intake_state_entries", original_write)
+        inbox = resolve_execution_inbox_path(repo, tmp_path / "unused.sqlite3")
+        after_lease = auto_intake.time.time() + 121
+        monkeypatch.setattr(auto_intake.time, "time", lambda: after_lease)
+        pending = list_retryable_trade_payloads(inbox, retry_delay_sec=0)[0]
+        saved_args = [*common, "--inbox-id", pending["inbox_id"]]
+        assert run(saved_args) == 0
+        assert json.loads(capsys.readouterr().out)["portfolio_refresh_attempted_at_ms"] is None
+        assert run([*saved_args, "--mode", "apply"]) == 2
+        capsys.readouterr()
+        assert dispatched == []
+        monkeypatch.setattr(auto_intake, "is_portfolio_management_enabled", lambda _: False)
+        assert run([*saved_args, "--mode", "apply", "--confirm"]) == 0
+        capsys.readouterr()
+        saved = read_trade_payload(inbox, inbox_id=pending["inbox_id"])
+        assert saved["status"] == "handled" and saved["portfolio_refresh_attempted_at_ms"] is None
+        assert dispatched == []
+        monkeypatch.setattr(auto_intake, "is_portfolio_management_enabled", lambda _: True)
+        for _ in range(2):
+            assert run([*saved_args, "--mode", "apply", "--confirm"]) == 0
+            capsys.readouterr()
+        assert len(dispatched) == 1
+        saved = read_trade_payload(inbox, inbox_id=pending["inbox_id"])
+        assert saved["status"] == "handled"
+        assert saved["portfolio_refresh_attempted_at_ms"] is not None
+        historical = {**stock, "external_execution_id": "stock-file-no-pm"}
+        path.write_text(json.dumps(historical) + "\n")
+        assert run([*common, "--execution-file", str(path), "--mode", "apply", "--confirm"]) == 0
+        historical_result = json.loads(capsys.readouterr().out)["results"][0]
+        assert run([*common, "--inbox-id", historical_result["inbox_id"], "--mode", "apply", "--confirm"]) == 0
+        capsys.readouterr()
+        assert len(dispatched) == 1
+
+
+@pytest.mark.parametrize("entry", ["execution-file", "inbox-id"])
+def test_om_trade_intake_public_process_accepts_saved_input_flags(tmp_path, entry):
+    config_path = _write_runtime_config(tmp_path)
+    input_path = tmp_path / "executions.jsonl"
+    input_path.write_text(json.dumps({"schema_version": "trade_execution.v1"}) + "\n")
+    value = str(input_path) if entry == "execution-file" else "nonexistent-saved-entry"
+    command = [str(BASE / "om"), "run", "trade-intake", "--config", str(config_path),
+               "--runtime-root", str(tmp_path / "runtime"), f"--{entry}", value]
+    env = {**os.environ, "OM_PYTHON": sys.executable, "PYTHONDONTWRITEBYTECODE": "1"}
+    preview = subprocess.run(command, cwd=BASE, env=env, capture_output=True, text=True,
+                             check=False, timeout=AUTO_INTAKE_CLI_TIMEOUT_SEC)
+    assert "unrecognized arguments" not in preview.stderr
+    assert preview.returncode == 2, preview.stderr or preview.stdout
+    if entry == "execution-file":
+        assert json.loads(preview.stdout)["reason"] == "ledger_preview_unavailable"
+    else:
+        assert "saved Inbox entry must resolve" in preview.stdout
+    apply = subprocess.run([*command, "--mode", "apply"], cwd=BASE, env=env, capture_output=True,
+                           text=True, check=False, timeout=AUTO_INTAKE_CLI_TIMEOUT_SEC)
+    assert apply.returncode == 2
+    assert "use --confirm or --yes" in apply.stdout
+    assert not list((tmp_path / "runtime").rglob("*.sqlite3"))
+
+
+@pytest.mark.parametrize("failure", ["unresolved", "exception"])
+def test_listener_core_owns_one_durable_attempt(tmp_path, monkeypatch, failure):
+    import hashlib
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    from src.application.trades.inbox import (
+        list_retryable_trade_payloads,
+        read_trade_payload,
+        read_trade_source_evidence,
+        trade_payload_evidence_ref,
+    )
+    from src.application.trades.inbox_authority import resolve_execution_inbox_path
+    stop = threading.Event()
+    payload = {"acc_id": "REAL_LX", "broker_account_id": "futu:REAL:REAL_LX", "environment": "REAL",
+               "external_id_namespace": "futu.deal", "deal_id": "listener-missing-multiplier",
+               "code": "US.NVDA260918P00100000", "qty": "1", "price": "2.50",
+               "trd_side": "SELL_SHORT", "create_time": "2026-09-07 10:30:00",
+               "status": "OK"}
+    class Listener:
+        def __init__(self, *, on_deal, **_):
+            self.on_deal = on_deal
+        def start(self, **_):
+            self.on_deal(payload)
+        def check_health(self):
+            stop.set()
+        def close(self):
+            pass
+    class History:
+        def __init__(self, **_):
+            pass
+        def close(self):
+            pass
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", History)
+    monkeypatch.setattr(auto_intake, "append_lifecycle_attempt_checkpoint_seal", lambda *_, **__: None)
+    reconciled_sources = []
+    monkeypatch.setattr(
+        auto_intake,
+        "reconcile_due_lifecycle_cases_for_source",
+        lambda *_, **kwargs: (reconciled_sources.append(kwargs["source"]) or {}),
+    )
+    monkeypatch.setattr(auto_intake, "enrich_trade_push_payload_with_account_id", lambda raw, **_: raw)
+    monkeypatch.setattr("src.application.trades.normalizer.resolve_multiplier_with_source_and_diagnostics",
+                        lambda **_: (None, None, {}))
+    if failure == "exception":
+        monkeypatch.setattr(auto_intake, "save_trade_payload_result",
+                            lambda *_, **__: (_ for _ in ()).throw(OSError("result storage unavailable")))
+    source = _listener_source(tmp_path, "lx", 11111)
+    for key in ("state_path", "audit_path", "status_path", "inbox_path", "backfill_checkpoint_path"):
+        source[key] = tmp_path / source[key]
+    source["settlement_observation"] = {"enabled": False}
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    assert auto_intake._run_listener_source_loop(
+        source=source, repo=repo, cfg={}, cfg_path=tmp_path / "config.json", runtime_root=tmp_path,
+        runtime_root_source="test", intake_cfg={"mode": "apply", "enabled": True}, apply_changes=True,
+        receipt_callback=lambda _: {}, process_lock=threading.RLock(), stop_event=stop,
+    ) == 0
+    authoritative = resolve_execution_inbox_path(repo, source["inbox_path"])
+    assert reconciled_sources and reconciled_sources[0]["inbox_path"] == authoritative
+    status = json.loads(Path(source["status_path"]).read_text(encoding="utf-8"))
+    assert status["inbox_path"] == str(authoritative)
+    assert status["inbox"]["path"] == str(authoritative)
+    after_lease = auto_intake.time.time() + 121
+    monkeypatch.setattr(auto_intake.time, "time", lambda: after_lease)
+    rows = list_retryable_trade_payloads(authoritative, retry_delay_sec=0)
+    if failure == "exception":
+        from src.application.trades.deal_identity import broker_deal_key_from_payload
+        assert rows == []
+        key = broker_deal_key_from_payload(payload, account_mapping=source["account_mapping"])
+        rows = [read_trade_payload(authoritative, inbox_id=hashlib.sha256(key.encode()).hexdigest())]
+        assert rows[0]["result"]["receipt_kind"] == "verification_pending"
+    assert len(rows) == 1
+    assert rows[0]["attempt_count"] == 1
+    evidence = read_trade_source_evidence(
+        resolve_execution_inbox_path(repo, source["inbox_path"]),
+        evidence_ref=trade_payload_evidence_ref(rows[0]["inbox_id"]),
+        read_only=True,
+    )
+    assert evidence[0]["adapter_version"] == "om.trade-intake.push.v1"
+    assert repo.list_trade_events() == []
+    if failure == "exception":
+        assert "result storage unavailable" in rows[0]["last_error"]
+
+
+def _run_failure_case_listener(tmp_path, monkeypatch, *, on_start=None, rows=()):
+    """One listener iteration, real isolated status/Inbox, no provider connections."""
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    stop = threading.Event()
+    callback_errors = []
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    source = _listener_source(tmp_path, "lx", 11111)
+    for key in ("state_path", "audit_path", "status_path", "inbox_path", "backfill_checkpoint_path"):
+        source[key] = tmp_path / source[key]
+
+    class Listener:
+        def __init__(self, *, on_deal, **_):
+            self.on_deal = on_deal
+
+        def start(self, **_):
+            if on_start:
+                try:
+                    on_start(self.on_deal, source, repo)
+                except BaseException as exc:
+                    callback_errors.append(exc)
+                finally:
+                    stop.set()
+
+        def check_health(self):
+            stop.set()
+
+        def close(self):
+            pass
+
+    class History:
+        def __init__(self, **_):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", History)
+    monkeypatch.setattr(auto_intake, "_reconcile_source_completion", lambda **_: {})
+    monkeypatch.setattr(auto_intake, "recover_trade_intake_receipts", lambda **_: {})
+    monkeypatch.setattr(auto_intake, "recover_order_fee_targets", lambda *_, **__: {
+        "targets": [], "selection_cursor": {"after": None}, "candidate_count": 0, "issues": []})
+    monkeypatch.setattr(auto_intake, "reconcile_due_lifecycle_cases_for_source", lambda *_, **__: {})
+    monkeypatch.setattr(auto_intake, "_refresh_lifecycle_delivery_status", lambda *_, **__: None)
+    monkeypatch.setattr(auto_intake, "is_portfolio_management_enabled", lambda _: False)
+    monkeypatch.setattr(auto_intake, "list_retryable_trade_payloads", lambda *_, **__: list(rows))
+    monkeypatch.setattr(auto_intake, "resolve_futu_quote_route", lambda _: SimpleNamespace(
+        ok=False, errors=("offline test",), status="unavailable"))
+    assert auto_intake._run_listener_source_loop(
+        source=source, repo=repo, cfg={}, cfg_path=tmp_path / "config.json", runtime_root=tmp_path,
+        runtime_root_source="test", intake_cfg={"mode": "apply", "enabled": True}, apply_changes=True,
+        receipt_callback=lambda _: {}, process_lock=threading.RLock(), stop_event=stop,
+    ) == 0
+    if callback_errors:
+        raise callback_errors[0]
+    return source, repo
+
+
+@pytest.mark.parametrize("failure", ["key", "enqueue", "audit", "status", "reporting"])
+def test_push_enqueue_failure_is_contained_and_next_push_survives(tmp_path, monkeypatch, failure):
+    original_enqueue = auto_intake.enqueue_trade_payload
+    original_key = auto_intake.broker_deal_key_from_payload
+    original_audit = auto_intake.append_trade_intake_audit
+    original_status = auto_intake._write_listener_status
+    calls = []
+    statuses = []
+    failed = False
+    payload = {"deal_id": "push-fault", "acc_id": "REAL_LX", "environment": "REAL",
+               "external_id_namespace": "futu.deal", "code": "US.NVDA", "qty": 1, "price": 1}
+
+    def on_start(callback, source, repo):
+        nonlocal failed
+        def enqueue(*args, **kwargs):
+            nonlocal failed
+            calls.append(kwargs["payload"])
+            if failure in {"enqueue", "reporting"} and not failed:
+                failed = True
+                raise OSError("enqueue fault")
+            return original_enqueue(*args, **kwargs)
+
+        def key(*args, **kwargs):
+            nonlocal failed
+            if failure == "key" and not failed:
+                failed = True
+                raise ValueError("key fault")
+            return original_key(*args, **kwargs)
+
+        def audit(path, event, **kwargs):
+            nonlocal failed
+            if failure == "reporting" or (failure == "audit" and not failed):
+                failed = True
+                raise OSError("audit fault")
+            return original_audit(path, event, **kwargs)
+
+        def status(path, state, **kwargs):
+            nonlocal failed
+            statuses.append({**state, **kwargs})
+            if failure == "reporting" or (failure == "status" and not failed):
+                failed = True
+                raise OSError("status fault")
+            return original_status(path, state, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(auto_intake, "enqueue_trade_payload", enqueue)
+            patch.setattr(auto_intake, "broker_deal_key_from_payload", key)
+            patch.setattr(auto_intake, "append_trade_intake_audit", audit)
+            patch.setattr(auto_intake, "_write_listener_status", status)
+            raw = {**payload, "_trade_intake_source_identity_errors": ["test invalid identity"]} if failure in {"audit", "status"} else payload
+            callback(raw)
+            assert len(calls) == (0 if failure == "key" else 1)
+            assert statuses[-1]["stage"] == "push_enqueue_failed"
+            assert "fault" in statuses[-1]["last_error"]
+            if failure != "reporting":
+                saved_status = json.loads(source["status_path"].read_text())
+                assert saved_status["stage"] == "push_enqueue_failed"
+                audit_rows = [json.loads(line) for line in source["audit_path"].read_text().splitlines()]
+                assert audit_rows[-1]["phase"] == "push_enqueue_failed"
+                assert audit_rows[-1]["deal_id"] == "push-fault"
+            if failure in {"audit", "status"}:
+                # Re-delivery of the same quarantined payload must remain one durable row.
+                callback(raw)
+                from src.application.trades.inbox_authority import resolve_execution_inbox_path
+                summary = auto_intake.trade_inbox_summary(resolve_execution_inbox_path(repo, source["inbox_path"]))
+                assert summary["identity_needs_review_count"] == 1
+            callback({**payload, "deal_id": "next-push"})
+            assert calls[-1]["deal_id"] == "next-push"
+
+    _run_failure_case_listener(tmp_path, monkeypatch, on_start=on_start)
+
+
+@pytest.mark.parametrize("failure", ["checkpoint", "gateway"])
+def test_intake_preparation_failure_keeps_batch_processing_and_retries(tmp_path, monkeypatch, failure):
+    order, results, seals = [], [], []
+    counts = {"checkpoint": 0, "gateway": 0}
+
+    def checkpoint(*_, **kwargs):
+        counts["checkpoint"] += 1
+        order.append("checkpoint")
+        seals.append(kwargs["reason"])
+        if failure == "checkpoint" and counts["checkpoint"] == 1:
+            raise OSError("seal unavailable")
+
+    def gateway(**_):
+        counts["gateway"] += 1
+        order.append("gateway")
+        if failure == "gateway" and counts["gateway"] == 1:
+            raise OSError("gateway unavailable")
+        return SimpleNamespace(close=lambda: None)
+
+    def process(payload, **_):
+        order.append(payload["deal_id"])
+        return {"status": "applied", "deal_id": payload["deal_id"]}
+
+    monkeypatch.setattr(auto_intake, "append_lifecycle_attempt_checkpoint_seal", checkpoint)
+    monkeypatch.setattr(auto_intake, "build_futu_gateway", gateway)
+    monkeypatch.setattr(auto_intake, "_process_payload", process)
+    monkeypatch.setattr(auto_intake, "ensure_lifecycle_timing_after_intake",
+                        lambda *_, **__: order.append("timing") or {"created": True})
+    monkeypatch.setattr(auto_intake, "_format_result_summary", lambda result: results.append(dict(result)) or "test")
+    rows = [{"inbox_id": str(i), "payload": {"deal_id": f"row-{i}"}} for i in range(2)]
+    source, _ = _run_failure_case_listener(tmp_path, monkeypatch, rows=rows)
+    assert [result["status"] for result in results] == ["applied", "applied"]
+    assert results[0]["lifecycle_timing"]["status"] == "needs_review"
+    assert results[1]["lifecycle_timing"] == {"created": True}
+    assert order == (["checkpoint", "row-0", "checkpoint", "gateway", "row-1", "timing"]
+                     if failure == "checkpoint" else
+                     ["checkpoint", "gateway", "row-0", "gateway", "row-1", "timing"])
+    assert seals == (["process_startup", "prior_seal_persist_failed"] if failure == "checkpoint" else ["process_startup"])
+    status = json.loads(source["status_path"].read_text())
+    assert status["last_lifecycle_intake_error"]["deal_id"] == "row-0"
+    assert status["last_lifecycle_intake_error"]["reason_codes"] == [
+        "checkpoint_seal_pending" if failure == "checkpoint" else "settlement_gateway_unavailable"]
+
+
+@pytest.mark.parametrize("result_status,trusted,expected_loads", [
+    ("applied", True, 0), (" APPLIED ", True, 0), ("failed", False, 0), ("failed", True, 1),
+])
+def test_inbox_fee_state_load_is_lazy(tmp_path, monkeypatch, result_status, trusted, expected_loads):
+    payload = {"deal_id": "fee-deal", "acc_id": "REAL_LX", "order_id": "fee-order"}
+    if trusted:
+        payload["_trade_intake_source"] = {"schema_version": "trade_intake_source.v1",
+                                           "account": "lx", "futu_account_id": "REAL_LX"}
+    loads, targets = [], []
+    monkeypatch.setattr(auto_intake, "append_lifecycle_attempt_checkpoint_seal", lambda *_, **__: None)
+    monkeypatch.setattr(auto_intake, "build_futu_gateway", lambda **_: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(auto_intake, "ensure_lifecycle_timing_after_intake", lambda *_, **__: None)
+    monkeypatch.setattr(auto_intake, "_process_payload", lambda *_, **__: {"status": result_status})
+    monkeypatch.setattr(auto_intake, "load_trade_intake_state", lambda path: loads.append(path) or {"marker": True})
+    monkeypatch.setattr(auto_intake, "is_durable_processed_deal", lambda state, _: state.get("marker", False))
+    original_target = auto_intake._durable_fee_target
+    def target(**kwargs):
+        value = original_target(**kwargs)
+        targets.append(value)
+        return value
+    monkeypatch.setattr(auto_intake, "_durable_fee_target", target)
+    _run_failure_case_listener(tmp_path, monkeypatch, rows=[{"inbox_id": "fee", "payload": payload}])
+    assert len(loads) == expected_loads
+    assert targets == [auto_intake.fee_target_from_trusted_payload(payload)]
+
+
+def _manual_failure_config(tmp_path, monkeypatch):
+    sources = [_listener_source(tmp_path, account, 11111 + i) for i, account in enumerate(("lx", "sy"))]
+    cfg = {"enabled": True, "mode": "apply", "state_path": Path("state.json"),
+           "audit_path": Path("audit.jsonl"), "status_path": Path("status.json"),
+           "receipt": {"enabled": False}, "backfill": {"enabled": False},
+           "account_mapping": {"REAL_LX": "lx", "REAL_SY": "sy", "OTHER_LX": "lx"},
+           "futu_account_ids": ["REAL_LX", "REAL_SY", "OTHER_LX"], "sources": sources}
+    monkeypatch.setattr(auto_intake, "load_config", lambda **_: {})
+    monkeypatch.setattr(auto_intake, "resolve_trade_intake_config",
+                        lambda *_, **kwargs: {**cfg, "mode": kwargs.get("mode_override") or "apply"})
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    monkeypatch.setattr(auto_intake, "open_position_ledger_from_runtime_config", lambda **_: (None, repo))
+    monkeypatch.setattr(auto_intake, "resolve_position_ledger_sqlite_path", lambda **_: repo.db_path)
+    monkeypatch.setattr(auto_intake, "_build_receipt_callback", lambda **_: lambda _: {})
+    return cfg, ["--config", str(tmp_path / "config.json"), "--runtime-root", str(tmp_path)]
+
+
+@pytest.mark.parametrize("failure", ["unmatched", "ambiguous"])
+def test_execution_file_selector_rejection_is_row_local(tmp_path, monkeypatch, capsys, failure):
+    cfg, args = _manual_failure_config(tmp_path, monkeypatch)
+    if failure == "ambiguous":
+        cfg["sources"].append({**cfg["sources"][0], "id": "duplicate"})
+    def row(physical, label, deal):
+        return {"schema_version": "trade_execution.v1",
+                "broker_account_ref": {"broker_id": "futu", "external_account_id": physical,
+                    "environment": "REAL", "broker_account_id": f"futu:REAL:{physical}", "account_label": label},
+                "instrument_ref": {"asset_type": "stock", "market": "US", "symbol": "NVDA", "currency": "USD"},
+                "external_id_namespace": "futu.deal", "external_execution_id": deal,
+                "side": "buy", "position_effect": "open", "quantity": "1", "price": "100",
+                "currency": "USD", "occurred_at_utc": "2026-09-07T02:30:00Z"}
+    incoming = [row("OTHER_LX" if failure == "unmatched" else "REAL_LX", "lx", "bad"),
+                row("REAL_SY", "sy", "good")]
+    path = tmp_path / "rows.jsonl"
+    path.write_text("\n".join(json.dumps(item) for item in incoming))
+    selected, processed = [], []
+    original_select = auto_intake._select_source_for_payload
+    def select(sources, **kwargs):
+        assert not kwargs["payload"]["_trade_intake_file_errors"]
+        selected.append(kwargs["require_match"])
+        return original_select(sources, **kwargs)
+    def process(payload, **kwargs):
+        processed.append((payload["external_execution_id"], kwargs["state_path"]))
+        return {"status": "applied"}
+    monkeypatch.setattr(auto_intake, "_select_source_for_payload", select)
+    monkeypatch.setattr(auto_intake, "_process_payload", process)
+    assert auto_intake.main([*args, "--execution-file", str(path), "--mode", "apply", "--confirm"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert selected == [True, True]
+    assert processed == [("good", tmp_path / "state/sy.json")]
+    assert result["result_counts"] == {"rejected": 1, "applied": 1}
+    assert [item["line_number"] for item in result["results"]] == [1, 2]
+    assert ("requires payload" if failure == "unmatched" else "multiple trade-intake sources") in result["results"][0]["reason"]
+
+
+def test_deal_json_account_conflict_returns_clean_rejection(tmp_path, monkeypatch, capsys):
+    _, args = _manual_failure_config(tmp_path, monkeypatch)
+    path = tmp_path / "deal.json"
+    path.write_text(json.dumps({"deal_id": "conflict", "account": "sy", "futu_account_id": "REAL_LX"}))
+    monkeypatch.setattr(auto_intake, "_process_payload", lambda *_, **__: pytest.fail("rejected input reached processing"))
+    assert auto_intake.main([*args, "--deal-json", str(path), "--mode", "apply", "--confirm"]) == 2
+    captured = capsys.readouterr()
+    assert "account conflicts" in captured.out
+    assert "Traceback" not in captured.err
+
+
+def test_listener_status_writer_records_status_for_carry_forward(tmp_path: Path) -> None:
+    """The receipt-recovery hook carries the current status forward, not a literal.
+
+    `_recover_local_intake_if_due` writes `status=str(status_state.get("status") or
+    "starting")` so it can preserve whatever the listener last reported, and it
+    reads that from the same state dict every writer shares. `_write_listener_status`
+    therefore has to record what it wrote: when it only wrote a local copy, the hook
+    relabelled a healthy listener as "starting" on every iteration — which paged the
+    operator every 10 minutes and made the runtime summary read "partial" forever.
+    """
+    status_path = tmp_path / "intake-status.json"
+    status_state: dict[str, object] = {}
+    auto_intake._write_listener_status(status_path, status_state, status="listening", stage="heartbeat")
+    assert status_state["status"] == "listening"
+    auto_intake._write_listener_status(
+        status_path, status_state,
+        status=str(status_state.get("status") or "starting"), stage="receipt_recovery",
+    )
+    written = json.loads(status_path.read_text(encoding="utf-8"))
+    assert written["status"] == "listening"
+    assert written["stage"] == "receipt_recovery"
+
+
+@pytest.mark.parametrize("mode,status,expected", [
+    ("apply", "failed", False), ("apply", "applied", True), ("apply", "unresolved", False),
+    ("apply", "verification_pending", False), ("apply", "skipped", False), ("dry-run", "applied", False),
+])
+def test_deal_json_write_contract_requires_applied_result(tmp_path, monkeypatch, capsys, mode, status, expected):
+    _, args = _manual_failure_config(tmp_path, monkeypatch)
+    path = tmp_path / "deal.json"
+    path.write_text(json.dumps({"deal_id": "write-contract", "futu_account_id": "REAL_LX"}))
+    monkeypatch.setattr(auto_intake, "_process_payload", lambda *_, **__: {"status": status})
+    assert auto_intake.main([*args, "--deal-json", str(path), "--mode", mode, "--confirm"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["status"] == status
+    assert result["write_applied"] is expected
+    assert result["dry_run"] is (mode == "dry-run")
+
+
+def test_source_loop_carries_listening_status_across_iterations(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A running source must not read as "starting" for the whole iteration.
+
+    `_recover_local_intake_if_due` writes the status file at the top of every work
+    iteration and has no status of its own to report, so it names whatever the
+    loop currently holds. The loop held nothing — `_write_listener_status` wrote
+    the file without updating its caller's state — so that write always said
+    "starting" and, because the heartbeat lands at the end of the iteration, the
+    file read "starting" for all but about a second of each cycle. That is what
+    the 3.7.1 heartbeat watchdog sampled when it paged production every silence
+    window on 2026-09-24. The observation point below is inside the loop's work,
+    between that write and the heartbeat, which is exactly where the operator's
+    samples landed.
+    """
+    order: list[str] = []
+
+    class Repo:
+        def list_trade_lifecycle_attempt_audit_heads_for_account(self, *, account: str) -> list[dict]:
+            assert account == "lx"
+            return []
+
+    class Listener:
+        def __init__(self, **_kwargs):
+            return None
+
+        def start(self, **_kwargs):
+            return None
+
+        def check_health(self):
+            return None
+
+        def close(self):
+            return None
+
+    class History:
+        def __init__(self, **_kwargs):
+            return None
+
+        def fetch(self):
+            return []
+
+        def close(self):
+            return None
+
+    class Gateway:
+        def close(self):
+            return None
+
+    class Stop:
+        stopped = False
+        waits = 0
+
+        def is_set(self):
+            return self.stopped
+
+        def set(self):
+            self.stopped = True
+
+        def wait(self, _seconds):
+            self.waits += 1
+            if self.waits >= 2:
+                self.stopped = True
+            return self.stopped
+
+    monotonic = 0
+
+    def next_monotonic():
+        nonlocal monotonic
+        monotonic += 61
+        return float(monotonic)
+
+    status_path = tmp_path / "status.json"
+    observed: list[str] = []
+
+    def observe(*_args, **_kwargs):
+        observed.append(json.loads(status_path.read_text(encoding="utf-8"))["status"])
+        return {"seal_status": "not_required", "run_seal": None, "process_counters": _kwargs["process_metrics"]}
+
+    monkeypatch.setattr(auto_intake, "OpenDTradePushListener", Listener)
+    monkeypatch.setattr(auto_intake, "OpenDHistoryDealClient", History)
+    monkeypatch.setattr(
+        auto_intake,
+        "append_lifecycle_attempt_checkpoint_seal",
+        lambda *_args, **_kwargs: order.append("seal"),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "build_futu_gateway",
+        lambda **_kwargs: order.append("gateway") or Gateway(),
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "resolve_futu_quote_route",
+        lambda _cfg: SimpleNamespace(ok=False, errors=("quote unavailable",), status="unavailable", host=None, port=None),
+    )
+    monkeypatch.setattr(auto_intake, "reconcile_due_lifecycle_cases_for_source", observe)
+    monkeypatch.setattr(auto_intake, "trade_inbox_summary", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(auto_intake, "list_retryable_trade_payloads", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(auto_intake, "_refresh_lifecycle_delivery_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(auto_intake.time, "monotonic", next_monotonic)
+    source = {
+        "id": "lx",
+        "account": "lx",
+        "host": "127.0.0.1",
+        "port": 11111,
+        "state_path": tmp_path / "state.json",
+        "audit_path": tmp_path / "audit.jsonl",
+        "status_path": status_path,
+        "inbox_path": tmp_path / "inbox.sqlite3",
+        "backfill_checkpoint_path": tmp_path / "backfill.json",
+        "account_mapping": {"1001": "lx"},
+        "futu_account_ids": ["1001"],
+        "backfill": {"enabled": False},
+    }
+
+    rc = auto_intake._run_listener_source_loop(
+        source=source,
+        repo=Repo(),
+        cfg={},
+        cfg_path=tmp_path / "config.json",
+        runtime_root=tmp_path,
+        runtime_root_source="test",
+        intake_cfg={"mode": "apply", "enabled": True, "backfill": {"enabled": False}},
+        apply_changes=True,
+        receipt_callback=lambda _context: {},
+        process_lock=threading.RLock(),
+        stop_event=Stop(),
+    )
+
+    assert rc == 0
+    assert observed, "the loop never reached its work phase"
+    assert observed == ["listening"] * len(observed)
+
+
+def _initialize_preview_ledger(root, config_path):
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+    path = auto_intake.resolve_position_ledger_sqlite_path(base=root,
+        cfg=json.loads(config_path.read_text()), data_config=None)
+    return SQLiteOptionPositionsRepository(path)

@@ -1,0 +1,467 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import pytest
+
+from domain.domain.engine import (
+    EARNINGS_NEAR_EXPIRY_POLICY_VERSION,
+    EARNINGS_NEAR_EXPIRY_WINDOW_DAYS,
+)
+from src.application.cc_lp_steps import (
+    CC_LP_FAMILY,
+    run_cc_lp_scan,
+    summarize_cc_lp_result,
+)
+from src.application.combo_yield_steps import run_cc_lp_variant
+from src.application.combo_yield_config import (
+    derive_combo_yield_policy,
+    resolve_combo_yield_cfg,
+)
+from src.infrastructure.exchange_rates import CurrencyConverter, ExchangeRates
+
+
+def _write_required_data(tmp_path: Path, *, call_rows: list[dict], put_rows: list[dict]) -> Path:
+    required_data = tmp_path / "required_data"
+    parsed = required_data / "parsed"
+    parsed.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for row in call_rows:
+        r = dict(row)
+        r["option_type"] = "call"
+        rows.append(r)
+    for row in put_rows:
+        r = dict(row)
+        r["option_type"] = "put"
+        rows.append(r)
+    pd.DataFrame(rows).to_csv(parsed / "NVDA_required_data.csv", index=False)
+    return required_data
+
+
+def _call_row(**overrides) -> dict:
+    row = {
+        "symbol": "NVDA",
+        "expiration": "2026-08-28",
+        "dte": 20,
+        "contract_symbol": "NVDA260828C110000",
+        "multiplier": 100.0,
+        "currency": "USD",
+        "strike": 110.0,
+        "spot": 100.0,
+        "bid": 4.0,
+        "ask": 4.2,
+        "mid": 4.1,
+        "open_interest": 500.0,
+        "volume": 20.0,
+        "delta": 0.30,
+        "implied_volatility": 0.35,
+        "spread": 0.2,
+        "spread_ratio": 0.05,
+    }
+    row.update(overrides)
+    return row
+
+
+def _put_row(**overrides) -> dict:
+    row = {
+        "symbol": "NVDA",
+        "expiration": "2026-08-28",
+        "dte": 20,
+        "contract_symbol": "NVDA260828P90000",
+        "multiplier": 100.0,
+        "currency": "USD",
+        "strike": 90.0,
+        "spot": 100.0,
+        "bid": 2.0,
+        "ask": 2.2,
+        "mid": 2.1,
+        "open_interest": 600.0,
+        "volume": 15.0,
+        "delta": -0.15,
+        "implied_volatility": 0.40,
+        "spread": 0.2,
+        "spread_ratio": 0.10,
+    }
+    row.update(overrides)
+    return row
+
+
+def _scan_call_row(**overrides) -> dict:
+    """A call row as produced by run_sell_call_scan (passed to _call_leg_from_required_data)."""
+
+    row = {
+        "symbol": "NVDA",
+        "option_type": "call",
+        "expiration": "2026-08-28",
+        "dte": 20,
+        "contract_symbol": "NVDA260828C110000",
+        "multiplier": 100.0,
+        "currency": "USD",
+        "strike": 110.0,
+        "spot": 100.0,
+        "bid": 4.0,
+        "ask": 4.2,
+        "mid": 4.1,
+        "open_interest": 500.0,
+        "volume": 20.0,
+        "delta": 0.30,
+        "implied_volatility": 0.35,
+        "avg_cost": 90.0,
+        "net_income": 400.0,
+        "net_income_cny": 400.0,
+        "annualized_net_premium_return": 0.50,
+        "iv_rv_ratio": 1.3,
+        "iv_minus_rv": 0.1,
+        "event_source_status": "ok",
+        "event_status": "ready",
+        "earnings_evidence_status": "ready",
+        "earnings_reason_code": None,
+        "earnings_policy_version": EARNINGS_NEAR_EXPIRY_POLICY_VERSION,
+        "earnings_window_days": EARNINGS_NEAR_EXPIRY_WINDOW_DAYS,
+        "earnings_market_date": "2026-08-08",
+        "earnings_hard_window_start": "2026-08-22",
+        "earnings_hard_window_end": "2026-08-28",
+        "earnings_hard_coverage_status": "complete",
+        "earnings_soft_coverage_status": "complete",
+        "earnings_has_event": False,
+        "earnings_blocking_has_event": False,
+        "earnings_events": [],
+        "earnings_blocking_events": [],
+        "earnings_nonblocking_events": [],
+        "event_flag": False,
+        "event_types": "",
+        "event_dates": "",
+        "shares_total": 100,
+        "shares_eligible": 100,
+        "shares_locked": 0,
+        "shares_available_for_cover": 1,
+        "covered_contracts_available": 1,
+        "max_new_contracts": 1,
+        "is_fully_covered_available": True,
+        "spread": 0.2,
+        "spread_ratio": 0.05,
+    }
+    row.update(overrides)
+    return row
+
+
+def _converter() -> CurrencyConverter:
+    return CurrencyConverter(ExchangeRates(usd_per_cny=0.14))
+
+
+def _cc_lp_required_data(tmp_path: Path) -> Path:
+    return _write_required_data(
+        tmp_path,
+        call_rows=[_call_row()],
+        put_rows=[_put_row()],
+    )
+
+
+def _cc_lp_symbol_cfg() -> dict:
+    return {
+        "symbol": "NVDA",
+        "combo_yield": {"enabled": True, "variant": "cc_lp"},
+        "sell_call": {"enabled": True},
+        "_global_sell_call_liquidity": {},
+    }
+
+
+def _cc_lp_scan_kwargs(required_data: Path, **overrides: Any) -> dict[str, Any]:
+    kwargs = {
+        "symbol": "NVDA",
+        "required_data_dir": required_data,
+        "sell_call_cfg": {"enabled": True},
+        "exchange_rate_converter": _converter(),
+        "portfolio_ctx": None,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _cc_lp_variant_kwargs(
+    symbol_cfg: dict,
+    required_data: Path,
+    *,
+    portfolio_ctx: dict[str, Any],
+    **overrides: Any,
+) -> dict[str, Any]:
+    kwargs = {
+        "symbol": "NVDA",
+        "symbol_cfg": symbol_cfg,
+        "policy": derive_combo_yield_policy(
+            resolve_combo_yield_cfg(symbol_cfg),
+            market="us",
+        ),
+        "required_data_dir": required_data,
+        "exchange_rate_converter": _converter(),
+        "portfolio_ctx": portfolio_ctx,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _available_cc_lp_context() -> dict[str, Any]:
+    return {
+        "portfolio_source_name": "futu",
+        "capacity_authority": {"status": "available"},
+        "option_ctx": {
+            "locked_shares_status": "available",
+            "locked_shares_by_symbol": {},
+            "locked_shares_unavailable_by_symbol": {},
+        },
+    }
+
+
+def test_run_cc_lp_scan_produces_candidates(tmp_path: Path) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    captured: dict[str, Any] = {}
+
+    def _scan(**kwargs: Any) -> pd.DataFrame:
+        captured.update(kwargs)
+        return pd.DataFrame([_scan_call_row()])
+
+    df = run_cc_lp_scan(**_cc_lp_scan_kwargs(
+            required_data,
+            stock={"shares": 100, "can_sell_qty": 100, "shares_locked": 0, "avg_cost": 90.0},
+            run_sell_call_scan_fn=_scan,
+    ))
+    assert not df.empty
+    row = df.iloc[0]
+    assert row["strategy_family"] == CC_LP_FAMILY == "combo_yield"
+    assert row["variant"] == "cc_lp"
+    assert row["call_strike"] > row["put_strike"]
+    assert row["net_credit_retention"] > 0.20
+    assert abs(row["put_delta"]) >= 0.10
+    assert row["covered_notional"] == pytest.approx(100.0 * 100.0)
+    assert abs(float(row["net_return"]) - float(row["net_credit"]) / (100.0 * 100.0)) < 1e-5
+    assert captured["shares"] == 100
+    assert captured["shares_can_sell"] == 100
+    assert captured["shares_locked"] == 0
+    assert "shares_available_for_cover" not in captured
+
+
+def test_run_cc_lp_scan_skips_without_stock(tmp_path: Path) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    df = run_cc_lp_scan(**_cc_lp_scan_kwargs(required_data, stock=None))
+    assert df.empty
+
+
+def test_run_cc_lp_scan_demo_capacity_uses_covered_call_owner_without_stock(
+    tmp_path: Path,
+) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    captured: dict[str, Any] = {}
+
+    def _scan(**kwargs: Any) -> pd.DataFrame:
+        captured.update(kwargs)
+        return pd.DataFrame([_scan_call_row()])
+
+    df = run_cc_lp_scan(**_cc_lp_scan_kwargs(
+            required_data,
+            stock=None,
+            run_sell_call_scan_fn=_scan,
+            demo_capacity=True,
+    ))
+
+    assert not df.empty
+    assert captured["demo_capacity"] is True
+    assert df.iloc[0]["capacity_source"] == "demo_scenario"
+    assert int(df.iloc[0]["max_new_contracts"]) == 1
+
+
+def test_run_cc_lp_scan_rejects_retention_below_floor(tmp_path: Path) -> None:
+    # expensive put -> retention below 0.20
+    put = _put_row(ask=4.0)
+    required_data = _write_required_data(
+        tmp_path,
+        call_rows=[_call_row(bid=4.0)],
+        put_rows=[put],
+    )
+    df = run_cc_lp_scan(**_cc_lp_scan_kwargs(
+            required_data,
+            stock={"shares": 100, "can_sell_qty": 100, "shares_locked": 0, "avg_cost": 90.0},
+            run_sell_call_scan_fn=lambda **kwargs: pd.DataFrame([_scan_call_row(bid=4.0)]),
+    ))
+    assert df.empty
+
+
+def test_run_cc_lp_scan_inherits_sell_call_underwriting_gate(tmp_path: Path) -> None:
+    # call with net_income below underwriting min (50) -> must be filtered out
+    call = _scan_call_row(
+        net_income=10.0,
+        net_income_cny=10.0,
+        annualized_net_premium_return=0.05,
+        avg_cost=90.0,
+    )
+    required_data = _cc_lp_required_data(tmp_path)
+    df = run_cc_lp_scan(**_cc_lp_scan_kwargs(
+            required_data,
+            sell_call_cfg={
+                "enabled": True,
+                "min_annualized_net_premium_return": 0.10,
+                "min_net_income": 50.0,
+            },
+            stock={"shares": 100, "can_sell_qty": 100, "shares_locked": 0, "avg_cost": 90.0},
+            run_sell_call_scan_fn=lambda **kwargs: pd.DataFrame([call]),
+    ))
+    assert df.empty
+
+
+def test_run_cc_lp_variant_returns_summary(tmp_path: Path) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    symbol_cfg = _cc_lp_symbol_cfg()
+    summary = run_cc_lp_variant(**_cc_lp_variant_kwargs(
+            symbol_cfg,
+            required_data,
+            portfolio_ctx=_available_cc_lp_context(),
+            stock={"shares": 100, "can_sell_qty": 100, "avg_cost": 90.0},
+            run_cc_lp_scan_fn=lambda **kwargs: pd.DataFrame(
+                [
+                    {
+                        "strategy_family": CC_LP_FAMILY,
+                        "symbol": "NVDA",
+                        "call_strike": 110.0,
+                        "put_strike": 90.0,
+                        "net_credit_retention": 0.30,
+                    }
+                ]
+            ),
+    ))
+    assert summary is not None
+    assert summary["strategy_family"] == CC_LP_FAMILY
+    assert summary["status"] == "candidates_found"
+    assert summary["candidate_count"] == 1
+
+
+def test_run_cc_lp_variant_forwards_pairs_to_sink(tmp_path: Path) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    symbol_cfg = _cc_lp_symbol_cfg()
+    captured: list[dict] = []
+    summary = run_cc_lp_variant(**_cc_lp_variant_kwargs(
+            symbol_cfg,
+            required_data,
+            portfolio_ctx=_available_cc_lp_context(),
+            stock={"shares": 100, "can_sell_qty": 100, "avg_cost": 90.0},
+            run_cc_lp_scan_fn=lambda **kwargs: pd.DataFrame(
+                [
+                    {
+                        "strategy_family": "combo_yield",
+                        "variant": "cc_lp",
+                        "symbol": "NVDA",
+                        "candidate_pair_id": "cc_lp:NVDA:C:P",
+                        "call_strike": 110.0,
+                        "put_strike": 90.0,
+                        "net_credit_retention": 0.30,
+                    }
+                ]
+            ),
+            combo_evidence_sink_fn=captured.append,
+    ))
+    assert summary["status"] == "candidates_found"
+    assert len(captured) == 1
+    assert captured[0]["variant"] == "cc_lp"
+    assert captured[0]["ranked_pairs"][0]["candidate_pair_id"] == "cc_lp:NVDA:C:P"
+
+
+def test_run_cc_lp_variant_not_applicable_without_stock(tmp_path: Path) -> None:
+    required_data = _cc_lp_required_data(tmp_path)
+    symbol_cfg = _cc_lp_symbol_cfg()
+    summary = run_cc_lp_variant(**_cc_lp_variant_kwargs(
+            symbol_cfg,
+            required_data,
+            portfolio_ctx=_available_cc_lp_context(),
+            stock=None,
+            run_cc_lp_scan_fn=lambda **kwargs: pd.DataFrame(),
+    ))
+    assert summary is not None
+    assert summary["status"] == "not_applicable"
+    assert summary["reason"] == "stock_context_missing"
+
+
+def test_run_cc_lp_variant_fails_closed_without_locked_share_context(
+    tmp_path: Path,
+) -> None:
+    symbol_cfg = {
+        "symbol": "NVDA",
+        "combo_yield": {"enabled": True, "variant": "cc_lp"},
+        "sell_call": {"enabled": True},
+    }
+    context = _available_cc_lp_context()
+    context["option_ctx"]["locked_shares_status"] = "unavailable"
+    calls: list[dict[str, Any]] = []
+
+    summary = run_cc_lp_variant(**_cc_lp_variant_kwargs(
+            symbol_cfg,
+            tmp_path / "required_data",
+            portfolio_ctx=context,
+            stock={"shares": 100, "can_sell_qty": 100, "avg_cost": 90.0},
+            run_cc_lp_scan_fn=lambda **kwargs: calls.append(kwargs) or pd.DataFrame(),
+    ))
+
+    assert summary["status"] == "unavailable"
+    assert summary["reason"] == "option_positions_context_unavailable"
+    assert calls == []
+
+
+def test_variant_config_parses() -> None:
+    cfg = resolve_combo_yield_cfg({"combo_yield": {"enabled": True, "variant": "cc_lp"}})
+    policy = derive_combo_yield_policy(cfg)
+    assert policy.config["variant"] == "cc_lp"
+    cfg_default = resolve_combo_yield_cfg({"combo_yield": {"enabled": True}})
+    policy_default = derive_combo_yield_policy(cfg_default)
+    assert policy_default.config["variant"] == "sp_lc"
+
+
+def test_summarize_cc_lp_result() -> None:
+    summary = summarize_cc_lp_result(
+        df=pd.DataFrame([{"a": 1}]),
+        symbol="NVDA",
+        status="candidates_found",
+    )
+    assert summary["candidate_count"] == 1
+    assert summary["status"] == "candidates_found"
+
+
+@pytest.mark.parametrize("raw", ["100.00000000000000001", "True", "100.5", "0", "500", "1000"])
+def test_cc_lp_scan_validates_put_multiplier_before_float(tmp_path, raw):
+    valid = raw in {"500", "1000"}
+    call_multiplier = int(raw) if valid else 100
+    root = _write_required_data(
+        tmp_path, call_rows=[_call_row(multiplier=call_multiplier)],
+        put_rows=[_put_row(multiplier=raw)],
+    )
+    result = run_cc_lp_scan(**_cc_lp_scan_kwargs(
+        root,
+        stock={"shares": 1000, "can_sell_qty": 1000, "shares_locked": 0, "avg_cost": 90.0},
+        run_sell_call_scan_fn=lambda **_: pd.DataFrame([_scan_call_row(multiplier=call_multiplier)]),
+    ))
+    if valid:
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["multiplier"] == int(raw)
+        assert row["put_total_cost"] > 2.2 * int(raw)
+        assert row["net_credit"] > 0
+    else:
+        assert result.empty
+
+
+@pytest.mark.parametrize("delta,bounds,accepted", [
+    (-0.15, {}, True), (-0.35, {}, True), (-0.149, {}, False), (-0.351, {}, False),
+    (None, {}, False), (float("nan"), {}, False), (float("inf"), {}, False),
+    (-0.45, {"min_delta": 0.4, "max_delta": 0.5}, True),
+])
+def test_variant_long_put_delta_reaches_scan_and_metrics(tmp_path: Path, delta, bounds, accepted) -> None:
+    required_data = _write_required_data(tmp_path, call_rows=[_call_row()], put_rows=[_put_row(delta=delta)])
+    symbol_cfg = _cc_lp_symbol_cfg()
+    symbol_cfg["combo_yield"]["put"] = bounds
+    summary = run_cc_lp_variant(**_cc_lp_variant_kwargs(
+        symbol_cfg, required_data, portfolio_ctx=_available_cc_lp_context(),
+        stock={"shares": 100, "can_sell_qty": 100, "avg_cost": 90.0},
+        run_cc_lp_scan_fn=lambda **kwargs: run_cc_lp_scan(
+            **kwargs, run_sell_call_scan_fn=lambda **kw: pd.DataFrame([_scan_call_row()]),
+        ),
+    ))
+    assert summary is not None
+    assert (summary["status"] == "candidates_found") is accepted

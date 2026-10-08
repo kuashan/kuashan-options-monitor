@@ -1,0 +1,92 @@
+notifications:
+  enabled: false
+
+accounts:
+  lx:
+    type: futu
+    futu:
+      trd_env: REAL
+    futu_account_id: "REPLACE_WITH_FUTU_ACCOUNT_ID"
+
+trade_intake:
+  combo_reconciliation:
+    accounts: {}
+
+portfolio:
+  holdings:
+    enabled: false
+
+templates:
+  put_base:
+    sell_put:
+      min_annualized_net_return: 0.10
+      min_net_income: 50.0
+
+markets:
+  us:
+    accounts: [lx]
+    features:
+      wheel:
+        accounts: []
+        min_dte: 30
+        max_dte: 45
+        min_delta: 0.30
+        min_annualized_net_premium_return: 0.10
+        min_net_premium_cny: 50
+        max_spread_ratio: 0.40
+        min_iv_rv_ratio: 1.10
+        min_iv_minus_rv: 0.05
+    symbols:
+      - NVDA
+      - FUTU
+      - GOOGL
+    overrides:
+      FUTU:
+        sell_put:
+          dte: [20, 45]
+          strike: [55, 85]
+        covered_call:
+          enabled: true
+          dte: [20, 60]
+          strike: [90, 120]
+        combo_yield: true
+
+  hk:
+    accounts: [lx]
+    symbols:
+      - "0700.HK"
+      - "9992.HK"
+
+bot:
+  enabled: true
+  context_window_messages: 8
+  active_model: deepseek-default
+  models:
+    deepseek-default:
+      provider: deepseek
+      base_url: "https://api.deepseek.com"
+      model: deepseek-chat
+      confidence_min: 0.75
+      timeout_seconds: 90
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+    kimi-code:
+      provider: kimi-code
+      base_url: "https://api.kimi.com/coding/v1"
+      model: kimi-for-coding
+      confidence_min: 0.75
+      timeout_seconds: 90
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+    openai-default:
+      provider: openai
+      base_url: ""
+      model: gpt-5.2
+      confidence_min: 0.75
+      timeout_seconds: 90
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+
+inbound:
+  feishu_ws:
+    ack_reaction: THUMBSUP

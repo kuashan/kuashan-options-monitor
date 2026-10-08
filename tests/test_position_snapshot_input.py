@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import hashlib
+
+import pytest
+
+from domain.domain.position_snapshot import (
+    POSITION_SNAPSHOT_VERSION,
+    normalize_persisted_position_snapshot_input,
+    normalize_position_snapshot_input,
+    position_snapshot_scope_errors,
+)
+from src.application.futu_portfolio_context import build_futu_portfolio_context, build_futu_position_snapshot
+from src.application.quality.opend_position_adapter import OpenDOptionSnapshot
+from src.application.quality.position_checks import build_position_dataset
+
+
+NOW = datetime(2026, 9, 7, 2, tzinfo=timezone.utc)
+ACCOUNT = {"broker_account_id": "futu:REAL:123", "broker_id": "futu", "external_account_id": "123", "environment": "REAL", "account_label": "lx"}
+
+
+def _snapshot(*, stock: bool = False, rows: list | None = None) -> dict:
+    return normalize_position_snapshot_input({
+        "schema_version": POSITION_SNAPSHOT_VERSION,
+        "snapshot_id": "snapshot-1", "source_id": "test.positions",
+        "broker_account_ref": ACCOUNT,
+        "scope": {"markets": ["US"], "asset_types": ["stock" if stock else "option"], "filtered": False},
+        "observed_at_utc": NOW.isoformat(), "completeness": "complete",
+        "quality": {"status": "ready"}, "rows": [] if rows is None else rows,
+    })
+
+
+def _scope_errors(snapshot: dict, *, asset: str = "option") -> list[str]:
+    return position_snapshot_scope_errors(snapshot, account_label="lx", environment="REAL", market="US", asset_type=asset, external_account_id="123", now_utc=NOW)
+
+
+class _FrozenDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return NOW
+
+
+def _futu_snapshot(rows: list, *, asset_types: list | None = None) -> dict:
+    return build_futu_position_snapshot(
+        rows=rows, broker_account_ref=ACCOUNT, markets=["US"],
+        asset_types=asset_types or ["stock"], observed_at_utc=NOW.isoformat(), completeness="complete",
+    )
+
+
+def _portfolio_context(snapshot: dict, *, position_rows: list | None = None) -> dict:
+    return build_futu_portfolio_context(
+        balance_rows=[], position_rows=position_rows or [], account="lx", futu_account_id="123",
+        broker_account_identifiers=["123"], trd_env="REAL", capacity_market="us",
+        position_snapshot_input=snapshot,
+    )
+
+
+def _dataset(snapshot_input: dict, *, local_lots: list | None = None) -> dict:
+    snapshot = OpenDOptionSnapshot(
+        account="lx", market="us", environment="REAL", account_fingerprint="sha256:" + hashlib.sha256(b"123").hexdigest(),
+        observed_at_utc=NOW.isoformat(), snapshot_id="snapshot-1", complete=True,
+        refresh_cache=True, rows=[], trading_days=[], snapshot_input=snapshot_input,
+    )
+    return build_position_dataset(snapshot=snapshot, local_lots=local_lots or [], account="lx", market="us", observed_at_utc=NOW.isoformat(), now=NOW, control_state={})[0]
+
+
+@pytest.mark.parametrize("change", [
+    {"completeness": "partial"}, {"completeness": "unknown"},
+    {"scope": {"markets": ["US"], "asset_types": ["option"], "filtered": True}},
+    {"scope": {"markets": ["HK"], "asset_types": ["option"], "filtered": False}},
+    {"scope": {"markets": ["US"], "asset_types": ["stock"], "filtered": False}},
+    {"broker_account_ref": {**ACCOUNT, "environment": "SIMULATE"}},
+    {"broker_account_ref": {**ACCOUNT, "account_label": "sy"}},
+    {"source_as_of_utc": (NOW - timedelta(seconds=301)).isoformat()},
+    {"observed_at_utc": (NOW - timedelta(seconds=301)).isoformat()},
+    {"quality": {"status": "stale"}},
+    {"broker_account_ref": {**ACCOUNT, "external_account_id": "456"}},
+    {"observed_at_utc": (NOW - timedelta(seconds=10)).isoformat(), "source_as_of_utc": NOW.isoformat()},
+])
+def test_incomplete_or_wrong_scope_empty_positions_never_reconcile_to_zero(change: dict) -> None:
+    snapshot = {**_snapshot(), **change}
+    assert _scope_errors(snapshot)
+    result = _dataset(snapshot)
+    assert result["status"] == "unavailable"
+    assert result["checks"][1]["reason_code"] == "POSITION_CONVERGENCE_SOURCE_UNAVAILABLE"
+
+
+def test_only_complete_same_scope_empty_snapshot_proves_zero() -> None:
+    assert _scope_errors(_snapshot()) == []
+    assert _dataset(_snapshot())["status"] == "trusted"
+    wrong_account = deepcopy(_snapshot())
+    wrong_account["broker_account_ref"]["external_account_id"] = "456"
+    assert "snapshot_physical_account_mismatch" in _scope_errors(wrong_account)
+
+
+def test_current_snapshot_requires_version_and_history_adapter_is_explicit() -> None:
+    versionless = _snapshot()
+    versionless.pop("schema_version")
+
+    assert "missing:schema_version" in normalize_position_snapshot_input(
+        versionless
+    )["errors"]
+    persisted = normalize_persisted_position_snapshot_input(versionless)
+    assert persisted["schema_version"] == POSITION_SNAPSHOT_VERSION
+    assert "missing:schema_version" not in persisted["errors"]
+
+
+def test_position_contract_retains_exact_quantity_and_rejects_missing_or_nonfinite() -> None:
+    row = {"instrument_ref": {"asset_type": "stock", "symbol": "NVDA", "market": "US", "currency": "USD"}, "position_side": "long", "quantity": "100.000000000000000001"}
+    assert _snapshot(stock=True, rows=[row])["rows"][0]["quantity"] == "100.000000000000000001"
+    for bad in (None, "NaN", "Infinity", True, 1.1):
+        normalized = _snapshot(stock=True, rows=[{**row, "quantity": bad}])
+        assert normalized["errors"]
+        assert normalized["rows"][0]["quantity"] is None
+    option = {**row, "instrument_ref": {**row["instrument_ref"], "asset_type": "option", "option_type": "put", "strike": "100", "expiration_ymd": "2026-09-18", "multiplier": "10"}, "quantity": "1.5"}
+    assert "invalid:rows.0.quantity:integer_required" in _snapshot(rows=[option])["errors"]
+
+
+def test_standard_rows_drive_option_comparison_without_futu_code_parsing() -> None:
+    standard = _snapshot(rows=[{
+        "instrument_ref": {"asset_type": "option", "symbol": "NVDA", "market": "US", "currency": "USD", "option_type": "put", "strike": "99.5", "expiration_ymd": "2026-09-18", "multiplier": "10"},
+        "position_side": "short", "quantity": "1",
+    }])
+    result = _dataset(standard)
+    assert result["status"] == "partial"
+    assert result["checks"][1]["reason_code"] == "POSITION_DIVERGENCE_TRANSIENT"
+
+
+@pytest.mark.parametrize(("deliverable", "error_kind"), [
+    (None, None), ({}, None),
+    ({"symbol": "NVDA", "quantity": "10", "cash": "9000"}, "unsupported"),
+    ("NVDA:10", "invalid"), ([], "invalid"),
+])
+def test_standard_snapshot_deliverable_blocks_consumers_and_preserves_evidence(deliverable, error_kind) -> None:
+    instrument = {
+        "asset_type": "option", "symbol": "NVDA", "market": "US", "currency": "USD",
+        "option_type": "put", "strike": "100", "expiration_ymd": "2026-09-18", "multiplier": "100",
+    }
+    if deliverable is not None:
+        instrument["deliverable"] = deliverable
+    standard = {**_snapshot(), "rows": [{"instrument_ref": instrument, "position_side": "short", "quantity": "1"}]}
+    original = deepcopy(standard)
+    normalized = normalize_position_snapshot_input(standard)
+    local = {"record_id": "ordinary-lot", "fields": {
+        "account": "lx", "broker": "富途", "symbol": "NVDA", "option_type": "put",
+        "side": "short", "contracts": 1, "contracts_open": 1, "strike": 100,
+        "multiplier": 100, "expiration_ymd": "2026-09-18", "status": "open",
+    }}
+    result = _dataset(standard, local_lots=[local])
+    assert standard == original
+    assert normalized["rows"][0]["instrument_ref"].get("deliverable") == deliverable
+    if error_kind:
+        reason = f"{error_kind}:rows.0.instrument_ref.deliverable"
+        assert reason in normalized["errors"]
+        assert reason in result["checks"][0]["observed"]["snapshot_errors"]
+        assert result["status"] == "unavailable"
+        assert result["usable_for"] == []
+        assert set(result["blocked_consumers"]) == {"option_position_report", "lifecycle", "close_advice"}
+    else:
+        assert normalized["errors"] == []
+        assert result["status"] == "trusted"
+        assert set(result["usable_for"]) == {"option_position_report", "lifecycle", "close_advice"}
+
+
+@pytest.mark.parametrize("invalid", ["partial", "filtered", "stale_source", "wrong_account", "wrong_environment"])
+def test_stock_capacity_uses_snapshot_scope_and_preserves_source_cost(monkeypatch, invalid: str) -> None:
+    import src.application.futu_portfolio_context as module
+
+    monkeypatch.setattr(module, "datetime", _FrozenDatetime)
+    raw_rows = [{"code": "US.NVDA", "qty": 100, "can_sell_qty": 100, "average_cost": 20, "cost_price": 1, "sec_type": "STOCK"}]
+    snapshot = _futu_snapshot(raw_rows)
+    if invalid == "partial":
+        snapshot["completeness"] = "partial"
+    elif invalid == "filtered":
+        snapshot["scope"]["filtered"] = True
+    elif invalid == "stale_source":
+        snapshot["source_as_of_utc"] = (NOW - timedelta(days=1)).isoformat()
+    elif invalid == "wrong_account":
+        snapshot["broker_account_ref"]["external_account_id"] = "456"
+    else:
+        snapshot["broker_account_ref"]["environment"] = "SIMULATE"
+    context = _portfolio_context(snapshot, position_rows=[{**raw_rows[0], "qty": 1000}])
+    stock = context["stocks_by_symbol"]["NVDA"]
+    assert stock["shares"] == 100
+    assert stock["avg_cost"] == 20
+    assert stock["can_sell_qty"] is None
+    assert stock["eligible_underlying_shares"] is None
+    assert stock["capacity_authority_status"] == "unavailable"
+
+
+def test_futu_snapshot_identifies_quantity_and_never_combines_physical_accounts() -> None:
+    first = _futu_snapshot([{"code": "US.NVDA", "qty": 100, "provider_time": NOW}])
+    second = _futu_snapshot([{"code": "US.NVDA", "qty": 200}])
+    assert first["snapshot_id"] != second["snapshot_id"]
+    evidence = first["source_evidence"]
+    assert first["evidence_refs"] == [evidence[0]["evidence_id"]]
+    assert evidence[0]["schema_version"] == "source_evidence.v1"
+    assert evidence[0]["source"] == "opend"
+    assert evidence[0]["source_id"] == "futu-opend.positions"
+    assert evidence[0]["account"] == "lx"
+    assert evidence[0]["data_type"] == "position"
+    assert evidence[0]["source_record_identity"] == first["snapshot_id"]
+    assert evidence[0]["adapter_version"] == "om.futu-opend-position.v1"
+    mixed = _futu_snapshot([{"code": "US.NVDA", "qty": 100, "acc_id": "123"}, {"code": "US.NVDA", "qty": 200, "acc_id": "456"}])
+    assert mixed["errors"] == ["position_row_account_mismatch:1"]
+    assert mixed["rows"][0]["quantity"] == "100"
+    assert len(mixed["source_payload"]["rows"]) == 2
+
+
+@pytest.mark.parametrize(("quantity", "whole_shares"), [("100", 100), ("99.999999999999999999", 99)])
+def test_complete_stock_snapshot_supplies_only_proven_whole_share_capacity(monkeypatch, quantity: str, whole_shares: int) -> None:
+    import src.application.futu_portfolio_context as module
+
+    monkeypatch.setattr(module, "datetime", _FrozenDatetime)
+    snapshot = _futu_snapshot([{"code": "US.NVDA", "qty": quantity, "can_sell_qty": quantity, "average_cost": 20}])
+    context = _portfolio_context(snapshot)
+    assert context["position_snapshot_input"]["rows"][0]["quantity"] == quantity
+    stock = context["stocks_by_symbol"]["NVDA"]
+    assert stock["capacity_authority_status"] == "available"
+    assert stock["eligible_underlying_shares"] == whole_shares
+    assert stock["avg_cost"] == 20
+
+
+@pytest.mark.parametrize(('side', 'quantity', 'sellable', 'valid'), [
+    ('short', -2, -1, True), ('short', -2, 0, True),
+    ('short', -2, 1, True), ('long', 2, 1, True),
+    ('long', 2, -1, False), ('long', -2, -1, False),
+    ('short', -2, -3, False), ('long', 2, 3, False),
+    ('short', -2, '-0.5', False), ('short', -2, True, False),
+    ('short', -2, 'NaN', False), ('short', -2, 'Infinity', False),
+    ('short', -2, 'invalid', False),
+])
+def test_futu_available_contracts_preserve_direction_and_quantity_validation(
+    side, quantity, sellable, valid,
+) -> None:
+    row = {
+        'code': 'US.NVDA260918P100000', 'stock_owner': 'US.NVDA',
+        'sec_type': 'OPTION', 'option_type': 'PUT', 'position_side': side,
+        'qty': quantity, 'can_sell_qty': sellable, 'option_strike_price': 100,
+        'strike_time': '2026-09-18', 'option_contract_multiplier': 100,
+    }
+    snapshot = _futu_snapshot([row], asset_types=['option'])
+    assert bool(snapshot['errors']) is not valid
+    assert snapshot['rows'][0]['source_row'] == row
+    if valid:
+        assert snapshot['rows'][0]['sellable_quantity'] == str(abs(sellable))
+        assert _scope_errors(snapshot) == []

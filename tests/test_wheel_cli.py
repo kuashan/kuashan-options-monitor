@@ -1,0 +1,1367 @@
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+import src.application.config_authoring_transaction as config_transaction
+import src.application.wheel.workflows as wheel_workflows
+import src.interfaces.cli.main as cli_main
+import src.interfaces.cli.wheel as wheel_cli
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.config_authoring_transaction import publish_yaml_config_generation
+from src.application.config_yaml import build_yaml_runtime_config_file
+from src.application.ledger.repository import SQLiteOptionPositionsRepository
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _activation_environment(
+    tmp_path: Path, *, initialize_db: bool = True
+) -> tuple[Path, Path, Path, Path]:
+    source = tmp_path / "config.yaml"
+    doc = {
+        "accounts": {
+            "lx": {"type": "futu", "futu_account_id": "12345678", "futu": {"host": "127.0.0.1", "port": 11111}},
+            "sy": {"type": "futu", "futu_account_id": "REAL_87654321", "futu": {"host": "127.0.0.1", "port": 11112}},
+        },
+        "markets": {
+            "us": {
+                "accounts": ["lx", "sy"],
+                "features": {
+                    "wheel": {
+                        "accounts": ["sy"],
+                        "call": {"min_dte": 21},
+                    }
+                },
+                "symbols": ["NVDA"],
+            }
+        },
+    }
+    source.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    publish_yaml_config_generation(
+        repo_root=REPO_ROOT,
+        config_yaml_path=source,
+        config_doc=doc,
+        runtime_root=tmp_path,
+        markets=["us"],
+        include_bot=False,
+        apply=True,
+        backup=False,
+    )
+    runtime = tmp_path / "config.us.json"
+    data_config = tmp_path / "portfolio.runtime.json"
+    sqlite_path = tmp_path / "output_shared" / "state" / "option_positions.sqlite3"
+    if initialize_db:
+        SQLiteOptionPositionsRepository(sqlite_path)
+    return source, runtime, data_config, sqlite_path
+
+
+def _activation_args(
+    action: str,
+    *,
+    runtime: Path,
+    data_config: Path,
+    runtime_root: Path,
+    account: str = "lx",
+    generation: int = 0,
+    request_id: str = "request-1",
+    source_sha: str | None = None,
+    apply: bool = False,
+) -> list[str]:
+    values = [
+        "activation",
+        action,
+        "--market",
+        "us",
+        "--account",
+        account,
+        "--config",
+        str(runtime),
+        "--data-config",
+        str(data_config),
+        "--runtime-root",
+        str(runtime_root),
+    ]
+    if action == "status":
+        return values
+    values += [
+        "--expected-current-generation",
+        str(generation),
+        "--request-id",
+        request_id,
+        "--actor",
+        "tester",
+    ]
+    if source_sha:
+        values += ["--expected-source-sha256", source_sha]
+    if apply:
+        values += ["--apply", "--confirm"]
+    return values
+
+
+def _activation_cli(action: str, **kwargs: Any) -> dict[str, Any]:
+    return wheel_cli.execute(wheel_cli.parse_args(_activation_args(action, **kwargs)))
+
+
+def _apply_activation(
+    action: str,
+    *,
+    runtime: Path,
+    data_config: Path,
+    runtime_root: Path,
+    generation: int,
+    request_id: str,
+) -> dict[str, Any]:
+    preview = _activation_cli(
+        action,
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=runtime_root,
+        generation=generation,
+        request_id=request_id,
+    )
+    return _activation_cli(
+        action,
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=runtime_root,
+        generation=generation,
+        request_id=request_id,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+    )
+
+
+def _prepare_activation_storage_case(
+    tmp_path: Path,
+    case: str,
+) -> tuple[Path, Path, Path, Path]:
+    source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path,
+        initialize_db=case in {"available_no_window", "closed", "open"},
+    )
+    if case == "missing_table":
+        sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(sqlite_path) as conn:
+            conn.execute("CREATE TABLE unrelated (value INTEGER)")
+    elif case == "unreadable":
+        sqlite_path.mkdir(parents=True)
+    elif case in {"closed", "open"}:
+        _apply_activation(
+            "enable",
+            runtime=runtime,
+            data_config=data_config,
+            runtime_root=tmp_path,
+            generation=0,
+            request_id="status-enable",
+        )
+    if case == "closed":
+        _apply_activation(
+            "disable",
+            runtime=runtime,
+            data_config=data_config,
+            runtime_root=tmp_path,
+            generation=1,
+            request_id="status-disable",
+        )
+    return source, runtime, data_config, sqlite_path
+
+
+def _stage_activation_journal(
+    runtime_root: Path,
+    *,
+    symbol: str,
+    audit_id: str,
+    extra_targets: list[dict[str, Any]] | None = None,
+) -> tuple[Path, bytes, list[dict[str, Any]]]:
+    source = runtime_root / "config.yaml"
+    doc = yaml.safe_load(source.read_text(encoding="utf-8"))
+    doc["markets"]["us"]["symbols"].append(symbol)
+    after_bytes = config_transaction._yaml_bytes(doc)
+    prepared = config_transaction._prepare_generation(
+        repo_root=REPO_ROOT,
+        source_path=source,
+        source_bytes=after_bytes,
+        runtime_root=runtime_root,
+        markets=["us"],
+        include_bot=False,
+    )
+    targets = [
+        *prepared["target_payloads"],
+        *(extra_targets or []),
+        {
+            "role": "config_yaml",
+            "path": source,
+            "payload": after_bytes,
+            "source": True,
+        },
+    ]
+    manifest = config_transaction._prepare_transaction_manifest(
+        transaction_dir=(
+            runtime_root
+            / "output_shared"
+            / "state"
+            / "config_authoring_transactions"
+            / audit_id
+        ),
+        audit_id=audit_id,
+        source_path=source,
+        before_source_sha=config_transaction.config_source_sha256(source),
+        after_source_sha=config_transaction._bytes_sha256(after_bytes),
+        targets=targets,
+    )
+    config_transaction._set_manifest_phase(manifest, "committing")
+    return manifest, after_bytes, targets
+
+
+def _run_public_wheel_cli(args: list[str], capsys: pytest.CaptureFixture[str]):
+    exit_code = cli_main.main(["wheel", *args, "--format", "json"])
+    return exit_code, json.loads(capsys.readouterr().out)
+
+
+def _run_activation_cli(action: str, *, capsys: pytest.CaptureFixture[str], **kwargs: Any):
+    return _run_public_wheel_cli(_activation_args(action, **kwargs), capsys)
+
+
+def _deployment_tree(runtime_root: Path) -> dict[str, object]:
+    return {
+        str(path.relative_to(runtime_root)): (
+            "directory" if path.is_dir() else path.read_bytes()
+        )
+        for path in runtime_root.rglob("*")
+    }
+
+
+def _deployment_file_bytes(runtime_root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(runtime_root)): path.read_bytes()
+        for path in runtime_root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _malformed_activation_status_environment(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, dict[str, Any]]:
+    _source, runtime, data_config, sqlite_path = _activation_environment(tmp_path)
+    enabled = _apply_activation(
+        "enable",
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=tmp_path,
+        generation=0,
+        request_id="malformed-status-enable",
+    )
+    _stage_activation_journal(
+        tmp_path,
+        symbol="AMD",
+        audit_id="malformed-status-pending",
+    )
+    config = json.loads(runtime.read_text(encoding="utf-8"))
+    config["wheel"]["activation_by_account"]["lx"] = {"generation": 1}
+    runtime.write_text(json.dumps(config), encoding="utf-8")
+    original = enabled["expected_config_descriptor"]
+    expected_status_window = {
+        **original,
+        "effective_policy_hash": original["policy_sha256"],
+        "policy_binding_revision": 0,
+    }
+    return runtime, data_config, sqlite_path, expected_status_window
+
+
+def _enable_for_account(
+    account: str,
+    *,
+    runtime: Path,
+    data_config: Path,
+    runtime_root: Path,
+    request_id: str,
+) -> dict[str, Any]:
+    preview = _activation_cli(
+        "enable",
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=runtime_root,
+        account=account,
+        request_id=request_id,
+    )
+    return _activation_cli(
+        "enable",
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=runtime_root,
+        account=account,
+        request_id=request_id,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+    )
+
+
+def _drifted_activation_environment(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path, Path]:
+    """An open `sy` window whose rebuilt snapshot carries a different policy hash."""
+
+    source, runtime, data_config, sqlite_path = _activation_environment(tmp_path)
+    _enable_for_account(
+        "sy",
+        runtime=runtime,
+        data_config=data_config,
+        runtime_root=tmp_path,
+        request_id="drift-enable",
+    )
+    doc = yaml.safe_load(source.read_text(encoding="utf-8"))
+    doc["markets"]["us"]["features"]["wheel"]["call"]["min_dte"] = 30
+    source.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
+    rebuilt = build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=source,
+        output_config_path=runtime,
+        dry_run=False,
+    )
+    assert rebuilt["write_applied"] is True
+    return source, runtime, data_config, sqlite_path
+
+
+def _deployment_args(runtime: Path, data_config: Path, runtime_root: Path) -> list[str]:
+    return [
+        "--config", str(runtime),
+        "--data-config", str(data_config),
+        "--runtime-root", str(runtime_root),
+    ]
+
+
+def _accept_policy_args(*extra: str) -> list[str]:
+    return ["activation", "accept-policy", "--market", "us", "--actor", "tester", *extra]
+
+
+def _end_args(*extra: str):
+    return wheel_cli.parse_args(
+        [
+            "end",
+            "--account",
+            "lx",
+            "--stock-lot-id",
+            "assigned-stock-1",
+            "--expected-batch-generation-hash",
+            "generation-1",
+            "--request-id",
+            "request-1",
+            "--actor",
+            "tester",
+            "--config-key",
+            "us",
+            *extra,
+        ]
+    )
+
+
+def _branch_args(action: str, *extra: str):
+    return wheel_cli.parse_args(
+        [
+            "branch",
+            action,
+            "--account",
+            "lx",
+            "--stock-lot-id",
+            "assigned-stock-1",
+            "--expected-batch-generation-hash",
+            "branch-generation-1",
+            "--request-id",
+            "request-1",
+            "--actor",
+            "tester",
+            "--config-key",
+            "us",
+            *extra,
+        ]
+    )
+
+
+def _put_linkage_args(action: str, *extra: str):
+    args = [
+        "linkage",
+        action,
+        "--account",
+        "lx",
+        "--wheel-branch-id",
+        "wheel-put-1",
+        "--direction",
+        "put",
+        "--expected-batch-generation-hash",
+        "generation-1",
+        "--request-id",
+        "request-1",
+        "--actor",
+        "tester",
+        "--option-record-id",
+        "put-lot-1",
+        "--linkage-candidate-id",
+        "candidate-1",
+        "--expected-input-hash",
+        "input-1",
+        "--config-key",
+        "us",
+    ]
+    if action == "reject":
+        args.extend(("--reason", "not this cycle"))
+    return wheel_cli.parse_args([*args, *extra])
+
+
+def _stub_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        wheel_cli,
+        "load_runtime_config",
+        lambda **_kwargs: (tmp_path / "config.us.json", {"portfolio": {}}),
+    )
+    monkeypatch.setattr(
+        wheel_cli,
+        "resolve_position_data_config_path",
+        lambda **_kwargs: tmp_path / "portfolio.runtime.json",
+    )
+    monkeypatch.setattr(
+        wheel_cli,
+        "open_position_ledger_from_runtime_config",
+        lambda **_kwargs: (tmp_path / "portfolio.runtime.json", object()),
+    )
+
+
+def test_wheel_cli_end_previews_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls = []
+    _stub_runtime(monkeypatch, tmp_path)
+
+    def _end(_repo, **kwargs):
+        calls.append(kwargs)
+        return {"dry_run": True, "write_applied": False}
+
+    monkeypatch.setattr(wheel_cli, "end_wheel_lifecycle", _end)
+
+    assert wheel_cli.execute(_end_args()) == {"dry_run": True, "write_applied": False}
+    assert calls[0]["apply_changes"] is False
+    assert calls[0]["lot_id"] == "assigned-stock-1"
+
+
+def test_wheel_cli_requires_apply_with_confirmation() -> None:
+    with pytest.raises(SystemExit, match="require --apply"):
+        wheel_cli.execute(_end_args("--confirm"))
+
+
+def test_wheel_cli_branch_resolves_legacy_call_alias_and_previews(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_runtime(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        wheel_cli,
+        "build_wheel_read_model",
+        lambda *_args, **_kwargs: {
+            "wheel_branches": [
+                {
+                    "wheel_branch_id": "wheel-call-1",
+                    "direction": "call",
+                    "stock_lot_id": "assigned-stock-1",
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        wheel_cli,
+        "resolve_wheel_config",
+        lambda *_args, **_kwargs: {
+            "market": "us",
+            "activation_descriptor": {"generation": 1},
+            "account_configured": True,
+            "policy_sha256": "a" * 64,
+        },
+    )
+
+    def _decide(_repo, **kwargs):
+        calls.append(kwargs)
+        return {"dry_run": True, "write_applied": False}
+
+    monkeypatch.setattr(wheel_cli.wheel_application, "decide_wheel_branch", _decide)
+
+    assert wheel_cli.execute(_branch_args("start"))["dry_run"] is True
+    assert calls == [
+        {
+            "account": "lx",
+            "wheel_branch_id": "wheel-call-1",
+            "decision": "start",
+            "expected_batch_generation_hash": "branch-generation-1",
+            "request_id": "request-1",
+            "actor": "tester",
+            "market": "us",
+            "apply_changes": False,
+            "as_of_ms": calls[0]["as_of_ms"],
+            "market": "us",
+            "activation_descriptor": {"generation": 1},
+            "account_configured": True,
+            "policy_sha256": "a" * 64,
+        }
+    ]
+
+
+def test_wheel_cli_branch_identity_is_exactly_one() -> None:
+    with pytest.raises(SystemExit):
+        wheel_cli.parse_args(
+            [
+                "branch",
+                "end",
+                "--account",
+                "lx",
+                "--wheel-branch-id",
+                "branch-1",
+                "--stock-lot-id",
+                "lot-1",
+                "--expected-batch-generation-hash",
+                "generation-1",
+                "--request-id",
+                "request-1",
+                "--actor",
+                "tester",
+                "--config-key",
+                "us",
+            ]
+        )
+
+
+def test_wheel_cli_branch_apply_requires_confirmation() -> None:
+    with pytest.raises(SystemExit, match="use --confirm or --yes"):
+        wheel_cli.execute(_branch_args("end", "--apply"))
+
+
+def test_wheel_cli_activation_apply_requires_preview_source_sha() -> None:
+    args = wheel_cli.parse_args(
+        [
+            "activation",
+            "enable",
+            "--market",
+            "us",
+            "--account",
+            "lx",
+            "--expected-current-generation",
+            "0",
+            "--request-id",
+            "enable-1",
+            "--actor",
+            "tester",
+            "--apply",
+            "--confirm",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="expected-source-sha256"):
+        wheel_cli.execute(args)
+
+
+def test_wheel_cli_activation_status_and_enable_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        wheel_cli,
+        "_open_runtime",
+        lambda *_args, **_kwargs: pytest.fail("activation must use the shared facade"),
+    )
+
+    def _change(**kwargs):
+        calls.append(kwargs)
+        return {"dry_run": True, "write_applied": False}
+
+    monkeypatch.setattr(wheel_cli.wheel_application, "change_wheel_activation", _change)
+
+    status = wheel_cli.parse_args(
+        ["activation", "status", "--market", "us", "--account", "lx"]
+    )
+    enable = wheel_cli.parse_args(
+        [
+            "activation",
+            "enable",
+            "--market",
+            "us",
+            "--account",
+            "lx",
+            "--expected-current-generation",
+            "0",
+            "--request-id",
+            "enable-1",
+            "--actor",
+            "tester",
+            "--expected-source-sha256",
+            "b" * 64,
+        ]
+    )
+
+    assert wheel_cli.execute(status)["dry_run"] is True
+    assert wheel_cli.execute(enable)["dry_run"] is True
+    assert calls == [
+        {
+            "repo_root": Path(wheel_cli.__file__).resolve().parents[3],
+            "action": "status",
+            "market": "us",
+            "account": "lx",
+            "config_path": None,
+            "config_key": "us",
+            "data_config": None,
+            "runtime_root": None,
+            "expected_current_generation": None,
+            "request_id": None,
+            "actor": None,
+            "expected_source_sha256": None,
+            "apply_changes": False,
+        },
+        {
+            "repo_root": Path(wheel_cli.__file__).resolve().parents[3],
+            "action": "enable",
+            "market": "us",
+            "account": "lx",
+            "config_path": None,
+            "config_key": "us",
+            "data_config": None,
+            "runtime_root": None,
+            "expected_current_generation": 0,
+            "request_id": "enable-1",
+            "actor": "tester",
+            "expected_source_sha256": "b" * 64,
+            "apply_changes": False,
+        },
+    ]
+
+
+def test_wheel_cli_activation_json_uses_existing_formatter(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = {
+        "status": "closed",
+        "paths": {"config_path": "/runtime/config.us.json"},
+        "readiness": {"monitoring_gate": "disabled"},
+    }
+    monkeypatch.setattr(
+        wheel_cli.wheel_application,
+        "change_wheel_activation",
+        lambda **_kwargs: result,
+    )
+
+    assert wheel_cli.main(
+        [
+            "activation",
+            "status",
+            "--market",
+            "us",
+            "--account",
+            "lx",
+            "--format",
+            "json",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize(
+    ("account", "mismatched_runtime_root", "message"),
+    [
+        ("lx", True, "different deployments"),
+        ("unknown", False, "account is not configured"),
+    ],
+)
+def test_public_wheel_cli_maps_activation_input_errors_without_writes(
+    account: str,
+    mismatched_runtime_root: bool,
+    message: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path,
+        initialize_db=False,
+    )
+    before = _deployment_tree(tmp_path)
+    runtime_root = tmp_path / "other-deployment" if mismatched_runtime_root else tmp_path
+
+    exit_code, payload = _run_activation_cli(
+        "status", runtime=runtime, data_config=data_config, runtime_root=runtime_root,
+        account=account,
+        capsys=capsys,
+    )
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["tool_name"] == "wheel"
+    assert payload["error"] == {
+        "code": "INPUT_ERROR",
+        "message": payload["error"]["message"],
+    }
+    assert message in payload["error"]["message"]
+    assert _deployment_tree(tmp_path) == before
+    assert not sqlite_path.exists()
+
+
+def test_wheel_cli_activation_public_entry_completes_full_lifecycle(
+    tmp_path: Path,
+) -> None:
+    source, runtime, data_config, sqlite_path = _activation_environment(tmp_path)
+
+    enable_preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    enabled = _activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=enable_preview["expected_source_sha256"],
+        apply=True,
+    )
+    replayed = _activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=enable_preview["expected_source_sha256"],
+        apply=True,
+    )
+
+    assert enabled["status"] == "applied"
+    assert enabled["ready"] is True
+    assert enabled["membership"] is True
+    assert enabled["window_receipt"]["expected_config_descriptor"]["generation"] == 1
+    original_descriptor = enabled["window_receipt"]["expected_config_descriptor"]
+    assert "effective_policy_hash" not in original_descriptor
+    assert "policy_binding_revision" not in original_descriptor
+    assert enabled["current_window"] == {
+        **original_descriptor,
+        "effective_policy_hash": original_descriptor["policy_sha256"],
+        "policy_binding_revision": 0,
+    }
+    assert enabled["config_audit"]["write_applied"] is True
+    assert replayed["status"] == "idempotent"
+    assert replayed["window_receipt"]["expected_config_descriptor"] == (
+        enabled["window_receipt"]["expected_config_descriptor"]
+    )
+    assert replayed["write_applied"] is False
+
+    disable_preview = _activation_cli(
+        "disable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        generation=1,
+        request_id="disable-1",
+    )
+    disabled = _activation_cli(
+        "disable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        generation=1,
+        request_id="disable-1",
+        source_sha=disable_preview["expected_source_sha256"],
+        apply=True,
+    )
+    assert disabled["status"] == "applied"
+    assert disabled["ready"] is False
+    assert disabled["monitoring_gate"] == "disabled"
+    assert disabled["reason_code"] == "closed_window"
+
+    reenable_preview = _activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        generation=1,
+        request_id="enable-2",
+    )
+    reenabled = _activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        generation=1,
+        request_id="enable-2",
+        source_sha=reenable_preview["expected_source_sha256"],
+        apply=True,
+    )
+    assert reenabled["status"] == "applied"
+    assert reenabled["ready"] is True
+    assert reenabled["latest_window"]["generation"] == 2
+    history = SQLiteOptionPositionsRepository(sqlite_path).list_wheel_activation_windows(
+        market="us", account="lx"
+    )
+    assert len(history) == 2
+    assert history[0]["deactivated_at_ms"] is not None
+    assert history[1]["deactivated_at_ms"] is None
+    wheel = yaml.safe_load(source.read_text(encoding="utf-8"))["markets"]["us"][
+        "features"
+    ]["wheel"]
+    assert set(wheel["accounts"]) == {"lx", "sy"}
+    assert wheel["call"]["min_dte"] == 21
+
+
+def test_public_wheel_cli_preserves_committed_window_config_failure_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path, initialize_db=False
+    )
+    preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    publisher = config_transaction.publish_yaml_config_generation_locked
+    monkeypatch.setattr(
+        config_transaction,
+        "publish_yaml_config_generation_locked",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AgentToolError(
+                code="CONFIG_WRITE_FAILED",
+                message="injected config interruption",
+                details={"write_applied": False, "targets": []},
+            )
+        ),
+    )
+
+    args = _activation_args(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+    )
+    exit_code, payload = _run_public_wheel_cli(args, capsys)
+
+    assert exit_code == 2
+    assert payload["ok"] is False
+    assert payload["tool_name"] == "wheel"
+    assert payload["error"]["code"] == "CONFIG_WRITE_FAILED"
+    details = payload["error"]["details"]
+    assert details["failure_phase"] == "config_publish"
+    assert details["window_receipt"]["write_applied"] is True
+    assert details["config_audit"] == {"write_applied": False, "targets": []}
+    assert details["write_applied"] is True
+    assert details["original_request"] == {
+        "action": "enable",
+        "market": "us",
+        "account": "lx",
+        "request_id": "request-1",
+        "actor": "tester",
+        "expected_current_generation": 0,
+        "policy_sha256": details["original_request"]["policy_sha256"],
+    }
+    assert "same request_id" in details["retry_hint"]
+
+    monkeypatch.setattr(
+        config_transaction,
+        "publish_yaml_config_generation_locked",
+        publisher,
+    )
+    retry_preview = wheel_cli.execute(wheel_cli.parse_args(args[:-2]))
+    retried = _activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=retry_preview["expected_source_sha256"],
+        apply=True,
+    )
+    rows = SQLiteOptionPositionsRepository(sqlite_path).list_wheel_activation_windows(
+        market="us", account="lx"
+    )
+    assert retry_preview["status"] == "configuration_pending"
+    assert retried["ready"] is True
+    assert retried["window_receipt"]["write_applied"] is False
+    assert len(rows) == 1
+
+
+def test_public_wheel_cli_preserves_readback_failure_and_idempotent_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(tmp_path)
+    preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    original_status = wheel_workflows._activation_status
+    failed = False
+
+    def _fail_after_publish(cfg, **kwargs):
+        nonlocal failed
+        if cfg["wheel"].get("activation_by_account") and not failed:
+            failed = True
+            raise OSError("injected readback failure")
+        return original_status(cfg, **kwargs)
+
+    monkeypatch.setattr(wheel_workflows, "_activation_status", _fail_after_publish)
+    args = _activation_args(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+    )
+
+    exit_code, payload = _run_public_wheel_cli(args, capsys)
+
+    assert exit_code == 2
+    details = payload["error"]["details"]
+    assert details["failure_phase"] == "readback"
+    assert details["window_receipt"]["write_applied"] is True
+    assert details["config_audit"]["write_applied"] is True
+    assert details["write_applied"] is True
+    assert details["original_request"]["request_id"] == "request-1"
+    assert "same request_id" in details["retry_hint"]
+
+    retried = wheel_cli.execute(wheel_cli.parse_args(args))
+    rows = SQLiteOptionPositionsRepository(sqlite_path).list_wheel_activation_windows(
+        market="us", account="lx"
+    )
+    assert retried["status"] == "idempotent"
+    assert retried["write_applied"] is False
+    assert len(rows) == 1
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status", "storage_status"),
+    [
+        ("missing_database", "unavailable", "missing_database"),
+        ("missing_table", "unavailable", "missing_table"),
+        ("unreadable", "unavailable", "unreadable"),
+        ("available_no_window", "no_window", "available"),
+        ("open", "open", "available"),
+        ("closed", "closed", "available"),
+    ],
+)
+def test_public_wheel_cli_activation_status_distinguishes_storage_and_window_state(
+    case: str,
+    expected_status: str,
+    storage_status: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _prepare_activation_storage_case(
+        tmp_path,
+        case,
+    )
+
+    exit_code, result = _run_activation_cli("status", runtime=runtime, data_config=data_config, runtime_root=tmp_path, capsys=capsys)
+
+    assert exit_code == 0
+    assert result["status"] == expected_status
+    assert result["storage_status"] == storage_status
+    assert result["source_status"] == "available"
+    assert result["pending_authoring_journal"] is False
+    if case == "missing_database":
+        assert not sqlite_path.exists()
+        assert not sqlite_path.with_name(sqlite_path.name + "-wal").exists()
+        assert not sqlite_path.with_name(sqlite_path.name + "-shm").exists()
+
+
+def test_public_wheel_cli_status_keeps_invalid_scope_when_database_is_missing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path, initialize_db=False,
+    )
+    config = json.loads(runtime.read_text(encoding="utf-8"))
+    config["wheel"]["accounts"] = "lx"
+    runtime.write_text(json.dumps(config), encoding="utf-8")
+
+    exit_code, status = _run_activation_cli(
+        "status", runtime=runtime, data_config=data_config,
+        runtime_root=tmp_path, capsys=capsys,
+    )
+
+    assert exit_code == 0
+    assert status["storage_status"] == "missing_database"
+    assert status["monitoring_gate"] == "config_mismatch"
+    assert status["reason_code"] == "invalid_account_scope"
+    assert not sqlite_path.exists()
+
+
+def test_public_wheel_cli_status_preserves_known_window_for_malformed_descriptor(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime, data_config, _sqlite_path, expected_window = (
+        _malformed_activation_status_environment(tmp_path)
+    )
+    before = _deployment_file_bytes(tmp_path)
+
+    exit_code, status = _run_activation_cli("status", runtime=runtime, data_config=data_config, runtime_root=tmp_path, capsys=capsys)
+
+    assert exit_code == 0
+    assert status["current_window"] == expected_window
+    assert status["latest_window"] == expected_window
+    assert status["membership"] is True
+    assert status["ready"] is False
+    assert status["monitoring_gate"] == "config_mismatch"
+    assert status["reason_code"] == "descriptor_mismatch"
+    # A descriptor that cannot be parsed is not drift: no policy rebind can clear it, so the
+    # gate must not advertise one.
+    assert status["policy_drift"] is False
+    assert status.get("remediation_command") is None
+    assert status["pending_authoring_journal"] is True
+    assert _deployment_file_bytes(tmp_path) == before
+
+
+def test_public_wheel_cli_status_offers_accept_policy_for_pure_policy_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, _sqlite_path = _drifted_activation_environment(tmp_path)
+    before = _deployment_file_bytes(tmp_path)
+
+    exit_code, status = _run_activation_cli(
+        "status", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        account="sy",
+        capsys=capsys,
+    )
+
+    assert exit_code == 0
+    assert status["ready"] is False
+    assert status["monitoring_gate"] == "config_mismatch"
+    assert status["reason_code"] == "descriptor_mismatch"
+    assert status["policy_drift"] is True
+    command = status["remediation_command"]
+    assert "wheel activation accept-policy" in command
+    assert "--market us" in command
+    assert "--apply --confirm" in command
+    assert str(runtime) in command
+    assert str(tmp_path) in command
+    assert _deployment_file_bytes(tmp_path) == before
+
+
+def test_public_wheel_cli_accept_policy_dry_run_then_apply(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, runtime, data_config, _sqlite_path = _drifted_activation_environment(tmp_path)
+    runtime_args = _deployment_args(runtime, data_config, tmp_path)
+    before = _deployment_file_bytes(tmp_path)
+
+    exit_code, planned = _run_public_wheel_cli(
+        _accept_policy_args(*runtime_args),
+        capsys,
+    )
+    assert exit_code == 0
+    assert planned["status"] == "planned"
+    assert planned["dry_run"] is True
+    assert planned["write_applied"] is False
+    assert [item["classification"] for item in planned["plan"]["accounts"]] == ["accept"]
+    assert planned["plan"]["snapshot_stale"] is False
+    assert _deployment_file_bytes(tmp_path) == before
+
+    with pytest.raises(SystemExit):
+        wheel_cli.main([*_accept_policy_args(*runtime_args, "--apply"), "--format", "json"])
+    assert _deployment_file_bytes(tmp_path) == before
+
+    exit_code, applied = _run_public_wheel_cli(
+        _accept_policy_args(*runtime_args, "--apply", "--confirm"),
+        capsys,
+    )
+    assert exit_code == 0
+    assert applied["status"] == "applied"
+    assert applied["write_applied"] is True
+    assert applied["readiness_after"]["monitoring_gate"] == "enabled"
+    assert [item["status"] for item in applied["accounts"]] == ["applied"]
+    # The snapshot already matched the YAML, so neither run rebuilt it and the plan the
+    # operator saw is byte-identical with the plan that was applied.
+    assert applied["snapshot"]["written"] is False
+    assert applied["plan_hash"] == planned["plan_hash"]
+
+
+def test_public_wheel_cli_accept_policy_text_renders_the_new_keys(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, _sqlite_path = _drifted_activation_environment(tmp_path)
+
+    exit_code = cli_main.main(
+        [
+            "wheel",
+            *_accept_policy_args(*_deployment_args(runtime, data_config, tmp_path)),
+            "--format", "text",
+        ]
+    )
+    printed = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "status: planned" in printed
+    assert "write_applied: False" in printed
+    assert "plan_hash: " in printed
+    assert "readiness_after: " in printed
+
+
+def test_public_wheel_cli_rolls_forward_journal_before_stale_preview_rejection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path, initialize_db=False
+    )
+    preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    manifest, after_bytes, targets = _stage_activation_journal(
+        tmp_path,
+        symbol="AMD",
+        audit_id="cli-roll-forward",
+    )
+    (tmp_path / "config.yaml").write_bytes(after_bytes)
+
+    exit_code, payload = _run_activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+        capsys=capsys,
+    )
+
+    assert exit_code == 2
+    assert payload["error"]["code"] == "STALE_PREVIEW"
+    details = payload["error"]["details"]
+    assert details["failure_phase"] == "source_validation"
+    assert details["window_receipt"] is None
+    assert details["write_applied"] is True
+    assert details["pending_authoring_journal"] is False
+    assert details["recovered_transactions"][0]["mode"] == "roll_forward"
+    for target in targets:
+        assert Path(target["path"]).read_bytes() == target["payload"]
+    assert not manifest.exists()
+    assert not sqlite_path.exists()
+
+
+def test_public_wheel_cli_rolls_back_journal_before_stale_preview_rejection(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path, initialize_db=False
+    )
+    stale_preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    current_doc = yaml.safe_load(source.read_text(encoding="utf-8"))
+    current_doc["markets"]["us"]["symbols"].append("AMD")
+    publish_yaml_config_generation(
+        repo_root=REPO_ROOT,
+        config_yaml_path=source,
+        config_doc=current_doc,
+        runtime_root=tmp_path,
+        markets=["us"],
+        include_bot=False,
+        apply=True,
+        backup=False,
+    )
+    before_runtime = runtime.read_bytes()
+    manifest, _after_bytes, targets = _stage_activation_journal(
+        tmp_path,
+        symbol="FUTU",
+        audit_id="cli-roll-back",
+    )
+    for target in targets:
+        if not target.get("source"):
+            Path(target["path"]).write_bytes(target["payload"])
+
+    exit_code, payload = _run_activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=stale_preview["expected_source_sha256"],
+        apply=True,
+        capsys=capsys,
+    )
+
+    assert exit_code == 2
+    assert payload["error"]["code"] == "STALE_PREVIEW"
+    details = payload["error"]["details"]
+    assert details["write_applied"] is True
+    assert details["recovered_transactions"][0]["mode"] == "roll_back"
+    assert details["recovered_transactions"][0]["cleanup"] is True
+    assert runtime.read_bytes() == before_runtime
+    assert not manifest.exists()
+    assert not sqlite_path.exists()
+
+
+def test_public_wheel_cli_reports_partial_recovery_without_writing_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _source, runtime, data_config, sqlite_path = _activation_environment(
+        tmp_path, initialize_db=False
+    )
+    preview = _activation_cli("enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path)
+    extra_target = tmp_path / "recovery-extra.json"
+    extra_target.write_bytes(b'{"old":true}\n')
+    manifest, after_bytes, _targets = _stage_activation_journal(
+        tmp_path,
+        symbol="AMD",
+        audit_id="cli-partial-recovery",
+        extra_targets=[
+            {
+                "role": "runtime_extra",
+                "path": tmp_path / "recovery-extra.json",
+                "payload": b'{"new":true}\n',
+                "source": False,
+            }
+        ],
+    )
+    (tmp_path / "config.yaml").write_bytes(after_bytes)
+    writer = config_transaction._atomic_write_bytes
+
+    def _fail_extra_target(path: Path, payload: bytes) -> None:
+        if path.resolve() == extra_target.resolve():
+            raise OSError("injected recovery interruption")
+        writer(path, payload)
+
+    monkeypatch.setattr(
+        config_transaction,
+        "_atomic_write_bytes",
+        _fail_extra_target,
+    )
+
+    exit_code, payload = _run_activation_cli(
+        "enable", runtime=runtime, data_config=data_config, runtime_root=tmp_path,
+        source_sha=preview["expected_source_sha256"],
+        apply=True,
+        capsys=capsys,
+    )
+
+    assert exit_code == 2
+    assert payload["error"]["code"] == "CONFIG_TRANSACTION_RECOVERY_REQUIRED"
+    details = payload["error"]["details"]
+    assert details["failure_phase"] == "config_recovery"
+    assert details["window_receipt"] is None
+    assert details["write_applied"] is True
+    recovery = details["recovered_transactions"][0]
+    assert recovery["targets"][0]["write_applied"] is True
+    assert any(target["write_applied"] is None for target in recovery["targets"])
+    assert recovery["cleanup"] is False
+    assert extra_target.read_bytes() == b'{"old":true}\n'
+    assert manifest.exists()
+    assert not sqlite_path.exists()
+
+
+def test_wheel_cli_put_linkage_reject_previews_canonical_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_runtime(monkeypatch, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        wheel_cli,
+        "build_wheel_read_model",
+        lambda *_args, **_kwargs: {
+            "wheel_branches": [
+                {
+                    "wheel_branch_id": "wheel-put-1",
+                    "direction": "put",
+                    "stock_lot_id": None,
+                }
+            ]
+        },
+    )
+
+    def _reject(_repo, **kwargs):
+        calls.append(kwargs)
+        return {"dry_run": True, "write_applied": False}
+
+    monkeypatch.setattr(wheel_cli, "reject_wheel_linkage", _reject)
+
+    assert wheel_cli.execute(_put_linkage_args("reject"))["dry_run"] is True
+    assert calls[0] == {
+        "account": "lx",
+        "wheel_branch_id": "wheel-put-1",
+        "direction": "put",
+        "expected_batch_generation_hash": "generation-1",
+        "request_id": "request-1",
+        "actor": "tester",
+        "market": "us",
+        "apply_changes": False,
+        "as_of_ms": calls[0]["as_of_ms"],
+        "option_lot_id": "put-lot-1",
+        "linkage_candidate_id": "candidate-1",
+        "expected_input_hash": "input-1",
+        "reason": "not this cycle",
+    }
+
+
+def test_wheel_cli_put_rejects_legacy_stock_lot_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _stub_runtime(monkeypatch, tmp_path)
+    args = _put_linkage_args("reject")
+    args.wheel_branch_id = None
+    args.stock_lot_id = "legacy-lot"
+    with pytest.raises(ValueError, match="Call-only alias"):
+        wheel_cli.execute(args)
+
+
+@pytest.mark.parametrize(
+    ("command", "extra", "target"),
+    [
+        (["branch", "end"], [], "branch"),
+        (["end"], [], "end"),
+        (["intent", "cancel"], ["--intent-id", "intent-1", "--reason", "cancel"], "intent"),
+        (
+            ["linkage", "reject"],
+            [
+                "--option-record-id", "option-1",
+                "--linkage-candidate-id", "candidate-1",
+                "--expected-input-hash", "input-1",
+                "--reason", "wrong branch",
+            ],
+            "linkage",
+        ),
+    ],
+)
+def test_wheel_cli_config_path_uses_resolved_market(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: list[str],
+    extra: list[str],
+    target: str,
+) -> None:
+    cfg = {"_generated": {"market": "hk"}, "portfolio": {}}
+    repo = object()
+    config_path = tmp_path / "runtime.json"
+    monkeypatch.setattr(wheel_cli, "_open_runtime", lambda *_a, **_k: (config_path, cfg, repo))
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        wheel_cli,
+        "build_wheel_read_model",
+        lambda *_a, **kwargs: (
+            calls.append(("read", kwargs.get("market")))
+            or {"wheel_branches": [{
+                "wheel_branch_id": "branch-1",
+                "stock_lot_id": "assigned-stock-1",
+                "direction": "call",
+            }]}
+        ),
+    )
+
+    def capture(name: str):
+        def fake(_repo, **kwargs):
+            calls.append((name, kwargs.get("market")))
+            return {"dry_run": True, "write_applied": False}
+        return fake
+
+    monkeypatch.setattr(wheel_cli.wheel_application, "decide_wheel_branch", capture("branch"))
+    monkeypatch.setattr(wheel_cli, "end_wheel_lifecycle", capture("end"))
+    monkeypatch.setattr(wheel_cli, "cancel_wheel_intent", capture("intent"))
+    monkeypatch.setattr(wheel_cli, "reject_wheel_linkage", capture("linkage"))
+    args = wheel_cli.parse_args([
+        *command,
+        "--account", "lx",
+        "--stock-lot-id", "assigned-stock-1",
+        "--expected-batch-generation-hash", "generation-1",
+        "--request-id", "request-1",
+        "--actor", "tester",
+        *extra,
+        "--config", str(config_path),
+    ])
+    assert args.config_key is None
+    assert wheel_cli.execute(args)["dry_run"] is True
+    assert calls[-1] == (target, "hk")
+    assert all(market == "hk" for _, market in calls)
+
+
+def test_wheel_cli_explicit_generated_config_reads_market_from_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _source, runtime, data_config, _sqlite_path = _activation_environment(tmp_path)
+    markets: list[str | None] = []
+
+    def end_preview(_repo, **kwargs):
+        markets.append(kwargs.get("market"))
+        return {"dry_run": True, "write_applied": False}
+
+    monkeypatch.setattr(wheel_cli, "end_wheel_lifecycle", end_preview)
+    args = wheel_cli.parse_args([
+        "end",
+        "--account", "lx",
+        "--stock-lot-id", "assigned-stock-1",
+        "--expected-batch-generation-hash", "generation-1",
+        "--request-id", "request-1",
+        "--actor", "tester",
+        "--config", str(runtime),
+        "--data-config", str(data_config),
+        "--runtime-root", str(tmp_path),
+    ])
+    assert args.config_key is None
+    assert wheel_cli.execute(args)["dry_run"] is True
+    assert markets == ["us"]

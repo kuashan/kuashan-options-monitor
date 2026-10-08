@@ -1,0 +1,697 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from domain.domain.ledger.position_fields import (
+    effective_contracts_open,
+    effective_expiration_ymd,
+    effective_strike,
+    exp_ms_to_ymd,
+    normalize_account,
+    normalize_broker,
+    normalize_option_type,
+    normalize_side,
+    normalize_status,
+    parse_exp_to_ms,
+)
+from domain.domain.option_position_identity import normalize_currency
+from domain.domain.symbol_identity import canonical_symbol
+from src.application.ledger.repository import (
+    SQLiteOptionPositionsRepository,
+    require_option_positions_read_repo,
+)
+from src.infrastructure.feishu_bitable import safe_float
+
+
+@dataclass(frozen=True)
+class LotCloseSelector:
+    broker: str
+    account: str
+    symbol: str
+    option_type: str
+    side: str
+    strike: float | None
+    expiration_ymd: str | None
+    contracts_to_close: int
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        broker: Any = "富途",
+        account: Any,
+        symbol: Any,
+        option_type: Any,
+        position_side: Any,
+        strike: Any,
+        expiration_ymd: Any,
+        contracts_to_close: Any,
+    ) -> "LotCloseSelector":
+        return cls(
+            broker=normalize_broker(broker),
+            account=normalize_account(account),
+            symbol=_canonical_selector_symbol(symbol),
+            option_type=normalize_option_type(option_type),
+            side=normalize_side(position_side),
+            strike=float(strike) if strike is not None else None,
+            expiration_ymd=_normalize_selector_expiration(expiration_ymd),
+            contracts_to_close=int(contracts_to_close),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def missing_identity_fields(self) -> list[str]:
+        return [
+            key
+            for key in ("broker", "account", "symbol", "option_type", "side", "strike", "expiration_ymd")
+            if self.to_dict().get(key) in (None, "")
+        ]
+
+
+@dataclass(frozen=True)
+class LotCloseCandidate:
+    lot_id: str
+    broker: str
+    account: str
+    symbol: str
+    option_type: str
+    side: str
+    status: str
+    contracts: int
+    contracts_open: int
+    contracts_closed: Any
+    strike: float | None
+    expiration_ymd: str | None
+    opened_at: int
+    premium: Any
+    currency: Any
+    source_event_id: Any
+    raw_fields: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        # Emitted payload, not a declaration: the candidate row is rendered by
+        # the CLI's MATCH_FAIL list, so its key stays `record_id` even though
+        # the field it reads from converged onto `lot_id`.
+        return {
+            ("record_id" if key == "lot_id" else key): value
+            for key, value in asdict(self).items()
+        }
+
+
+@dataclass(frozen=True)
+class LotCloseMatch:
+    lot_id: str
+    contracts_to_close: int
+    matched_by: str
+    candidate: LotCloseCandidate | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "record_id": self.lot_id,
+            "contracts_to_close": self.contracts_to_close,
+            "matched_by": self.matched_by,
+        }
+        if self.candidate is not None:
+            payload["candidate"] = self.candidate.to_dict()
+        return payload
+
+
+@dataclass(frozen=True)
+class CloseTargetResolution:
+    source: str
+    strategy: str
+    selector: dict[str, Any]
+    matches: tuple[LotCloseMatch, ...]
+
+    @property
+    def lot_ids(self) -> tuple[str, ...]:
+        return tuple(match.lot_id for match in self.matches)
+
+    @property
+    def contracts_to_close(self) -> int:
+        return sum(int(match.contracts_to_close or 0) for match in self.matches)
+
+    @property
+    def single_match(self) -> LotCloseMatch:
+        if len(self.matches) != 1:
+            raise ValueError(f"expected exactly one close target, got {len(self.matches)}")
+        return self.matches[0]
+
+    @property
+    def single_candidate(self) -> LotCloseCandidate:
+        candidate = self.single_match.candidate
+        if candidate is None:
+            raise ValueError("close target resolution is missing candidate details")
+        return candidate
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": "resolved",
+            "source": self.source,
+            "strategy": self.strategy,
+            "selector": dict(self.selector),
+            "target_count": len(self.matches),
+            "record_ids": list(self.lot_ids),
+            "contracts_to_close": int(self.contracts_to_close),
+            "targets": [match.to_dict() for match in self.matches],
+        }
+
+
+class LotCloseResolutionError(ValueError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        selector: LotCloseSelector,
+        candidates: list[LotCloseCandidate] | None = None,
+        remaining_contracts: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.selector = selector
+        self.candidates = list(candidates or [])
+        self.remaining_contracts = remaining_contracts
+
+
+def load_close_candidate_records(repo: Any) -> list[dict[str, Any]]:
+    try:
+        rows = require_option_positions_read_repo(repo).list_position_lots()
+    except Exception:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+def contract_key_from_lot_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """The payload's nested ``contract_key``, or ``{}`` when it is not an object.
+
+    The converged payload (``PositionLot.to_dict()``) carries the option
+    contract under ``contract_key`` instead of as flat ``broker`` / ``account``
+    / ``symbol`` / ``option_type`` / ``strike`` / ``expiration_ymd`` siblings.
+    ``{}`` is the answer for a row that predates the shape switch, which keeps
+    the flat siblings readable for it -- the same "nested first, flat for legacy
+    rows" rule ``domain.domain.ledger.position_fields.effective_*`` states.
+    """
+    contract_key = fields.get("contract_key")
+    return contract_key if isinstance(contract_key, dict) else {}
+
+
+def lot_contract_value(
+    fields: dict[str, Any],
+    contract_key: dict[str, Any],
+    nested_key: str,
+    *flat_keys: str,
+) -> Any:
+    """One contract identity value: the nested key first, the flat siblings after.
+
+    A converged payload answers from ``contract_key``; a legacy flat row has no
+    non-empty nested value and falls through to its retired flat spelling.
+    """
+    value = contract_key.get(nested_key)
+    if value not in (None, ""):
+        return value
+    for flat_key in flat_keys:
+        value = fields.get(flat_key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def lot_payload_int(fields: dict[str, Any], *keys: str) -> int:
+    """The first non-empty numeric value among ``keys`` (converged name first)."""
+    for key in keys:
+        value = safe_float(fields.get(key))
+        if value is not None:
+            return int(value)
+    return 0
+
+
+def normalize_close_candidate(item: dict[str, Any]) -> LotCloseCandidate | None:
+    lot_id = str(item.get("record_id") or item.get("id") or "").strip()
+    fields = item.get("fields") or {}
+    if not lot_id or not isinstance(fields, dict):
+        return None
+    contract_key = contract_key_from_lot_fields(fields)
+    strike = safe_float(contract_key.get("strike"))
+    if strike is None:
+        strike = effective_strike(fields)
+    expiration_ymd = str(contract_key.get("expiration_ymd") or "").strip()
+    if not expiration_ymd:
+        expiration_ymd = effective_expiration_ymd(fields)
+    return LotCloseCandidate(
+        lot_id=lot_id,
+        # No flat ``market`` fallback: a market-only row was never a close
+        # candidate (``test_match_close_positions_ignores_market_only_persisted_rows``),
+        # and the converged payload carries the broker under ``contract_key``.
+        broker=normalize_broker(lot_contract_value(fields, contract_key, "broker", "broker")),
+        account=normalize_account(lot_contract_value(fields, contract_key, "account", "account")),
+        symbol=_canonical_selector_symbol(
+            lot_contract_value(fields, contract_key, "underlying_symbol", "symbol")
+        ),
+        option_type=normalize_option_type(
+            lot_contract_value(fields, contract_key, "option_type", "option_type")
+        ),
+        side=normalize_side(
+            lot_contract_value(fields, contract_key, "position_side", "position_side", "side")
+        ),
+        status=normalize_status(fields.get("status")),
+        # ``contracts`` converged onto ``contracts_opened`` (``effective_contracts``
+        # reads the retired flat spelling and would answer 0 on a converged row).
+        contracts=lot_payload_int(fields, "contracts_opened", "contracts"),
+        contracts_open=effective_contracts_open(fields),
+        contracts_closed=fields.get("contracts_closed"),
+        strike=strike,
+        # Both sides of ``_exact_candidates``' comparison go through the same
+        # normalizer, so a nested ``expiration_ymd`` and a selector built from a
+        # deal's ``expiration_ymd`` compare equal without relying on either
+        # spelling already being canonical.
+        expiration_ymd=_normalize_selector_expiration(expiration_ymd),
+        opened_at=lot_payload_int(fields, "opened_at_ms", "opened_at"),
+        premium=fields.get("premium_open") or fields.get("premium"),
+        currency=fields.get("currency"),
+        source_event_id=fields.get("open_event_id") or fields.get("source_event_id"),
+        raw_fields=dict(fields),
+    )
+
+
+def list_close_candidates(
+    repo: Any,
+    *,
+    account: str | None = None,
+    conn: Any | None = None,
+) -> list[LotCloseCandidate]:
+    rows: list[LotCloseCandidate] = []
+    candidate_repo = getattr(repo, "primary_repo", repo)
+    active_reader = getattr(candidate_repo, "list_active_position_lots", None)
+    source_rows = (
+        active_reader(account=str(account), conn=conn)
+        if (
+            account
+            and callable(active_reader)
+            and type(candidate_repo) is SQLiteOptionPositionsRepository
+        )
+        else load_close_candidate_records(repo)
+    )
+    for item in source_rows:
+        candidate = normalize_close_candidate(item)
+        if candidate is None:
+            continue
+        rows.append(candidate)
+    rows.sort(key=lambda row: (int(row.opened_at or 0), row.lot_id))
+    return rows
+
+
+def resolve_unique_close_lot(
+    repo: Any,
+    selector: LotCloseSelector,
+    *,
+    conn: Any | None = None,
+) -> LotCloseMatch:
+    semantic_candidates = _semantic_candidates(repo, selector, conn=conn)
+    exact_candidates = _exact_candidates(semantic_candidates, selector)
+    eligible_candidates = [
+        row for row in exact_candidates
+        if int(row.contracts_open or 0) >= int(selector.contracts_to_close)
+    ]
+    if not exact_candidates:
+        raise LotCloseResolutionError(
+            "not_found",
+            "no open lot matches the close selector",
+            selector=selector,
+            candidates=semantic_candidates,
+        )
+    if not eligible_candidates:
+        raise LotCloseResolutionError(
+            "insufficient_contracts",
+            "matching lots do not have enough open contracts",
+            selector=selector,
+            candidates=exact_candidates,
+        )
+    if len(eligible_candidates) > 1:
+        raise LotCloseResolutionError(
+            "multiple_matches",
+            "multiple open lots match the close selector",
+            selector=selector,
+            candidates=eligible_candidates,
+        )
+    candidate = eligible_candidates[0]
+    return LotCloseMatch(
+        lot_id=candidate.lot_id,
+        contracts_to_close=int(selector.contracts_to_close),
+        matched_by="strict_contract_unique",
+        candidate=candidate,
+    )
+
+
+def resolve_unique_close_target(
+    repo: Any,
+    selector: LotCloseSelector,
+    *,
+    source: str,
+    conn: Any | None = None,
+) -> CloseTargetResolution:
+    match = resolve_unique_close_lot(repo, selector, conn=conn)
+    return CloseTargetResolution(
+        source=str(source or "unknown"),
+        strategy=match.matched_by,
+        selector=selector.to_dict(),
+        matches=(match,),
+    )
+
+
+def resolve_fifo_close_lots(
+    repo: Any,
+    selector: LotCloseSelector,
+    *,
+    conn: Any | None = None,
+) -> list[LotCloseMatch]:
+    remaining = int(selector.contracts_to_close or 0)
+    if remaining <= 0:
+        raise LotCloseResolutionError(
+            "invalid_quantity",
+            "contracts must be > 0 for close matching",
+            selector=selector,
+        )
+    matches: list[LotCloseMatch] = []
+    for item in _exact_candidates(
+        _semantic_candidates(repo, selector, conn=conn),
+        selector,
+    ):
+        open_qty = int(item.contracts_open or 0)
+        if open_qty <= 0:
+            continue
+        take = min(open_qty, remaining)
+        if take <= 0:
+            continue
+        matches.append(
+            LotCloseMatch(
+                lot_id=item.lot_id,
+                contracts_to_close=int(take),
+                matched_by="strict_exact_fifo",
+                candidate=item,
+            )
+        )
+        remaining -= int(take)
+        if remaining <= 0:
+            break
+    if remaining > 0:
+        raise LotCloseResolutionError(
+            "insufficient_contracts",
+            f"close_match_insufficient_contracts: remaining={remaining}",
+            selector=selector,
+            remaining_contracts=remaining,
+        )
+    if not matches:
+        raise LotCloseResolutionError(
+            "not_found",
+            "close_match_not_found",
+            selector=selector,
+        )
+    return matches
+
+
+def resolve_fifo_close_targets(
+    repo: Any,
+    selector: LotCloseSelector,
+    *,
+    source: str,
+    conn: Any | None = None,
+) -> CloseTargetResolution:
+    matches = resolve_fifo_close_lots(repo, selector, conn=conn)
+    return CloseTargetResolution(
+        source=str(source or "unknown"),
+        strategy="strict_exact_fifo",
+        selector=selector.to_dict(),
+        matches=tuple(matches),
+    )
+
+
+def summarize_close_candidates(repo: Any, selector: LotCloseSelector) -> dict[str, Any]:
+    semantic_candidates = _semantic_candidates(repo, selector)
+    exact_candidates = _exact_candidates(semantic_candidates, selector)
+    return {
+        "semantic_count": len(semantic_candidates),
+        "exact_contract_count": len(exact_candidates),
+        "exact_open_contracts": sum(int(row.contracts_open or 0) for row in exact_candidates),
+        "requested_contracts": int(selector.contracts_to_close or 0),
+    }
+
+
+def find_unique_open_lot(
+    repo: Any,
+    *,
+    broker: Any = None,
+    account: Any,
+    symbol: Any,
+    option_type: Any,
+    side: Any,
+    expiration_ymd: Any = None,
+) -> LotCloseCandidate | None:
+    broker_norm = normalize_broker(broker) if broker not in (None, "") else ""
+    account_norm = normalize_account(account)
+    symbol_norm = _canonical_selector_symbol(symbol)
+    option_type_norm = normalize_option_type(option_type)
+    side_norm = normalize_side(side)
+    expiration_norm = _normalize_selector_expiration(expiration_ymd) if expiration_ymd not in (None, "") else ""
+    matches = [
+        row for row in list_close_candidates(repo, account=account_norm)
+        if (not broker_norm or row.broker == broker_norm)
+        and row.account == account_norm
+        and row.symbol == symbol_norm
+        and row.option_type == option_type_norm
+        and row.side == side_norm
+        and normalize_status(row.status) == "open"
+        and int(row.contracts_open or 0) > 0
+        and (not expiration_norm or row.expiration_ymd == expiration_norm)
+    ]
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def resolve_explicit_close_target(
+    repo: Any,
+    *,
+    lot_id: str,
+    contracts_to_close: int,
+    source: str,
+    fields: dict[str, Any] | None = None,
+    conn: Any | None = None,
+) -> CloseTargetResolution:
+    resolved_lot_id = str(lot_id or "").strip()
+    selector = _explicit_selector(
+        lot_id=resolved_lot_id,
+        contracts_to_close=contracts_to_close,
+        fields=fields,
+    )
+    if not resolved_lot_id:
+        raise LotCloseResolutionError(
+            "record_id_required",
+            "explicit close target resolution requires record_id",
+            selector=selector,
+        )
+    if int(contracts_to_close) <= 0:
+        raise LotCloseResolutionError(
+            "invalid_quantity",
+            "contracts must be > 0 for close target resolution",
+            selector=selector,
+        )
+
+    candidate = _current_candidate_by_lot_id(
+        repo,
+        resolved_lot_id,
+        conn=conn,
+    )
+    if candidate is None:
+        raise LotCloseResolutionError(
+            "not_found",
+            "explicit close target record_id is not a current position lot",
+            selector=selector,
+        )
+    selector = _selector_from_candidate(candidate, contracts_to_close=contracts_to_close)
+    if fields is not None:
+        expected = normalize_close_candidate({"record_id": resolved_lot_id, "fields": fields})
+        if expected is None or _candidate_identity_tuple(candidate) != _candidate_identity_tuple(expected):
+            raise LotCloseResolutionError(
+                "target_identity_mismatch",
+                "target identity differs: explicit close target fields do not match current lot identity",
+                selector=selector,
+                candidates=[candidate],
+            )
+    if normalize_status(candidate.status) != "open" or int(candidate.contracts_open or 0) <= 0:
+        raise LotCloseResolutionError(
+            "target_lot_not_open",
+            "explicit close target lot is not open",
+            selector=selector,
+            candidates=[candidate],
+        )
+    if int(contracts_to_close) > int(candidate.contracts_open or 0):
+        raise LotCloseResolutionError(
+            "insufficient_contracts",
+            "explicit close target does not have enough open contracts",
+            selector=selector,
+            candidates=[candidate],
+            remaining_contracts=int(contracts_to_close) - int(candidate.contracts_open or 0),
+        )
+    match = LotCloseMatch(
+        lot_id=candidate.lot_id,
+        contracts_to_close=int(contracts_to_close),
+        matched_by="explicit_record_id_current_lot",
+        candidate=candidate,
+    )
+    return CloseTargetResolution(
+        source=str(source or "unknown"),
+        strategy=match.matched_by,
+        selector=selector.to_dict(),
+        matches=(match,),
+    )
+
+
+def _semantic_candidates(
+    repo: Any,
+    selector: LotCloseSelector,
+    *,
+    conn: Any | None = None,
+) -> list[LotCloseCandidate]:
+    return [
+        row
+        for row in list_close_candidates(
+            repo,
+            account=selector.account,
+            conn=conn,
+        )
+        if row.broker == selector.broker
+        and row.account == selector.account
+        and row.symbol == selector.symbol
+        and row.option_type == selector.option_type
+        and row.side == selector.side
+        and normalize_status(row.status) == "open"
+        and int(row.contracts_open or 0) > 0
+    ]
+
+
+def _exact_candidates(candidates: list[LotCloseCandidate], selector: LotCloseSelector) -> list[LotCloseCandidate]:
+    return [
+        row for row in candidates
+        if _same_optional_float(row.strike, selector.strike)
+        and row.expiration_ymd == selector.expiration_ymd
+    ]
+
+
+def _current_candidate_by_lot_id(
+    repo: Any,
+    lot_id: str,
+    *,
+    conn: Any | None = None,
+) -> LotCloseCandidate | None:
+    candidate_repo = require_option_positions_read_repo(repo)
+    exact_reader = getattr(candidate_repo, "get_position_lots_by_ids", None)
+    if (
+        callable(exact_reader)
+        and type(candidate_repo) is SQLiteOptionPositionsRepository
+    ):
+        rows = (
+            exact_reader((lot_id,), conn=conn)
+            if conn is not None
+            else exact_reader((lot_id,))
+        )
+        return normalize_close_candidate(rows[0]) if rows else None
+
+    for item in load_close_candidate_records(repo):
+        current_lot_id = str(item.get("record_id") or item.get("id") or "").strip()
+        if current_lot_id != lot_id:
+            continue
+        return normalize_close_candidate(item)
+
+    get_record_fields = getattr(repo, "get_record_fields", None)
+    if not callable(get_record_fields):
+        get_record_fields = getattr(candidate_repo, "get_record_fields", None)
+    if not callable(get_record_fields):
+        return None
+    try:
+        fields = get_record_fields(lot_id)
+    except Exception:
+        return None
+    if not isinstance(fields, dict):
+        return None
+    return normalize_close_candidate({"record_id": lot_id, "fields": fields})
+
+
+def _selector_from_candidate(candidate: LotCloseCandidate, *, contracts_to_close: int) -> LotCloseSelector:
+    return LotCloseSelector(
+        broker=candidate.broker,
+        account=candidate.account,
+        symbol=candidate.symbol,
+        option_type=candidate.option_type,
+        side=candidate.side,
+        strike=candidate.strike,
+        expiration_ymd=candidate.expiration_ymd,
+        contracts_to_close=int(contracts_to_close),
+    )
+
+
+def _explicit_selector(
+    *,
+    lot_id: str,
+    contracts_to_close: int,
+    fields: dict[str, Any] | None,
+) -> LotCloseSelector:
+    if isinstance(fields, dict):
+        candidate = normalize_close_candidate({"record_id": lot_id, "fields": fields})
+        if candidate is not None:
+            return _selector_from_candidate(candidate, contracts_to_close=contracts_to_close)
+    return LotCloseSelector(
+        broker="",
+        account="",
+        symbol="",
+        option_type="",
+        side="",
+        strike=None,
+        expiration_ymd=None,
+        contracts_to_close=int(contracts_to_close or 0),
+    )
+
+
+def _candidate_identity_tuple(candidate: LotCloseCandidate) -> tuple[Any, ...]:
+    return (
+        candidate.broker,
+        candidate.account,
+        candidate.symbol,
+        candidate.option_type,
+        candidate.side,
+        candidate.strike,
+        candidate.expiration_ymd,
+        normalize_currency(candidate.currency),
+    )
+
+
+def same_close_candidate_identity(
+    left: LotCloseCandidate,
+    right: LotCloseCandidate,
+) -> bool:
+    return _candidate_identity_tuple(left) == _candidate_identity_tuple(right)
+
+
+def _canonical_selector_symbol(value: Any) -> str:
+    return canonical_symbol(value) or str(value or "").strip().upper()
+
+
+def _normalize_selector_expiration(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    exp_ms = parse_exp_to_ms(raw)
+    if exp_ms is None:
+        return raw
+    return exp_ms_to_ymd(exp_ms)
+
+
+def _same_optional_float(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except (TypeError, ValueError):
+        return False

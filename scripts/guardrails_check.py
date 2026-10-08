@@ -1,0 +1,1364 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+import fnmatch
+import hashlib
+import json
+import re
+import subprocess
+import sys
+from collections.abc import Callable
+from pathlib import Path
+from urllib.parse import urlsplit
+
+ROOT = Path(__file__).resolve().parents[1]
+TEXT_SUFFIXES = {
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".env",
+    ".ini",
+    ".json",
+    ".jsonl",
+    ".md",
+    ".plist",
+    ".service",
+    ".txt",
+    ".rst",
+    ".py",
+    ".sh",
+    ".toml",
+    ".tsv",
+    ".xml",
+    ".yml",
+    ".yaml",
+    ".mk",
+}
+TEXT_FILENAMES = {"Makefile"}
+LineReader = Callable[[Path], list[str]]
+PathExists = Callable[[Path], bool]
+
+RUNTIME_TERMS = (
+    "运行入口",
+    "入口配置",
+    "主运行入口",
+    "runtime entry",
+    "run entry",
+    "entry config",
+)
+NEGATION_TERMS = (
+    "非运行入口",
+    "不是",
+    "不要将",
+    "禁止",
+    "forbid",
+    "forbidden",
+    "not",
+    "historical",
+    "history",
+    "deprecated",
+    "示例",
+    "example",
+)
+FORBIDDEN_CONFIG_MARKERS = (
+    "config.json",
+    "config.scheduled",
+    "config.market_us",
+    "config.market_hk",
+)
+
+LIVING_DOC_HISTORY_HEADING = "## 迁移与历史兼容"
+REPO_PATH_PREFIXES = (
+    "src/",
+    "domain/",
+    "scripts/",
+    "tests/",
+    ".github/",
+    "configs/",
+    "agent-runtime/",
+)
+_MARKDOWN_LINK_RE = re.compile(r"\[[^]]+\]\(([^)]+)\)")
+_INLINE_CODE_RE = re.compile(r"(?<!`)`([^`\n]+)`(?!`)")
+_PATH_LIFECYCLE_PREFIX_RE = re.compile(
+    r"(?:\b(?:historical|removed|deleted|retired|deprecated|proposed|planned|example)\b"
+    r"|历史(?:路径|文件)?|已删除|已移除|已退役|已弃用|拟新增|计划新增|待新增|示例)"
+    r"\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
+_NONDETERMINISTIC_PATH_CHARS = frozenset("*?[]{}<>")
+
+ROOT_RUNTIME_CONFIG_EXACT = {
+    "config.assistant.json",
+    "config.bot.json",
+    "config.json",
+    "config.us.json",
+    "config.hk.json",
+    "config.scheduled.json",
+}
+
+# SHA-256 fingerprints avoid re-publishing the private values this check blocks.
+# The token digest corresponds to a known broker identifier that previously
+# entered tracked files. Full-line fingerprints cover production snapshots
+# without blocking ordinary test numbers that happen to share one value.
+KNOWN_PRIVATE_TOKEN_SHA256 = {
+    "01a806970fce6590f0af7cd15d336a96810218f0147e70ba665e32fefb9feb71",
+}
+
+# Lower-cased SHA-256 fingerprints of personal commit email addresses that
+# entered this public repository. The original addresses must not be copied
+# into tracked policy or test fixtures.
+KNOWN_PRIVATE_EMAIL_SHA256 = {
+    "25656499f9f41c50ab3f80ba30aa23d635f6a7c251804491afd99c32d519a65a",
+    "976e5655efa1fd82592a512b235a385027e006ea07ce050bcd71d45fa4d9c70c",
+}
+
+KNOWN_PRIVATE_LINE_SHA256 = {
+    "9b19f299f62267c705ea86cc4eb849e26f6a02b1578f20a9ac74ffce8d30b6f2",
+    "2a7a08a8b323faea1cb3144509ed99bff332964c1c40a4d4cbb0f9f9635afd14",
+    "c07135572e8789d3f7174f85e5542487cac1cd700e6bd64e80883bd80b1f8898",
+    "2d3aba7adc7213770b12004eece3132390413aaf6dc7ceeb8d29cc33ce41662b",
+    "01d2f0535d856c424a4214e9aff069ce3440cfe907cc68d1618a85fe62b6a267",
+    "ce2feed25ba7244bd6dd00efdfb1fc172afd7aa430325e308149e2d3a389d7c2",
+    "90fc60d9f64e135b14d41b36ff3fd988fc5b16fbb712c24fd35fc47a5fa3f682",
+    "e8379c40054669b7dc387ec19a2594d1479c0ecda15287cb57c752acc87c4d3f",
+    "d3f52111abd0cc4d9e656bac3fc96c3f65eaa090207707b18e0c59ba00f68c32",
+    "3f43289b9200c28e69a3cf2dad3e3ab0ec9c9578dd9f7f93ae4ffdd9f05be197",
+    "f4b84e64b1111efa4db644ee5454a56918e73ce6b1a4c71b00c5524be5cd4d5c",
+    "1535deeb01fb464b700f709770d9f8138ae93a7ecf0d2a86430dffa2f292f308",
+    "a36901de3b1d2cadda16f450ca5d1d3359744b5e8d11ac43e775cf06f37c2f60",
+    "f49c4053151818de855302ce3248b4f7e53544bb72c011d2f28c8fb5c0fba721",
+    "c810e7d8c82dc94208eb82c1368d3c596c42bb35c91e459e2920c59cd0a4dc42",
+    "a6f94e8d099ddf20e07991116cdfa102f420196c7b25f1162062e5dbf0a81c65",
+    "1c66818855aba589b0b6425ede42ebdcc9e514e830b6c06950a266986d9b3868",
+    "331cb588fa20e449578865ae09cc3841bf08dedafc8023f817e52a305e302a67",
+}
+
+# Exact-line hashes for deliberate invalid security fixtures. Keep this narrow:
+# paths are not allowlisted, so moving a real credential into a test still fails.
+KNOWN_SAFE_SECRET_FIXTURE_LINE_SHA256 = {
+    "365c29c8194eaf2f2faaae0a39458ad91dcedf424588e64a62925db45cd094cf",
+    "975e4c7110a231ade2bea4e298bf77ced793b902cef07d72a89065e62f80969c",
+}
+
+_SENSITIVE_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9])")
+_EMAIL_RE = re.compile(
+    r"(?i)(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])"
+)
+_HIGH_CONFIDENCE_CREDENTIAL_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"(?<![A-Za-z0-9])sk-(?:proj-|svcacct-|ant-)?[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![0-9A-Z])"),
+    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
+    re.compile(r"(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{30,}(?![A-Za-z0-9])"),
+    re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{20,}(?![A-Za-z0-9-])"),
+    re.compile(r"(?<![A-Za-z0-9])sk_live_[A-Za-z0-9]{20,}(?![A-Za-z0-9])"),
+    re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/@\s:]+:[^/@\s]+@"),
+    re.compile(
+        r"(?i)(?:facebook|meta)[A-Za-z0-9_.-]{0,40}"
+        r"(?:app[_-]?secret|secret[_-]?id)\s*[\"']?\s*[:=]\s*[\"']?[0-9a-f]{32}"
+    ),
+)
+_PATH_COMPONENT = r"([A-Za-z0-9._\-\u3400-\u9fff]+)"
+_ABSOLUTE_HOME_RE = re.compile(rf"/(?:Users|home)/{_PATH_COMPONENT}/")
+_ABSOLUTE_VOLUME_RE = re.compile(rf"/Volumes/{_PATH_COMPONENT}/")
+_GENERIC_PATH_COMPONENTS = frozenset(
+    {"alice", "bob", "me", "om", "user", "users", "test", "example", "runner", "workspace"}
+)
+ROOT_RUNTIME_CONFIG_PATTERNS = (
+    "config.market_*.json",
+    "config.market_*.json.deprecated",
+    "config.local*.json",
+    "config.*.bak.*",
+)
+
+# Declared public surface. Only these roots are compared across revisions; a
+# module's surface is its ``__all__`` when that is statically resolvable, and
+# otherwise its own top-level public definitions and constants.
+PUBLIC_SURFACE_ROOTS = ("src", "domain", "scripts")
+PUBLIC_SURFACE_LEDGER = Path("docs/public_surface_retirements.json")
+PUBLIC_SURFACE_LEDGER_HEADING = "retirements"
+PUBLIC_SURFACE_LEDGER_KEYS = frozenset({"module", "name", "reason"})
+PUBLIC_SURFACE_WILDCARD = "*"
+PUBLIC_SURFACE_MIN_REASON_LENGTH = 20
+PUBLIC_SURFACE_SAMPLE_LIMIT = 12
+# ``D``/``M``/``T`` can take a declared name away; ``A`` only adds surface and is
+# the one status this check skips. Any other status means git is describing a
+# state the check cannot interpret, and that is reported instead of skipped.
+_PUBLIC_SURFACE_STATUSES = frozenset({"D", "M", "T"})
+_PUBLIC_SURFACE_SKIPPED_STATUSES = frozenset({"A"})
+_PUBLIC_SURFACE_SYMLINK_MODE = "120000"
+_PUBLIC_SURFACE_CALLS = frozenset({"sorted", "list", "tuple", "set", "frozenset"})
+_PUBLIC_SURFACE_ALL_MUTATORS = frozenset({"append", "extend", "insert", "remove", "pop", "clear"})
+
+
+class PublicSurfaceUnavailable(Exception):
+    """Raised when a module's declared public surface is not statically readable."""
+
+
+class Violation:
+    def __init__(self, path: Path, line_no: int, reason: str, line: str) -> None:
+        self.path = path
+        self.line_no = line_no
+        self.reason = reason
+        self.line = line
+
+    def render(self) -> str:
+        return f"{self.path}:{self.line_no}: {self.reason}\n  {self.line.strip()}"
+
+
+def git_index_paths() -> list[Path]:
+    try:
+        out = subprocess.check_output(["git", "ls-files", "-z"], cwd=str(ROOT))
+    except Exception as exc:
+        raise SystemExit(f"[guardrails] failed to list files: {exc}")
+
+    return [
+        Path(raw.decode("utf-8", errors="surrogateescape"))
+        for raw in out.split(b"\0")
+        if raw
+    ]
+
+
+def tracked_file_paths() -> list[Path]:
+    paths = git_index_paths()
+
+    files: list[Path] = []
+    for rel in paths:
+        p = ROOT / rel
+        if not p.is_file():
+            continue
+        files.append(rel)
+    return files
+
+
+def staged_file_paths() -> list[Path]:
+    try:
+        out = subprocess.check_output(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"],
+            cwd=str(ROOT),
+        )
+    except Exception as exc:
+        raise SystemExit(f"[guardrails] failed to list staged files: {exc}") from exc
+    return [
+        Path(raw.decode("utf-8", errors="surrogateescape"))
+        for raw in out.split(b"\0")
+        if raw
+    ]
+
+
+def text_tracked_files(paths: list[Path]) -> list[Path]:
+    files: list[Path] = []
+    for rel in paths:
+        p = ROOT / rel
+        if p.name in TEXT_FILENAMES or p.suffix in TEXT_SUFFIXES:
+            files.append(p)
+    return files
+
+
+def text_staged_files(paths: list[Path]) -> list[Path]:
+    return [
+        ROOT / rel
+        for rel in paths
+        if rel.name in TEXT_FILENAMES or rel.suffix in TEXT_SUFFIXES
+    ]
+
+
+def is_root_runtime_config_path(path: Path) -> bool:
+    if len(path.parts) != 1:
+        return False
+    name = path.name
+    if name in ROOT_RUNTIME_CONFIG_EXACT:
+        return True
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in ROOT_RUNTIME_CONFIG_PATTERNS)
+
+
+def is_doc_file(path: Path) -> bool:
+    return path.suffix in {".md", ".txt", ".rst"}
+
+
+def read_lines(path: Path) -> list[str]:
+    return path.read_text(encoding="utf-8", errors="ignore").splitlines()
+
+
+def read_staged_lines(path: Path) -> list[str]:
+    rel = path.relative_to(ROOT).as_posix()
+    try:
+        out = subprocess.check_output(["git", "show", f":{rel}"], cwd=str(ROOT))
+    except Exception as exc:
+        raise SystemExit(f"[guardrails] failed to read staged file {rel}: {exc}") from exc
+    return out.decode("utf-8", errors="ignore").splitlines()
+
+
+def working_tree_path_exists(path: Path) -> bool:
+    root = ROOT.resolve()
+    candidate = (root / path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return candidate.exists()
+
+
+def index_path_exists(path: Path, index_paths: set[str]) -> bool:
+    key = path.as_posix().rstrip("/")
+    if not key or key == "." or ".." in path.parts:
+        return False
+    return key in index_paths or any(item.startswith(f"{key}/") for item in index_paths)
+
+
+def _local_markdown_targets(
+    document: Path,
+    lines: list[str],
+    *,
+    path_exists: PathExists,
+) -> tuple[list[Path], list[Violation]]:
+    root = ROOT.resolve()
+    targets: list[Path] = []
+    issues: list[Violation] = []
+    for idx, line in enumerate(lines, start=1):
+        for raw_target in _MARKDOWN_LINK_RE.findall(line):
+            parsed = urlsplit(raw_target.strip())
+            if parsed.scheme or parsed.netloc or not parsed.path.lower().endswith(".md"):
+                continue
+            candidate = (document.parent / parsed.path).resolve()
+            try:
+                relative = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if path_exists(relative):
+                targets.append(candidate)
+            else:
+                issues.append(
+                    Violation(
+                        document.relative_to(root),
+                        idx,
+                        "indexed living-doc target does not exist",
+                        line,
+                    )
+                )
+    return targets, issues
+
+
+def living_document_paths(
+    *,
+    line_reader: LineReader = read_lines,
+    path_exists: PathExists = working_tree_path_exists,
+) -> tuple[list[Path], list[Violation]]:
+    root = ROOT.resolve()
+    index = root / "docs" / "INDEX.md"
+    if not path_exists(Path("docs/INDEX.md")):
+        return [], [
+            Violation(
+                Path("docs/INDEX.md"),
+                1,
+                "living-doc authority index does not exist",
+                "<missing docs/INDEX.md>",
+            )
+        ]
+
+    index_lines: list[str] = []
+    for line in line_reader(index):
+        if line.strip() == LIVING_DOC_HISTORY_HEADING:
+            break
+        index_lines.append(line)
+
+    direct, issues = _local_markdown_targets(index, index_lines, path_exists=path_exists)
+    documents = [index, *direct]
+    for document in direct:
+        relative = document.relative_to(root)
+        if document.name != "README.md" or relative.parts[:1] != ("docs",) or len(relative.parts) < 3:
+            continue
+        nested, nested_issues = _local_markdown_targets(
+            document,
+            line_reader(document),
+            path_exists=path_exists,
+        )
+        documents.extend(nested)
+        issues.extend(nested_issues)
+    return list(dict.fromkeys(documents)), issues
+
+
+def _normalized_repo_path(token: str) -> Path | None:
+    value = token.strip()
+    if not value.startswith(REPO_PATH_PREFIXES):
+        return None
+    if (
+        any(character.isspace() for character in value)
+        or any(character in _NONDETERMINISTIC_PATH_CHARS for character in value)
+        or "..." in value
+    ):
+        return None
+    value = value.split("::", 1)[0]
+    value = re.sub(r":\d+(?:-\d+)?$", "", value)
+    return Path(value)
+
+
+def check_living_doc_repo_paths(
+    files: list[Path],
+    *,
+    line_reader: LineReader = read_lines,
+    path_exists: PathExists = working_tree_path_exists,
+) -> list[Violation]:
+    issues: list[Violation] = []
+    for path in files:
+        for idx, line in enumerate(line_reader(path), start=1):
+            for match in _INLINE_CODE_RE.finditer(line):
+                relative = _normalized_repo_path(match.group(1))
+                if relative is None:
+                    continue
+                if _PATH_LIFECYCLE_PREFIX_RE.search(line[: match.start()]):
+                    continue
+                if path_exists(relative):
+                    continue
+                issues.append(
+                    Violation(
+                        path.relative_to(ROOT.resolve()),
+                        idx,
+                        "indexed living-doc repository path does not exist",
+                        line,
+                    )
+                )
+    return issues
+
+
+def check_runtime_entry_wording(
+    files: list[Path],
+    *,
+    line_reader: LineReader = read_lines,
+) -> list[Violation]:
+    issues: list[Violation] = []
+    for path in files:
+        if not is_doc_file(path):
+            continue
+        for idx, line in enumerate(line_reader(path), start=1):
+            lowered = line.lower()
+            if not any(marker in lowered for marker in FORBIDDEN_CONFIG_MARKERS):
+                continue
+            if not any(term in lowered for term in RUNTIME_TERMS):
+                continue
+            if any(term in lowered for term in NEGATION_TERMS):
+                continue
+            issues.append(
+                Violation(
+                    path.relative_to(ROOT),
+                    idx,
+                    "forbidden runtime-entry wording for config.json/config.scheduled/config.market_*",
+                    line,
+                )
+            )
+    return issues
+
+
+def check_runtime_config_tracking(files: list[Path]) -> list[Violation]:
+    issues: list[Violation] = []
+    for path in files:
+        if not is_root_runtime_config_path(path):
+            continue
+        issues.append(
+            Violation(
+                path,
+                1,
+                "root runtime config must stay untracked; commit templates under configs/examples/ instead",
+                "<tracked runtime config>",
+            )
+        )
+    return issues
+
+
+def check_sensitive_repository_artifacts(
+    files: list[Path],
+    *,
+    line_reader: LineReader = read_lines,
+) -> list[Violation]:
+    """Reject known private fingerprints and literal personal host layouts."""
+
+    issues: list[Violation] = []
+    for raw_path in files:
+        path = raw_path if raw_path.is_absolute() else ROOT / raw_path
+        if path.name not in TEXT_FILENAMES and path.suffix not in TEXT_SUFFIXES:
+            continue
+        for idx, line in enumerate(line_reader(path), start=1):
+            normalized_line = " ".join(line.split())
+            line_sha256 = hashlib.sha256(normalized_line.encode("utf-8")).hexdigest()
+            if (
+                line_sha256 in KNOWN_PRIVATE_LINE_SHA256
+            ):
+                issues.append(
+                    Violation(
+                        path.relative_to(ROOT),
+                        idx,
+                        "known production-derived repository line must not be tracked",
+                        "<redacted private fingerprint>",
+                    )
+                )
+            if (
+                line_sha256 not in KNOWN_SAFE_SECRET_FIXTURE_LINE_SHA256
+                and any(pattern.search(line) for pattern in _HIGH_CONFIDENCE_CREDENTIAL_PATTERNS)
+            ):
+                issues.append(
+                    Violation(
+                        path.relative_to(ROOT),
+                        idx,
+                        "high-confidence credential pattern must not be tracked",
+                        "<redacted credential pattern>",
+                    )
+                )
+            for match in _SENSITIVE_TOKEN_RE.finditer(line):
+                token = match.group(0)
+                if hashlib.sha256(token.encode("utf-8")).hexdigest() in KNOWN_PRIVATE_TOKEN_SHA256:
+                    issues.append(
+                        Violation(
+                            path.relative_to(ROOT),
+                            idx,
+                            "known private runtime or financial fingerprint must not be tracked",
+                            "<redacted private fingerprint>",
+                        )
+                    )
+                    break
+            for match in _EMAIL_RE.finditer(line):
+                email = match.group(0).lower()
+                if hashlib.sha256(email.encode("utf-8")).hexdigest() in KNOWN_PRIVATE_EMAIL_SHA256:
+                    issues.append(
+                        Violation(
+                            path.relative_to(ROOT),
+                            idx,
+                            "known personal email fingerprint must not be tracked",
+                            "<redacted private email>",
+                        )
+                    )
+                    break
+            for match in _ABSOLUTE_HOME_RE.finditer(line):
+                if match.group(1).lower() not in _GENERIC_PATH_COMPONENTS:
+                    issues.append(
+                        Violation(
+                            path.relative_to(ROOT),
+                            idx,
+                            "literal personal home path must use a generic placeholder",
+                            "<redacted personal path>",
+                        )
+                    )
+                    break
+            for match in _ABSOLUTE_VOLUME_RE.finditer(line):
+                if match.group(1).lower() not in _GENERIC_PATH_COMPONENTS:
+                    issues.append(
+                        Violation(
+                            path.relative_to(ROOT),
+                            idx,
+                            "literal personal volume path must use a generic placeholder",
+                            "<redacted personal path>",
+                        )
+                    )
+                    break
+    return issues
+
+
+def check_git_identity_privacy() -> list[Violation]:
+    """Reject a repository-effective author email already classified private."""
+
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "user.email"],
+            cwd=str(ROOT),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        raise SystemExit(f"[guardrails] failed to read git author identity: {exc}") from exc
+    email = result.stdout.strip().lower()
+    if not email:
+        return []
+    digest = hashlib.sha256(email.encode("utf-8")).hexdigest()
+    if digest not in KNOWN_PRIVATE_EMAIL_SHA256:
+        return []
+    return [
+        Violation(
+            Path(".git/config"),
+            1,
+            "repository-effective git author email is a known private address; use a noreply identity",
+            "<redacted private email>",
+        )
+    ]
+
+
+def _string_constant(node: ast.expr | None) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _module_all_value(tree: ast.Module) -> ast.expr | None:
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = [target for target in node.targets if isinstance(target, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            targets = [node.target]
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id == "__all__":
+                return node.value
+    return None
+
+
+_MODULE_SCOPE_CONTROL = (
+    ast.If,
+    ast.Try,
+    ast.TryStar,
+    ast.Match,
+    ast.For,
+    ast.While,
+    ast.With,
+    ast.AsyncWith,
+    ast.AsyncFor,
+)
+
+
+def _module_scope_statements(tree: ast.Module):
+    """Module-scope statements, descending into control flow but never into a ``def`` or ``class``.
+
+    A name bound under ``if``/``try`` is still bound in the module namespace, so
+    reading only the direct children of the module body made a guarded definition
+    look like a removal.
+
+    The set of statements to descend into has to be complete: every container the
+    walk does not enter is a place a definition can hide, and a definition the
+    reading never sees is a name this check does not protect.
+    """
+    stack = list(reversed(tree.body))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, _MODULE_SCOPE_CONTROL):
+            # ``Match`` is the one container here without a ``body``; read each
+            # attribute a container may use instead of assuming which it has.
+            stack.extend(reversed(getattr(node, "body", [])))
+            stack.extend(reversed(getattr(node, "orelse", [])))
+            stack.extend(reversed(getattr(node, "finalbody", [])))
+            for handler in getattr(node, "handlers", []):
+                stack.extend(reversed(handler.body))
+            for case in getattr(node, "cases", []):
+                stack.extend(reversed(case.body))
+
+
+def _assignment_targets(node: ast.stmt) -> list[ast.expr]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    if isinstance(node, ast.AnnAssign):
+        return [node.target]
+    return []
+
+
+def _starts_at_all(node: ast.expr) -> bool:
+    """Whether ``node`` is ``__all__`` itself or an item/attribute reached through it."""
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return isinstance(node, ast.Name) and node.id == "__all__"
+
+
+def _module_all_unreadable_reason(tree: ast.Module) -> str | None:
+    """Why a module-level ``__all__`` cannot be trusted, or ``None`` when it can.
+
+    Only one shape is followed: a single top-level assignment to a literal that
+    ``_resolve_declared_sequence`` can read. Every other way of building
+    ``__all__`` is reported, because reading those as "this module declares
+    nothing" would quietly stop protecting the names it still exports.
+    """
+    top_level = {id(node) for node in tree.body}
+    assignments = 0
+    for node in _module_scope_statements(tree):
+        if isinstance(node, ast.AugAssign) and _starts_at_all(node.target):
+            return "`__all__` is built with an augmented assignment; assign it once as a literal"
+        if isinstance(node, ast.Delete) and any(_starts_at_all(target) for target in node.targets):
+            return "`__all__` is deleted; the declared surface must be a single literal assignment"
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            function = node.value.func
+            if (
+                isinstance(function, ast.Attribute)
+                and function.attr in _PUBLIC_SURFACE_ALL_MUTATORS
+                and _starts_at_all(function.value)
+            ):
+                return f"`__all__` is mutated with .{function.attr}(...); assign it once as a literal"
+        for target in _assignment_targets(node):
+            if isinstance(target, ast.Name) and target.id == "__all__":
+                if id(node) not in top_level:
+                    return (
+                        "`__all__` is assigned inside a conditional or try block; "
+                        "assign it once at the top level"
+                    )
+                assignments += 1
+            elif _starts_at_all(target):
+                return (
+                    f"`__all__` is modified in place with `{ast.unparse(target)}`; "
+                    "assign it once as a literal"
+                )
+    if assignments > 1:
+        return "`__all__` is assigned more than once; the declared surface must be a single literal"
+    return None
+
+
+def _module_literal_bindings(tree: ast.Module) -> dict[str, ast.expr]:
+    """Module-level single-name bindings, the only ones ``__all__`` may refer to."""
+    bindings: dict[str, ast.expr] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        elif isinstance(node, ast.AnnAssign):
+            target = node.target
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id != "__all__":
+            bindings[target.id] = node.value
+    return bindings
+
+
+def _resolve_declared_sequence(
+    node: ast.expr,
+    bindings: dict[str, ast.expr],
+    seen: frozenset[str],
+) -> frozenset[str] | None:
+    """Resolve an expression that yields declared names, or ``None`` when it cannot be read."""
+    constant = _string_constant(node)
+    if constant is not None:
+        return frozenset({constant})
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        names: set[str] = set()
+        for element in node.elts:
+            resolved = _resolve_declared_sequence(element, bindings, seen)
+            if resolved is None:
+                return None
+            names |= resolved
+        return frozenset(names)
+    if isinstance(node, ast.Starred):
+        return _resolve_declared_sequence(node.value, bindings, seen)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _resolve_declared_sequence(node.left, bindings, seen)
+        right = _resolve_declared_sequence(node.right, bindings, seen)
+        if left is None or right is None:
+            return None
+        return left | right
+    if isinstance(node, ast.Dict):
+        keys: set[str] = set()
+        for key in node.keys:
+            text = _string_constant(key)
+            if text is None:
+                return None
+            keys.add(text)
+        return frozenset(keys)
+    if isinstance(node, ast.Call):
+        function = node.func
+        if isinstance(function, ast.Name) and function.id in _PUBLIC_SURFACE_CALLS and len(node.args) == 1:
+            return _resolve_declared_sequence(node.args[0], bindings, seen)
+        if isinstance(function, ast.Attribute) and function.attr == "keys" and not node.args:
+            return _resolve_declared_sequence(function.value, bindings, seen)
+        return None
+    if isinstance(node, ast.Name):
+        binding = bindings.get(node.id)
+        if binding is None or node.id in seen:
+            return None
+        return _resolve_declared_sequence(binding, bindings, seen | {node.id})
+    return None
+
+
+def _conventional_public_names(tree: ast.Module) -> frozenset[str]:
+    """Names a module declares without ``__all__``: its own top-level public definitions.
+
+    A ``def``/``class`` guarded by ``if``/``try`` still ships that name, so the
+    walk descends into module-level control flow for definitions. Plain
+    assignments are read only at the top level: a name assigned inside a guard is
+    how a module spells a platform fallback (``except ImportError: fcntl = None``)
+    or a temporary used by an error message, and protecting those would fail
+    changes that never touched the public surface.
+    """
+    names: set[str] = set()
+    top_level = {id(node) for node in tree.body}
+    for node in _module_scope_statements(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("_"):
+                names.add(node.name)
+        elif id(node) not in top_level:
+            continue
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if not node.target.id.startswith("_"):
+                names.add(node.target.id)
+    return frozenset(names)
+
+
+def _parse_module(source: str) -> ast.Module:
+    try:
+        return ast.parse(source)
+    except SyntaxError as exc:
+        raise PublicSurfaceUnavailable(
+            f"module source does not parse ({exc.msg} at line {exc.lineno})"
+        ) from exc
+
+
+def _explicit_all_names(tree: ast.Module) -> frozenset[str] | None:
+    """Resolved ``__all__``, or ``None`` when the module does not declare one."""
+    unreadable = _module_all_unreadable_reason(tree)
+    if unreadable is not None:
+        raise PublicSurfaceUnavailable(unreadable)
+    explicit = _module_all_value(tree)
+    if explicit is None:
+        return None
+    resolved = _resolve_declared_sequence(explicit, _module_literal_bindings(tree), frozenset())
+    if resolved is None:
+        raise PublicSurfaceUnavailable(
+            "`__all__` is not statically resolvable; declare it as a literal list of names "
+            "so the public surface can be compared across revisions"
+        )
+    return resolved
+
+
+def _bound_names(tree: ast.Module) -> frozenset[str]:
+    """Every name the module binds at module scope, whether by definition, assignment or import.
+
+    Control flow counts: a name bound inside ``if``/``try`` is reachable on the
+    module just the same, so treating it as gone would fail a change that only
+    moved the definition behind a guard.
+    """
+    names: set[str] = set()
+    for node in _module_scope_statements(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+    return frozenset(names)
+
+
+def declared_public_names(source: str) -> frozenset[str]:
+    """Declared public names of one module.
+
+    ``__all__`` wins when it is a statically resolvable literal (including
+    starred references to module-level literals, ``dict.keys()`` and
+    ``sorted(...)``). A module without ``__all__`` declares the top-level names
+    it defines itself, so re-exports must be listed in ``__all__`` to be
+    protected. Anything else raises rather than guessing.
+    """
+    tree = _parse_module(source)
+    explicit = _explicit_all_names(tree)
+    return _conventional_public_names(tree) if explicit is None else explicit
+
+
+def present_public_names(source: str) -> frozenset[str]:
+    """Names the module still exposes, used to decide whether a declared name disappeared.
+
+    A module that declares ``__all__`` is held to it, so dropping a name from
+    ``__all__`` is a removal. Without ``__all__`` every top-level binding counts
+    -- imports included -- because a name re-exported by an alias is still
+    reachable even though the module no longer defines it.
+    """
+    tree = _parse_module(source)
+    explicit = _explicit_all_names(tree)
+    return _bound_names(tree) if explicit is None else explicit
+
+
+def _git_blob_text(spec: str) -> str | None:
+    """Text of ``git show <spec>``, or ``None`` when that object does not exist."""
+    result = subprocess.run(
+        ["git", "show", spec],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", errors="ignore")
+
+
+def _head_file_text(relative: str, *, staged: bool) -> str | None:
+    if staged:
+        return _git_blob_text(f":{relative}")
+    path = ROOT / relative
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _git_tree_mode(revision: str, relative: str) -> str | None:
+    """Mode of ``relative`` in ``revision``'s tree, or ``None`` when it is not in it.
+
+    Reads the tree alone, so it still answers when the blob is not available
+    locally -- a partial clone, a pruned object store -- which is exactly the
+    case that must not be mistaken for "the path is gone".
+    """
+    result = subprocess.run(
+        ["git", "--literal-pathspecs", "ls-tree", "-z", revision, "--", relative],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"[guardrails] failed to read the tree of {revision}: "
+            f"{result.stderr.decode('utf-8', errors='ignore').strip()}"
+        )
+    entry = result.stdout.decode("utf-8", errors="surrogateescape")
+    if not entry:
+        return None
+    return entry.split("\t", 1)[0].split(" ", 1)[0]
+
+
+def _head_entry_mode(relative: str, *, staged: bool) -> str | None:
+    """Git mode of the module at the revision under review, ``None`` when it is not there.
+
+    Only the mode is asked for, so a symlink is recognisable before its content
+    (the link target's path, which can pass for valid Python) is read as source.
+    """
+    if staged:
+        result = subprocess.run(
+            ["git", "--literal-pathspecs", "ls-files", "-s", "-z", "--", relative],
+            cwd=str(ROOT),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return None
+        return result.stdout.decode("utf-8", errors="surrogateescape").split(" ", 1)[0]
+    if (ROOT / relative).is_symlink():
+        return _PUBLIC_SURFACE_SYMLINK_MODE
+    return None
+
+
+def _head_module_exists(relative: str, *, staged: bool) -> bool:
+    """Whether the module is still there at the revision under review.
+
+    Deliberately mirrors ``_head_file_text``: the index under ``--staged``, the
+    working tree otherwise, so the answer cannot disagree with the content the
+    check actually compared. A symlink counts as present even when it dangles --
+    this check never follows links, so "still there" must not depend on where one
+    points.
+    """
+    if staged:
+        return _head_file_text(relative, staged=True) is not None
+    path = ROOT / relative
+    return path.is_symlink() or path.is_file()
+
+
+def _git_revision_exists(revision: str) -> bool:
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{revision}^{{commit}}"],
+        cwd=str(ROOT),
+        check=False,
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def _public_surface_changed_paths(base_revision: str, *, staged: bool) -> list[tuple[str, str]]:
+    command = ["git", "diff", "--name-status", "--no-renames", "-z"]
+    if staged:
+        command.append("--cached")
+    command.append(base_revision)
+    command.append("--")
+    command.extend(f"{root}/" for root in PUBLIC_SURFACE_ROOTS)
+    result = subprocess.run(command, cwd=str(ROOT), check=False, capture_output=True)
+    if result.returncode != 0:
+        raise SystemExit(
+            "[guardrails] failed to diff the public surface against "
+            f"{base_revision}: {result.stderr.decode('utf-8', errors='ignore').strip()}"
+        )
+    fields = [
+        field.decode("utf-8", errors="surrogateescape")
+        for field in result.stdout.split(b"\0")
+        if field
+    ]
+    return [(fields[index], fields[index + 1]) for index in range(0, len(fields) - 1, 2)]
+
+
+def public_surface_removals(
+    base_revision: str,
+    *,
+    staged: bool,
+) -> tuple[list[tuple[str, str]], list[Violation]]:
+    """``[(module, name)]`` declared at ``base_revision`` and gone at head, plus read issues."""
+    removals: list[tuple[str, str]] = []
+    issues: list[Violation] = []
+    for status, relative in _public_surface_changed_paths(base_revision, staged=staged):
+        if not relative.endswith(".py") or status in _PUBLIC_SURFACE_SKIPPED_STATUSES:
+            continue
+        if status not in _PUBLIC_SURFACE_STATUSES:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    f"git reports status {status!r} for this module, which this check cannot "
+                    "interpret; finish the operation in progress and run it again",
+                    status,
+                )
+            )
+            continue
+        if _git_tree_mode(base_revision, relative) == _PUBLIC_SURFACE_SYMLINK_MODE:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    "the module is a symbolic link at the base revision, so its declared "
+                    "public surface cannot be compared",
+                    status,
+                )
+            )
+            continue
+        if _head_entry_mode(relative, staged=staged) == _PUBLIC_SURFACE_SYMLINK_MODE:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    "the module is a symbolic link at the revision under review, so its declared "
+                    "public surface cannot be compared",
+                    status,
+                )
+            )
+            continue
+        base_text = _git_blob_text(f"{base_revision}:{relative}")
+        if base_text is None:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    f"the module's content at base {base_revision[:12]} could not be read, so its "
+                    "declared public surface cannot be compared",
+                    status,
+                )
+            )
+            continue
+        head_text = _head_file_text(relative, staged=staged)
+        try:
+            base_names = declared_public_names(base_text)
+        except PublicSurfaceUnavailable as exc:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    "declared public surface cannot be read at the base revision",
+                    str(exc),
+                )
+            )
+            continue
+        try:
+            head_names = present_public_names(head_text) if head_text is not None else frozenset()
+        except PublicSurfaceUnavailable as exc:
+            issues.append(
+                Violation(
+                    Path(relative),
+                    1,
+                    "declared public surface cannot be read at the revision under review",
+                    str(exc),
+                )
+            )
+            continue
+        for name in sorted(base_names - head_names):
+            removals.append((relative, name))
+    return removals, issues
+
+
+def _retirement_entries(
+    source: str | None,
+    *,
+    label: str,
+) -> tuple[list[dict[str, str]], list[Violation]]:
+    if source is None:
+        return [], []
+    try:
+        payload = json.loads(source)
+    except json.JSONDecodeError as exc:
+        return [], [
+            Violation(PUBLIC_SURFACE_LEDGER, exc.lineno, f"{label}: retirement ledger is not valid JSON", exc.msg)
+        ]
+    if not isinstance(payload, dict) or not isinstance(payload.get(PUBLIC_SURFACE_LEDGER_HEADING), list):
+        return [], [
+            Violation(
+                PUBLIC_SURFACE_LEDGER,
+                1,
+                f"{label}: retirement ledger must be an object with a '{PUBLIC_SURFACE_LEDGER_HEADING}' list",
+                "<no retirements list>",
+            )
+        ]
+
+    entries: list[dict[str, str]] = []
+    issues: list[Violation] = []
+    for index, raw in enumerate(payload[PUBLIC_SURFACE_LEDGER_HEADING], start=1):
+        rendered = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+        if not isinstance(raw, dict) or set(raw) != PUBLIC_SURFACE_LEDGER_KEYS:
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} must have exactly "
+                    f"{sorted(PUBLIC_SURFACE_LEDGER_KEYS)}",
+                    rendered,
+                )
+            )
+            continue
+        module = raw["module"]
+        name = raw["name"]
+        reason = raw["reason"]
+        if not all(isinstance(value, str) for value in (module, name, reason)):
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} must use string values",
+                    rendered,
+                )
+            )
+            continue
+        if not module.endswith(".py") or module.startswith("/") or ".." in Path(module).parts:
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} must name a repository-relative .py module",
+                    rendered,
+                )
+            )
+            continue
+        if not module.startswith(tuple(f"{root}/" for root in PUBLIC_SURFACE_ROOTS)):
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} names a module outside the checked roots "
+                    f"{list(PUBLIC_SURFACE_ROOTS)}",
+                    rendered,
+                )
+            )
+            continue
+        if name != PUBLIC_SURFACE_WILDCARD and not name.isidentifier():
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} must name a declared identifier "
+                    f"or '{PUBLIC_SURFACE_WILDCARD}' for a retired module",
+                    rendered,
+                )
+            )
+            continue
+        if len(reason.strip()) < PUBLIC_SURFACE_MIN_REASON_LENGTH:
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"{label}: retirement entry #{index} must explain why the name is gone "
+                    f"(at least {PUBLIC_SURFACE_MIN_REASON_LENGTH} characters)",
+                    rendered,
+                )
+            )
+            continue
+        entries.append({"module": module, "name": name, "reason": reason})
+    return entries, issues
+
+
+def check_public_surface(base_revision: str, *, staged: bool = False) -> list[Violation]:
+    """Require every disappeared declared public name to be recorded in the retirement ledger."""
+    if not _git_revision_exists(base_revision):
+        raise SystemExit(
+            f"[guardrails] public-surface base revision {base_revision!r} is not available locally; "
+            "fetch it before running this check"
+        )
+    issues: list[Violation] = []
+    ledger_relative = PUBLIC_SURFACE_LEDGER.as_posix()
+    base_ledger = _git_blob_text(f"{base_revision}:{ledger_relative}")
+    if base_ledger is None and _git_tree_mode(base_revision, ledger_relative) is not None:
+        # The ledger is in the base tree but not readable here. Reading that as
+        # "no ledger at base" would empty the append-only comparison and let this
+        # very change drop recorded retirements unnoticed.
+        issues.append(
+            Violation(
+                PUBLIC_SURFACE_LEDGER,
+                1,
+                f"the retirement ledger at base {base_revision[:12]} could not be read, so "
+                "append-only cannot be verified for this change",
+                ledger_relative,
+            )
+        )
+    base_entries, base_issues = _retirement_entries(
+        base_ledger,
+        label=f"base {base_revision[:12]}",
+    )
+    issues.extend(base_issues)
+    head_entries, head_issues = _retirement_entries(
+        _head_file_text(PUBLIC_SURFACE_LEDGER.as_posix(), staged=staged),
+        label="head",
+    )
+    issues.extend(head_issues)
+
+    head_keys = {(entry["module"], entry["name"]) for entry in head_entries}
+    base_keys = {(entry["module"], entry["name"]) for entry in base_entries}
+    for module, name in sorted(base_keys - head_keys):
+        if name == PUBLIC_SURFACE_WILDCARD and _head_module_exists(module, staged=staged):
+            # The module came back, so this entry no longer records a retirement
+            # -- it would otherwise exempt every later removal from that module
+            # (see the wildcard exemption below). Restoring a retired module
+            # means dropping its now-false entry, and that has to be allowed --
+            # but only dropping it: rewriting the '*' into some other entry for
+            # the same module would just re-exempt a name that is still there.
+            if not any(other == module for other, _ in head_keys):
+                continue
+        issues.append(
+            Violation(
+                PUBLIC_SURFACE_LEDGER,
+                1,
+                "retirement ledger entries are append-only; this recorded retirement was dropped "
+                "(a '*' entry stays until the module it retires is back)",
+                f"{module} :: {name}",
+            )
+        )
+
+    for entry in head_entries:
+        if entry["name"] != PUBLIC_SURFACE_WILDCARD:
+            continue
+        if _head_module_exists(entry["module"], staged=staged):
+            issues.append(
+                Violation(
+                    PUBLIC_SURFACE_LEDGER,
+                    1,
+                    f"a '{PUBLIC_SURFACE_WILDCARD}' retirement is only valid when the module itself is gone, "
+                    "and it still exists",
+                    entry["module"],
+                )
+            )
+
+    removals, removal_issues = public_surface_removals(base_revision, staged=staged)
+    issues.extend(removal_issues)
+    uncovered: dict[str, list[str]] = {}
+    for module, name in removals:
+        if (module, name) in head_keys:
+            continue
+        if (module, PUBLIC_SURFACE_WILDCARD) in head_keys and not _head_module_exists(
+            module, staged=staged
+        ):
+            continue
+        uncovered.setdefault(module, []).append(name)
+    for module, names in sorted(uncovered.items()):
+        sample = ", ".join(names[:PUBLIC_SURFACE_SAMPLE_LIMIT])
+        if len(names) > PUBLIC_SURFACE_SAMPLE_LIMIT:
+            sample = f"{sample}, … {len(names) - PUBLIC_SURFACE_SAMPLE_LIMIT} more"
+        issues.append(
+            Violation(
+                Path(module),
+                1,
+                f"{len(names)} declared public name(s) disappeared without a retirement record in "
+                f"{PUBLIC_SURFACE_LEDGER.as_posix()}",
+                sample,
+            )
+        )
+    return issues
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Guardrails checks for docs and runtime config tracking")
+    parser.add_argument("--check-doc-wording", action="store_true", help="check docs wording for runtime entry")
+    parser.add_argument(
+        "--check-runtime-config-tracking",
+        action="store_true",
+        help="check that root runtime configs are not tracked by git",
+    )
+    parser.add_argument(
+        "--check-sensitive-artifacts",
+        action="store_true",
+        help="check tracked text for known private fingerprints and personal paths",
+    )
+    parser.add_argument(
+        "--check-public-surface",
+        action="store_true",
+        help="check that declared public names were not removed without a retirement ledger entry",
+    )
+    parser.add_argument(
+        "--public-surface-base",
+        metavar="REV",
+        default=None,
+        help=(
+            "base revision the declared public surface is compared against; "
+            "required by --check-public-surface, never defaulted"
+        ),
+    )
+    parser.add_argument(
+        "--staged",
+        action="store_true",
+        help="check the staged index content of changed files instead of the working tree",
+    )
+    args = parser.parse_args()
+
+    if args.check_public_surface and not args.public_surface_base:
+        raise SystemExit(
+            "[guardrails] --check-public-surface requires --public-surface-base <revision>; "
+            "the comparison is never skipped silently"
+        )
+    if args.public_surface_base and not args.check_public_surface:
+        raise SystemExit(
+            "[guardrails] --public-surface-base is only meaningful together with --check-public-surface"
+        )
+
+    run_doc = args.check_doc_wording
+    run_tracking = args.check_runtime_config_tracking
+    run_sensitive = args.check_sensitive_artifacts
+    if not run_doc and not run_tracking and not run_sensitive and not args.check_public_surface:
+        run_doc = True
+        run_tracking = True
+        run_sensitive = True
+
+    if args.staged:
+        tracked_paths = staged_file_paths()
+        files = text_staged_files(tracked_paths)
+        line_reader = read_staged_lines
+        index_paths = {path.as_posix() for path in git_index_paths()}
+        path_exists = lambda path: index_path_exists(path, index_paths)
+    else:
+        tracked_paths = tracked_file_paths()
+        files = text_tracked_files(tracked_paths)
+        line_reader = read_lines
+        path_exists = working_tree_path_exists
+    issues: list[Violation] = []
+
+    if run_doc:
+        issues.extend(check_runtime_entry_wording(files, line_reader=line_reader))
+        living_docs, living_doc_issues = living_document_paths(
+            line_reader=line_reader,
+            path_exists=path_exists,
+        )
+        issues.extend(living_doc_issues)
+        issues.extend(
+            check_living_doc_repo_paths(
+                living_docs,
+                line_reader=line_reader,
+                path_exists=path_exists,
+            )
+        )
+    if run_tracking:
+        issues.extend(check_runtime_config_tracking(tracked_paths))
+    if run_sensitive:
+        issues.extend(check_sensitive_repository_artifacts(files, line_reader=line_reader))
+        issues.extend(check_git_identity_privacy())
+    if args.check_public_surface:
+        issues.extend(check_public_surface(args.public_surface_base, staged=args.staged))
+
+    if issues:
+        print(f"[guardrails] FAILED ({len(issues)} issue(s))")
+        for item in issues:
+            print(item.render())
+        sys.exit(1)
+
+    print("[guardrails] OK")
+
+
+if __name__ == "__main__":
+    main()

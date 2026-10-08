@@ -1,0 +1,121 @@
+# Docs Index
+
+本文索引当前维护的 living docs，并明确仍保留在 `docs/` 中的历史材料。GitHub 目录中的文件存在
+不代表它描述当前行为；先从本索引进入。
+
+按问题选择事实来源，不使用覆盖所有问题的统一排序：
+
+| 问题 | 优先证据 |
+|---|---|
+| 当前代码如何实现 | 当前源码和实际调用链；测试用于验证具体行为，不保证实现符合业务要求 |
+| 指定环境实际加载什么、处于什么状态 | 该主机的有效配置、runtime artifact 和运行证据，绑定市场、账户与数据时间 |
+| 券商当前订单、成交、持仓和费用 | OpenD / 券商证据，核对账户、查询范围、完整性和时间；缓存不能冒充当前事实 |
+| 本地系统记录或投影了什么 | 对应 SQLite 账本、事件及投影；本地记录与券商事实不一致时保留差异 |
+| 系统应该满足什么行为 | 当前明确批准的业务契约及其维护中的 living docs；与实现冲突时报告差异 |
+
+证据缺失、过期或冲突时明确标注，不自动降级为零结果，也不据此覆盖另一来源或修正生产数据。
+本索引用于定位当前文档所有者；migration note、Gateflow、plan、review 和 memory 是历史线索，不能仅凭文件存在推断当前行为或授权。
+
+## 开始使用
+
+- [README](../README.md)：产品定位、五分钟开始、常用入口和安全边界。
+- [Install](INSTALL.md)：Python 要求、安装器、release 目录和 wrapper。
+- [Getting Started](GETTING_STARTED.md)：安装后的首次配置、检查和首跑。
+- [Deploy](../DEPLOY.md)：部署入口和目录契约。
+- [Linux / Mac Deployment](DEPLOY_LINUX_MAC.md)：systemd / launchd 详细部署。
+- [Runbook](../RUNBOOK.md)：巡检、调度、故障诊断和应急操作。
+
+## 配置
+
+- [Config Contract](../CONFIGS.md)：`config.yaml -> build -> runtime JSON` 权威链和迁移边界。
+- [Configuration Guide](../CONFIGURATION_GUIDE.md)：账户、市场、环境变量、通知和验证方法。
+- [Security](../SECURITY.md)：漏洞和敏感信息处理。
+- [Secret Storage](SECRET_STORAGE.md)：逻辑凭据、macOS Keychain、systemd credentials、env 兼容和轮换边界。
+
+配置字段会持续演进。静态文档只记录稳定心智模型；具体字段来源优先使用：
+
+```bash
+./om config explain --source yaml --market us --key <dot.path>
+./om config validate --source yaml --market us
+./om-agent run --tool config_validate --input-json '{"config_key":"us"}'
+```
+
+## 产品与策略
+
+- [Product Architecture](PRODUCT_ARCHITECTURE.md)：产品域、模块责任和依赖。
+- [Strategy Architecture](STRATEGY_ARCHITECTURE.md)：Cash-Secured Put (CSP)、Covered Call (CC)、Combo Yield 的开仓边界。
+- [Strategy Terminology](STRATEGY_TERMINOLOGY.md)：OM 内部策略命名与金融专业术语（Bullish Risk Reversal、Collar、Wheel 等）的对照。
+- [Candidate Strategy](candidate_strategy.md)：当前候选筛选、排序和 trace。
+- [Futu Simulate Account Experience Scan PRD](FUTU_SIMULATE_ACCOUNT_EXPERIENCE_PRD.md)：
+  面向富途模拟账户用户的 CSP、CC、Combo Yield 手动体验模式合同。
+- [Opportunity Quality](OPPORTUNITY_QUALITY.md)：扫描质量与人工复盘判定口径。
+- [Notification Experience PRD](OPTION_NOTIFICATION_EXPERIENCE_PRD.md)：已发布的 scheduled report、增量提醒和主动查询合同。
+- [Wheel Strategy PRD](WHEEL_STRATEGY_PRD.md)：当前 Wheel 产品合同、批次级 CC 监控、共享覆盖和生命周期边界。
+
+## 技术架构与核心合同
+
+- [Architecture](ARCHITECTURE.md)：技术分层、入口和真实调用链。
+- [Compatibility Freeze](COMPATIBILITY_FREEZE.md)：只修不增的兼容入口、canonical owner 和退出证据。
+- [Required Data Storage Design](REQUIRED_DATA_STORAGE_DESIGN.md)：required-data 预热、规划、投影验证、canonical blob、封存边界和兼容读取合同。
+- [Tick Storage Efficiency Design](TICK_STORAGE_EFFICIENCY_DESIGN.md)：Tick prefetch 摘要投影、opening snapshot 物理编码和历史清理边界。
+- [Futu Simulate Account Experience Scan System Design](FUTU_SIMULATE_ACCOUNT_EXPERIENCE_SYSTEM_DESIGN.md)：
+  模拟账户手动体验扫描的 owner、数据合同、副作用门禁和验收映射。
+- [Ledger Architecture](LEDGER_ARCHITECTURE.md)：`trade_events -> position_lots`、lot identity 和恢复流程。
+- [Order Domain Model PRD](ORDER_DOMAIN_MODEL_PRD.md)：订单/成交/持仓统一领域模型的需求真源：目标、现状证据、成功信号与验收映射。
+- [Order Domain Model Design](ORDER_DOMAIN_MODEL_DESIGN.md)：上述需求的技术实现参考（字段表、现状映射、迁移路径）；非需求真源，决策与验收以 PRD 为准。
+- [Futu Trade And Holdings Sync](FUTU_TRADE_HOLDINGS_SYNC.md)：broker 成交摄取、持仓对账、生命周期同步和 fail-closed 边界。
+- [Option Close Realtime Design](OPTION_CLOSE_REALTIME_DESIGN.md)：零价期权即时平仓与原因迟到补齐的设计及实现边界；部署状态以运行环境为准。
+- [External Holdings Account Retirement Design](EXTERNAL_HOLDINGS_ACCOUNT_RETIREMENT_DESIGN.md)：账户退役、全局扫描风险分支退役与旧配置切换边界；前半部分保留历史设计依据。
+- [Close Advice Contract](CLOSE_ADVICE_CONTRACT.md)：严格止盈平仓、报价证据、状态机与通知边界。
+- [Option Performance Design](OPTION_PERFORMANCE_DESIGN.md)：期权净现金流、胜率、收益率、统一账本真源与公开入口的当前合同。
+- [Assigned Stock Return Design](ASSIGNED_STOCK_RETURN_DESIGN.md)：assignment 后的正股事实和收益归因。
+- [Portfolio Assignment Scenario Design](PORTFOLIO_ASSIGNMENT_SCENARIO_DESIGN.md)：全部指派后分布来源、报价及资金覆盖的实现依据。
+- [OM Runtime and Data Quality](quality-monitoring/README.md)：OM 本地质量检查、文件契约与操作入口。
+- [Runtime Failure Evidence and Retention Design](RUNTIME_FAILURE_EVIDENCE_DESIGN.md)：Tick/OpenD 故障终态、取证可读性与保留预览的研发设计。
+- [Runtime Failure Operations](RUNTIME_FAILURE_OPERATIONS.md)：Tick 故障取证、审计时间窗、drift 导出与只读回收预览。
+- [Dependency Graph](DEPENDENCY_GRAPH.md)：由生成脚本维护的 Python import graph。
+
+## Tool Gateway、Bot 与消息入口
+
+- [Agent Getting Started](AGENT_GETTING_STARTED.md)：最短 Tool Gateway 接入。
+- [Agent Integration](AGENT_INTEGRATION.md)：JSON envelope、manifest 和权限合同。
+- [Tool Reference](TOOL_REFERENCE.md)：公开工具分类、风险 metadata 和常用示例。
+- [OM Capability Surfaces](OM_AGENT_CAPABILITY_MAP.md)：Tool Gateway、Control、Bot 的能力边界。
+- [Inbound Control](INBOUND_CONTROL.md)：确定性 Control、pending operation 和 channel 安全。
+- [Bot PRD](BOT_PRD.md)：Bot产品合同及项目内通用只读助理需求。
+- [Bot / Python runtime / Scene v6](BOT_DESIGN.md)：策略、报错与过滤原因问答，个人记忆、上下文和只读工具合同。
+- [Legacy Pi storage](PI_AGENT_CORE_INTEGRATION.md)：历史会话保留、离线转换与旧版本回滚边界。
+- [Agent Handbook](AGENT_WIKI.md)：本地 agent 的任务 playbook、模块地图和验证矩阵。
+- [Session Summary](SESSION_SUMMARY.md)：仅在显式 handoff 时使用的模板。
+
+`./om-agent spec` 是公开工具清单的运行时权威。Tool Reference 不复制每个工具的完整 schema。
+
+## 运维、修复与发布
+
+- [Guardrails](GUARDRAILS.md)：本地 hook 与 CI 门禁。
+- [Option Positions Repair](OPTION_POSITIONS_REPAIR.md)：账本错账的只读诊断、dry-run 和修复。
+- [Release Process](RELEASE_PROCESS.md)：VERSION 驱动的发布流程。
+
+## 迁移与历史兼容
+
+- [决策历史](DECISION_HISTORY.md)：SQLite 权威保存、只读查询和校验后历史导入；[产品合同](DECISION_HISTORY_PRD.md)。
+
+- [Option Performance v1 Migration](migrations/OPTION_PERFORMANCE_V1_MIGRATION.md)：旧 monthly-income 输出如何映射到当前 Performance；不是 rollback path。
+- [Trade And Position Ledger Redesign](TRADE_POSITION_LEDGER_REDESIGN.md)：已完成重构的兼容指针；当前合同见 Ledger Architecture。
+
+历史兼容文档只能解释旧 artifact，不能覆盖当前代码行为。
+
+## 退役与阶段性证据
+
+- [AI Decision Advice retirement](AI_DECISION_ADVICE_DESIGN.md)：已退役能力和残留兼容边界。
+这些文件保留用于解释历史决策，不逐段更新成当前实现。
+
+## 工作流证据
+
+以下目录保存阶段性过程证据，不属于 living docs：
+
+- `docs/gateflow/`
+- `docs/reviews/`
+- `docs/plans/`
+
+它们可能记录特定 commit、PR、当时的发现、实施切片和已关闭计划。不要逐份更新成“当前状态”；完成的 work unit 应以 final closeout / Git 历史追溯。新功能规范应进入上面的产品或技术合同，而不是继续堆在 review artifact 中。

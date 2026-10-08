@@ -1,0 +1,131 @@
+from __future__ import annotations
+
+import pytest
+
+from pathlib import Path
+
+
+def test_snapshot_decision_delivery_plan_roundtrip() -> None:
+    from domain.domain import Decision, DeliveryPlan, SnapshotDTO
+
+    snapshot = SnapshotDTO.from_payload(
+        {
+            "schema_kind": "snapshot_dto",
+            "schema_version": "1.0",
+            "snapshot_name": "scheduler_decision",
+            "as_of_utc": "2026-04-13T00:00:00+00:00",
+            "payload": {"decision": {"schema_kind": "scheduler_decision", "schema_version": "1.0"}},
+        }
+    )
+    assert snapshot.to_payload()["schema_kind"] == "snapshot_dto"
+
+    decision = Decision.from_payload(
+        {
+            "schema_kind": "decision",
+            "schema_version": "1.0",
+            "account": "lx",
+            "should_run": True,
+            "should_notify": False,
+            "reason": "ok",
+        }
+    )
+    assert decision.to_payload()["account"] == "lx"
+
+    plan = DeliveryPlan.from_payload(
+        {
+            "schema_kind": "delivery_plan",
+            "schema_version": "1.0",
+            "channel": "wechat_clawbot",
+            "target": "user:abc",
+            "account_messages": {"lx": "hello"},
+            "should_send": True,
+        }
+    )
+    assert plan.to_payload()["account_messages"]["lx"] == "hello"
+
+
+def test_delivery_plan_validation_blocks_empty_target() -> None:
+    from domain.domain import DeliveryPlan, SchemaValidationError
+
+    try:
+        DeliveryPlan.from_payload(
+            {
+                "schema_kind": "delivery_plan",
+                "schema_version": "1.0",
+                "channel": "wechat_clawbot",
+                "target": "",
+                "account_messages": {"lx": "hello"},
+                "should_send": True,
+            }
+        )
+        assert False, "expected SchemaValidationError"
+    except SchemaValidationError:
+        pass
+
+
+def test_main_uses_intermediate_objects_in_critical_path() -> None:
+    base = Path(__file__).resolve().parents[1]
+    main_src = (base / "src" / "application" / "multi_account_tick.py").read_text(encoding="utf-8")
+    scheduler_context_src = (base / "src" / "application" / "tick_scheduler_context.py").read_text(encoding="utf-8")
+    account_run_src = (base / "src" / "application" / "account_run.py").read_text(encoding="utf-8")
+    notification_src = (base / "src" / "application" / "scheduled_notification.py").read_text(encoding="utf-8")
+    audit_src = (base / "src" / "application" / "multi_tick_audit.py").read_text(encoding="utf-8")
+
+    assert "TickSchedulerRequest(" in main_src
+    assert "SnapshotDTO.from_payload" in scheduler_context_src
+    assert "Decision.from_payload" in account_run_src
+    assert "delivery_plan_cls.from_payload" in notification_src
+    assert "SCHEMA_VALIDATION_FAILED" in audit_src
+
+
+def test_snapshot_schema_error_has_stable_error_code() -> None:
+    from domain.domain import SchemaValidationError, SnapshotDTO
+
+    with pytest.raises(SchemaValidationError) as _caught:
+        SnapshotDTO.from_payload(
+            {
+                "schema_kind": "snapshot_dto",
+                "schema_version": "1.0",
+                "snapshot_name": "bad",
+                "as_of_utc": "2026-04-13T00:00:00+00:00",
+                "payload": [],
+            }
+        )
+    e = _caught.value
+    assert "E_SNAPSHOT_PAYLOAD_INVALID" in str(e)
+
+
+def test_decision_schema_error_has_stable_error_code_for_bool_field() -> None:
+    from domain.domain import Decision, SchemaValidationError
+
+    with pytest.raises(SchemaValidationError) as _caught:
+        Decision.from_payload(
+            {
+                "schema_kind": "decision",
+                "schema_version": "1.0",
+                "account": "lx",
+                "should_run": "yes",
+                "should_notify": False,
+                "reason": "bad",
+            }
+        )
+    e = _caught.value
+    assert "E_DECISION_SHOULD_RUN_INVALID" in str(e)
+
+
+def test_delivery_plan_schema_error_has_stable_error_code_for_message_type() -> None:
+    from domain.domain import DeliveryPlan, SchemaValidationError
+
+    with pytest.raises(SchemaValidationError) as _caught:
+        DeliveryPlan.from_payload(
+            {
+                "schema_kind": "delivery_plan",
+                "schema_version": "1.0",
+                    "channel": "wechat_clawbot",
+                "target": "user:abc",
+                "account_messages": {"lx": 1},
+                "should_send": True,
+            }
+        )
+    e = _caught.value
+    assert "E_DELIVERY_ACCOUNT_MESSAGE_INVALID" in str(e)

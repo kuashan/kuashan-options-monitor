@@ -1,0 +1,4695 @@
+from __future__ import annotations
+
+import pytest
+
+import json
+import os
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+import src.application.ledger.manual_trades as ledger_manual_trades
+import src.application.ledger.repository as ledger_repository
+from src.application.close_advice_report_manifest import (
+    publish_close_advice_report_manifest,
+)
+from tests.candidate_evidence_helpers import seal_opening_candidate_fixture
+
+BASE = Path(__file__).resolve().parents[1]
+
+
+_SEALED_SNAPSHOT_SHA256 = "a" * 64
+
+_SEALED_PLAN_SHA256 = "b" * 64
+
+def _minimal_cfg(*, market: str = "us") -> dict[str, Any]:
+    return {
+        "_generated": {
+            "schema_version": "1.0",
+            "generator": "options-monitor",
+            "source_format": "yaml",
+            "market": market,
+        },
+        "_resolved": {
+            "source_format": "yaml",
+            "market": market,
+            "runtime_schema": "config-json-v1",
+        },
+        "accounts": ["user1"],
+        "portfolio": {
+            "broker": "富途",
+            "source": "futu",
+        },
+        "templates": {
+            "put_base": {
+                "sell_put": {
+                    "min_annualized_net_return": 0.1,
+                    "min_net_income": 50,
+                    "min_open_interest": 10,
+                    "min_volume": 1,
+                    "max_spread_ratio": 0.3,
+                }
+            }
+        },
+        "symbols": [
+            {
+                "symbol": "NVDA",
+                "market": "US",
+                "fetch": {"source": "futu", "limit_expirations": 8},
+                "use": ["put_base"],
+                "sell_put": {
+                    "enabled": True,
+                    "min_dte": 20,
+                    "max_dte": 45,
+                    "min_strike": 100,
+                    "max_strike": 120,
+                },
+                "sell_call": {"enabled": False},
+            }
+        ],
+    }
+
+
+def _write_run_account_config(account_dir: Path, *, market: str) -> None:
+    path = account_dir / "state" / "config.override.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(_minimal_cfg(market=market), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _write_close_advice_report(
+    report_dir: Path,
+    rows: list[dict[str, Any]],
+    *,
+    run_id: str,
+    market: str,
+) -> None:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = report_dir / "close_advice.csv"
+    text_path = report_dir / "close_advice.txt"
+    context_path = report_dir / "state" / "option_positions_context.json"
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+    if context_path.exists():
+        context = json.loads(context_path.read_text(encoding="utf-8"))
+    else:
+        accounts = sorted(
+            {str(row.get("account") or "").strip().lower() for row in rows if str(row.get("account") or "").strip()}
+        )
+        context = {
+            "context_status": "available",
+            "filters": {"account": accounts[0] if len(accounts) == 1 else None},
+            "open_positions_min": [],
+        }
+        context_path.write_text(
+            json.dumps(context, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    sealed_rows = []
+    for source_row in rows:
+        row = dict(source_row)
+        row.setdefault("quote_mode", "frozen_snapshot")
+        row.setdefault(
+            "required_data_snapshot_manifest_sha256",
+            _SEALED_SNAPSHOT_SHA256,
+        )
+        row.setdefault(
+            "close_advice_required_data_plan_sha256",
+            _SEALED_PLAN_SHA256,
+        )
+        sealed_rows.append(row)
+    pd.DataFrame(sealed_rows).to_csv(csv_path, index=False)
+    text_path.write_text("", encoding="utf-8")
+    publish_close_advice_report_manifest(
+        csv_path=csv_path,
+        text_path=text_path,
+        context_path=context_path,
+        context=context,
+        rows=sealed_rows,
+        markets_to_run=[market],
+        run_id=run_id,
+        quote_mode="frozen_snapshot",
+        required_data_snapshot_manifest_sha256=_SEALED_SNAPSHOT_SHA256,
+        close_advice_required_data_plan_sha256=_SEALED_PLAN_SHA256,
+    )
+
+
+def _execute_private_runtime_status(payload: dict[str, Any]) -> dict[str, Any]:
+    """Exercise the trusted collector in tests that verify its detailed diagnosis."""
+
+    from src.application.agent_tools.diagnostics import _private_runtime_status_tool
+
+    data, warnings, meta = _private_runtime_status_tool(payload)
+    return {
+        "tool_name": "runtime_status.private",
+        "ok": True,
+        "data": data,
+        "warnings": warnings,
+        "meta": meta,
+    }
+
+
+def _write_manage_symbols_generation(tmp_path: Path, *, market: str = "us") -> tuple[Path, Path]:
+    from src.application.config_yaml import build_yaml_runtime_config_file
+
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        """\
+accounts:
+  user1:
+    type: futu
+    futu_account_id: "999000000000000001"
+templates:
+  put_base:
+    sell_put: {}
+  call_base:
+    covered_call:
+      strategy: insurance_underwriting
+markets:
+  us:
+    accounts: [user1]
+    symbols: [NVDA]
+    overrides:
+      NVDA:
+        use: [put_base]
+  hk:
+    accounts: [user1]
+    symbols: [0700.HK]
+    overrides:
+      0700.HK:
+        use: [put_base]
+""",
+        encoding="utf-8",
+    )
+    cfg_path = tmp_path / f"config.{market}.json"
+    build_yaml_runtime_config_file(
+        repo_root=BASE,
+        market=market,
+        config_path=config_yaml,
+        output_config_path=cfg_path,
+    )
+    return config_yaml, cfg_path
+
+
+def _public_cfg_with_futu(data_config_ref: str, *, market: str = "us") -> dict[str, Any]:
+    cfg = _minimal_cfg(market=market)
+    cfg["account_settings"] = {
+        "user1": {
+            "type": "futu",
+            "futu": {
+                "account_id": "999000000000000001",
+                "host": "127.0.0.1",
+                "port": 11111,
+            },
+        }
+    }
+    cfg["portfolio"]["account"] = "user1"
+    cfg["portfolio"]["data_config"] = data_config_ref
+    cfg["trade_intake"] = {
+        "enabled": True,
+        "mode": "dry-run",
+        "account_mapping": {
+            "futu": {
+                "999000000000000001": "user1",
+            }
+        },
+    }
+    cfg["symbols"][0]["fetch"] = {
+        "source": "futu",
+        "host": "127.0.0.1",
+        "port": 11111,
+        "limit_expirations": 8,
+    }
+    return cfg
+
+
+def _public_cfg_with_futu_auto_source(data_config_ref: str, *, market: str = "us") -> dict[str, Any]:
+    cfg = _public_cfg_with_futu(data_config_ref, market=market)
+    cfg["portfolio"]["source"] = "auto"
+    return cfg
+
+
+def _public_cfg_with_external_holdings(data_config_ref: str, *, market: str = "us") -> dict[str, Any]:
+    cfg = _public_cfg_with_futu(data_config_ref, market=market)
+    cfg["accounts"] = ["user1", "ext1"]
+    cfg["account_settings"]["ext1"] = {
+        "type": "external_holdings",
+        "holdings_account": "Feishu EXT",
+    }
+    cfg["portfolio"]["source_by_account"] = {"ext1": "holdings"}
+    return cfg
+
+
+def _write_healthcheck_config(
+    tmp_path: Path,
+    *,
+    cfg: dict[str, Any] | None = None,
+    data_config: dict[str, Any] | None = None,
+    file_name: str = "config.us.json",
+) -> Path:
+    """Write the runtime data config plus the market config the tool reads.
+
+    The defaults reproduce, byte for byte, the literal fixtures the healthcheck
+    tests used to build inline.
+    """
+    data_cfg_path = tmp_path / "portfolio.runtime.json"
+    data_cfg_path.write_text(
+        json.dumps(
+            data_config
+            if data_config is not None
+            else {"option_positions": {"sqlite_path": "output_shared/state/option_positions.sqlite3"}},
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    cfg_path = tmp_path / file_name
+    cfg_path.write_text(
+        json.dumps(cfg if cfg is not None else _public_cfg_with_futu("portfolio.runtime.json"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return cfg_path
+
+
+def _write_close_advice_config(tmp_path: Path, *, cfg: dict[str, Any] | None = None) -> Path:
+    """Write the futu runtime config the close-advice input tests exercise."""
+    if cfg is None:
+        cfg = _public_cfg_with_futu("portfolio.runtime.json")
+    cfg["close_advice"] = {"enabled": True}
+    return _write_healthcheck_config(tmp_path, cfg=cfg)
+
+
+def _open_positions_context_stub(open_positions_min: list[dict[str, Any]]):
+    """Build a ``load_option_positions_context`` stub carrying the given rows."""
+
+    def _fake_load_option_positions_context(**kwargs):  # type: ignore[no-untyped-def]
+        return ({"open_positions_min": open_positions_min}, True)
+
+    return _fake_load_option_positions_context
+
+
+def _required_data_csv_stub(csv_text: str):
+    """Build a ``save_required_data_opend`` stub that writes ``csv_text``."""
+
+    def _fake_save_required_data_opend(base, symbol, payload, *, output_root):  # type: ignore[no-untyped-def]
+        parsed = output_root / "parsed"
+        parsed.mkdir(parents=True, exist_ok=True)
+        csv_path = parsed / f"{symbol}_required_data.csv"
+        csv_path.write_text(csv_text, encoding="utf-8")
+        return output_root / "raw" / f"{symbol}_required_data.json", csv_path
+
+    return _fake_save_required_data_opend
+
+
+def _futu_doctor_ok(**kwargs: Any) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "sdk": {"ok": True},
+        "watchdog": {"ok": True},
+    }
+
+
+def _patch_agent_tool_dependencies(monkeypatch, **overrides: Any) -> None:
+    import src.application.agent_tools.diagnostics as diagnostics_tools
+    import src.application.agent_tools.materialization as materialization_tools
+    import src.application.agent_tools.positions as positions_tools
+    import src.application.agent_tools.runtime as runtime_tools
+
+    targets = {
+        "run_futu_doctor": (diagnostics_tools,),
+        "build_ready_futu_broker_gateway": (diagnostics_tools,),
+        "load_option_positions_repo": (diagnostics_tools,),
+        "load_portfolio_context": (materialization_tools,),
+        "refresh_assigned_stock_quotes": (positions_tools,),
+        "repo_base": (runtime_tools,),
+        "check_version_update": (runtime_tools,),
+        "update_local_version": (runtime_tools,),
+        "run_close_advice": (materialization_tools,),
+        "load_option_positions_context": (materialization_tools,),
+        "fetch_symbol_opend": (materialization_tools,),
+        "save_required_data_opend": (materialization_tools,),
+    }
+    for name, value in overrides.items():
+        modules = targets.get(name)
+        if modules is None:
+            raise AssertionError(f"unknown agent tool dependency override: {name}")
+        for module in modules:
+            monkeypatch.setattr(module, name, value)
+
+
+def _patch_healthcheck_dependencies(monkeypatch, **overrides: Any) -> None:
+    class _ReadyGateway:
+        def close(self) -> None:
+            pass
+
+    deps = {
+        "run_futu_doctor": _futu_doctor_ok,
+        "build_ready_futu_broker_gateway": lambda **_kwargs: _ReadyGateway(),
+    }
+    deps.update(overrides)
+    _patch_agent_tool_dependencies(monkeypatch, **deps)
+
+
+def test_healthcheck_works_with_explicit_config_path(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert out["data"]["config"]["accounts"] == ["user1"]
+    assert out["data"]["account_paths"]["user1"]["primary"]["source"] == "futu"
+    assert out["data"]["account_paths"]["user1"]["primary"]["ok"] is True
+    assert "fallback" not in out["data"]["account_paths"]["user1"]
+    assert out["meta"]["config_path"] == ".../config.us.json"
+    assert "runtime_runs" in out["data"]["tools"]
+    assert "candidate_filter_explain" in out["data"]["tools"]
+    assert "research" not in out["data"]["tools"]
+    assert out["data"]["side_lanes"]["research"]["agent_tool"] is False
+    assert out["data"]["side_lanes"]["research"]["mode"] == "read_only_evidence"
+    assert any(item["name"] == "opend_readiness" and item["status"] == "ok" for item in out["data"]["checks"])
+    assert any(item["name"] == "account_mapping" and item["status"] == "ok" for item in out["data"]["checks"])
+    primary = next(item for item in out["data"]["checks"] if item["name"] == "account_primary_paths")
+    assert primary["status"] == "ok"
+    assert primary["value"]["user1"]["source"] == "futu"
+    assert any(item["name"] == "starter_symbols" and item["status"] == "warn" for item in out["data"]["checks"])
+    assert any("starter account label 'user1'" in item for item in out["warnings"])
+
+
+def test_healthcheck_reports_missing_secret_backend_as_skipped(monkeypatch, tmp_path: Path) -> None:
+    from src.application.secret_store.contracts import SecretBackendUnavailable
+    import src.application.secret_resolver as secret_resolver
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+
+    def unavailable(**_kwargs):
+        raise SecretBackendUnavailable("no credential context")
+
+    monkeypatch.setattr(secret_resolver, "resolve_secret", unavailable)
+    _patch_healthcheck_dependencies(
+        monkeypatch,
+        run_futu_doctor=unavailable,
+        build_ready_futu_broker_gateway=unavailable,
+    )
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["data"]["summary"]["reason_code"] == "SECRET_BACKEND_UNAVAILABLE"
+    assert out["data"]["summary"]["ok"] is False
+    assert any(item["name"].startswith("opend_quote_readiness_") and item["status"] == "skipped"
+               for item in out["data"]["checks"])
+    assert any(item["name"].startswith("opend_broker_readiness_") and item["status"] == "skipped"
+               for item in out["data"]["checks"])
+
+
+def test_healthcheck_quote_failure_keeps_broker_primary_but_fails_legacy_summary(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    _patch_healthcheck_dependencies(
+        monkeypatch,
+        run_futu_doctor=lambda **_kwargs: {
+            "ok": False,
+            "message": "quote unavailable",
+            "watchdog": {"ok": False, "error": "quote unavailable"},
+            "telnet": {"ok": True},
+        },
+    )
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    quote_check = next(
+        item for item in out["data"]["checks"]
+        if item["name"].startswith("opend_quote_readiness_")
+    )
+    assert quote_check["status"] == "error"
+    assert quote_check["summary_excluded"] is True
+    assert out["data"]["account_paths"]["user1"]["primary"]["ok"] is True
+    aggregate = next(
+        item for item in out["data"]["checks"]
+        if item["name"] == "opend_readiness"
+    )
+    assert aggregate["status"] == "error"
+    assert out["data"]["summary"]["ok"] is False
+    assert out["data"]["summary"]["critical_count"] >= 1
+
+
+def test_healthcheck_quote_doctor_preserves_field_failure_and_telnet_evidence(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    calls: list[dict[str, Any]] = []
+
+    def _quote_doctor(**kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(kwargs))
+        return {
+            "ok": False,
+            "sdk": {"ok": True},
+            "watchdog_ok": True,
+            "watchdog": {
+                "ok": True,
+                "message": "OpenD quote capability healthy",
+                "state": {
+                    "program_status_type": "READY",
+                    "qot_logined": True,
+                    "trd_logined": False,
+                },
+            },
+            "telnet": {"ok": False, "host": "127.0.0.1", "port": 22222},
+            "required_fields": {
+                "results": [{"symbol": "NVDA", "ok": False}],
+            },
+            "required_fields_ok": False,
+        }
+
+    _patch_healthcheck_dependencies(monkeypatch, run_futu_doctor=_quote_doctor)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert len(calls) == 1
+    assert calls[0]["required_capability"] == "quote"
+    assert calls[0]["symbols"] == ["NVDA"]
+    quote_check = next(
+        item for item in out["data"]["checks"]
+        if item["name"].startswith("opend_quote_readiness_")
+    )
+    endpoint_check = next(
+        item for item in out["data"]["checks"]
+        if item["name"].startswith("opend_readiness_127_0_0_1_")
+    )
+    aggregate = next(
+        item for item in out["data"]["checks"]
+        if item["name"] == "opend_readiness"
+    )
+    assert quote_check["status"] == "error"
+    assert quote_check["value"]["global_state"]["qot_logined"] is True
+    assert quote_check["value"]["telnet"]["ok"] is False
+    assert endpoint_check["status"] == "error"
+    assert endpoint_check["value"]["telnet"]["ok"] is False
+    assert aggregate["status"] == "error"
+    assert "required option fields" in quote_check["message"]
+    assert "healthy" not in quote_check["message"]
+    assert "required option fields" in endpoint_check["message"]
+    assert out["data"]["summary"]["ok"] is False
+    assert out["data"]["account_paths"]["user1"]["primary"]["ok"] is True
+    assert any("Telnet is not listening" in warning for warning in out["warnings"])
+
+
+def test_healthcheck_quote_doctor_uses_profile_resolved_route_member(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    non_futu = dict(cfg["symbols"][0])
+    non_futu["symbol"] = "AAPL"
+    non_futu.pop("fetch", None)
+    non_futu["use"] = ["non_futu"]
+    futu = dict(cfg["symbols"][0])
+    futu.pop("fetch", None)
+    futu["use"] = ["futu_alias"]
+    cfg["templates"].update(
+        {
+            "non_futu": {"fetch": {"source": "yfinance"}},
+            "futu_alias": {
+                "fetch": {
+                    "source": "futu_api",
+                    "host": "127.0.0.1",
+                    "port": 11111,
+                }
+            },
+        }
+    )
+    cfg["symbols"] = [non_futu, futu]
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+
+    def _quote_doctor(**kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "sdk": {"ok": True},
+            "watchdog_ok": True,
+            "watchdog": {"ok": True, "message": "OpenD quote capability healthy"},
+            "required_fields_ok": True,
+            "telnet": {"ok": True},
+        }
+
+    _patch_healthcheck_dependencies(monkeypatch, run_futu_doctor=_quote_doctor)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert len(calls) == 1
+    assert calls[0]["symbols"] == ["NVDA"]
+
+
+def test_healthcheck_normalizes_shared_endpoint_and_preserves_telnet_binding(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    cfg["account_settings"]["user1"]["futu"].update(
+        {"host": "LOCALHOST", "telnet_port": 33333}
+    )
+    cfg["symbols"][0]["fetch"]["host"] = "localhost"
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+
+    def _quote_doctor(**kwargs: Any) -> dict[str, Any]:
+        calls.append(dict(kwargs))
+        return {
+            "ok": True,
+            "sdk": {"ok": True},
+            "watchdog_ok": True,
+            "watchdog": {"ok": True, "message": "OpenD quote capability healthy"},
+            "required_fields_ok": True,
+            "telnet": {"ok": True, "port": kwargs["telnet_port"]},
+        }
+
+    _patch_healthcheck_dependencies(monkeypatch, run_futu_doctor=_quote_doctor)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert len(calls) == 1
+    assert calls[0]["host"] == "localhost"
+    assert calls[0]["telnet_port"] == 33333
+    endpoint_checks = [
+        item for item in out["data"]["checks"]
+        if item["name"].startswith("opend_readiness_")
+        and item["name"] != "opend_readiness_global"
+    ]
+    assert [item["name"] for item in endpoint_checks] == [
+        "opend_readiness_localhost_11111"
+    ]
+    assert endpoint_checks[0]["value"]["accounts"] == ["user1"]
+    assert endpoint_checks[0]["value"]["telnet"]["port"] == 33333
+
+
+def test_healthcheck_does_not_warn_when_production_watchlist_contains_starter_symbol(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    msft = dict(cfg["symbols"][0])
+    msft["symbol"] = "MSFT"
+    cfg["symbols"].append(msft)
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert all(item["name"] != "starter_symbols" for item in out["data"]["checks"])
+    assert not any("Replace example starter symbols" in item for item in out["warnings"])
+
+
+def test_healthcheck_reports_feishu_inbound_audit_ready(monkeypatch, tmp_path: Path) -> None:
+    from src.application.bot.control.audit import InboundAuditStore
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    audit_db = tmp_path / "inbound.sqlite3"
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "in_healthcheck_ready",
+            "channel": "feishu",
+            "sender_id": "ou_1",
+            "conversation_id": "feishu:chat_1:ou_1",
+            "message_id": "omsg_1",
+            "raw_text": "状态",
+            "parser": "deterministic",
+            "intent_name": "runtime_status",
+            "tool_name": "runtime_status",
+            "decision": "allowed",
+            "result_ok": True,
+            "response": {"data": {"response_text": "ok"}},
+        }
+    )
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_ID", "cli_1")
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_SECRET", "secret_1")
+    monkeypatch.setenv("OM_FEISHU_BOT_ALLOWED_OPEN_IDS", "ou_1")
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path), "audit_db": str(audit_db)})
+    checks = {item["name"]: item for item in out["data"]["checks"]}
+
+    assert out["ok"] is True
+    assert checks["feishu_inbound"]["status"] == "ok"
+    assert checks["feishu_inbound"]["value"]["latest_event"]["sender_id"] == "ou_1"
+    assert checks["feishu_inbound"]["value"]["latest_event"]["conversation_id"] == "feishu:chat_1:ou_1"
+    assert checks["feishu_inbound"]["value"]["pending_store"]["readable"] is True
+
+
+def test_healthcheck_uses_explicit_env_file_for_feishu_inbound(monkeypatch, tmp_path: Path) -> None:
+    from src.application.bot.control.audit import InboundAuditStore
+    from src.application.tool_execution import execute_tool as run_tool
+
+    for name in (
+        "OM_ENV_FILE",
+        "OM_FEISHU_BOT_APP_ID",
+        "OM_FEISHU_BOT_APP_SECRET",
+        "OM_FEISHU_BOT_ALLOWED_OPEN_IDS",
+        "OM_INBOUND_AUDIT_DB",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    cfg_path = _write_healthcheck_config(tmp_path)
+    audit_db = tmp_path / "inbound.sqlite3"
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "in_healthcheck_env_file",
+            "channel": "feishu",
+            "sender_id": "ou_file",
+            "conversation_id": "feishu:chat_file:ou_file",
+            "message_id": "omsg_file",
+            "raw_text": "状态",
+            "parser": "deterministic",
+            "intent_name": "runtime_status",
+            "tool_name": "runtime_status",
+            "decision": "allowed",
+            "result_ok": True,
+            "response": {"data": {"response_text": "ok"}},
+        }
+    )
+    env_file = tmp_path / "options-monitor.env"
+    env_file.write_text(
+        "\n".join(
+            [
+                "OM_FEISHU_BOT_APP_ID=cli_file",
+                "OM_FEISHU_BOT_APP_SECRET=secret_file",
+                "OM_FEISHU_BOT_ALLOWED_OPEN_IDS=ou_file",
+                f"OM_INBOUND_AUDIT_DB={audit_db}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool(
+        "healthcheck",
+        {"config_path": str(cfg_path), "env_file": str(env_file)},
+    )
+    checks = {item["name"]: item for item in out["data"]["checks"]}
+    env = out["data"]["environment"]
+
+    assert checks["feishu_inbound"]["status"] == "ok"
+    assert checks["feishu_inbound"]["value"]["audit_db_exists"] is True
+    assert checks["feishu_inbound"]["value"]["latest_event"]["sender_id"] == "ou_file"
+    assert checks["feishu_inbound"]["value"]["credentials_configured"] is True
+    assert checks["feishu_inbound"]["value"]["allowed_open_ids_count"] == 1
+    assert env["env_file"] == ".../options-monitor.env"
+    assert env["env_file_loaded"] is True
+    assert env["entries"]["OM_FEISHU_BOT_APP_ID"]["source"] == "env_file:.../options-monitor.env"
+    assert env["entries"]["OM_INBOUND_AUDIT_DB"]["source"] == "env_file:.../options-monitor.env"
+
+
+def test_healthcheck_warns_when_feishu_latest_sender_not_allowed(monkeypatch, tmp_path: Path) -> None:
+    from src.application.bot.control.audit import InboundAuditStore
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    audit_db = tmp_path / "inbound.sqlite3"
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "in_healthcheck_denied_sender",
+            "channel": "feishu",
+            "sender_id": "ou_1",
+            "conversation_id": "feishu:chat_1:ou_1",
+            "message_id": "omsg_1",
+            "raw_text": "状态",
+            "parser": "deterministic",
+            "intent_name": "runtime_status",
+            "tool_name": "runtime_status",
+            "decision": "allowed",
+            "result_ok": True,
+            "response": {"data": {"response_text": "ok"}},
+        }
+    )
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_ID", "cli_1")
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_SECRET", "secret_1")
+    monkeypatch.setenv("OM_FEISHU_BOT_ALLOWED_OPEN_IDS", "ou_2")
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path), "audit_db": str(audit_db)})
+    check = next(item for item in out["data"]["checks"] if item["name"] == "feishu_inbound")
+
+    assert out["ok"] is True
+    assert check["status"] == "warn"
+    assert "OM_FEISHU_BOT_ALLOWED_OPEN_IDS" in check["message"]
+
+
+def test_healthcheck_rejects_placeholder_futu_mapping(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg = _public_cfg_with_futu("portfolio.runtime.json")
+    cfg["account_settings"]["user1"]["futu"]["account_id"] = "REAL_12345678"
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=cfg)
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert out["data"]["summary"]["ok"] is False
+    assert out["data"]["account_paths"]["user1"]["primary"]["ok"] is False
+    check = next(item for item in out["data"]["checks"] if item["name"] == "account_primary_paths")
+    assert check["status"] == "error"
+    assert "placeholder futu acc_id" in check["message"]
+
+
+def test_healthcheck_accepts_futu_auto_source_without_fallback_checks(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=_public_cfg_with_futu_auto_source("portfolio.runtime.json"))
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert out["data"]["summary"]["ok"] is True
+    assert out["data"]["account_paths"]["user1"]["primary"]["ok"] is True
+    assert "fallback" not in out["data"]["account_paths"]["user1"]
+    primary = next(item for item in out["data"]["checks"] if item["name"] == "account_primary_paths")
+    assert primary["status"] == "ok"
+    assert all(item["name"] != "account_fallback_paths" for item in out["data"]["checks"])
+    assert not any("holdings fallback configured" in item for item in out["warnings"])
+
+
+def test_healthcheck_accepts_account_settings_futu_account_id_without_trade_mapping(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg = _public_cfg_with_futu("portfolio.runtime.json")
+    cfg["account_settings"]["user1"]["futu"] = {"account_id": "999999999999999999"}
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=cfg)
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert out["data"]["summary"]["ok"] is True
+    primary = next(item for item in out["data"]["checks"] if item["name"] == "account_primary_paths")
+    mapping = next(item for item in out["data"]["checks"] if item["name"] == "account_mapping")
+    assert primary["status"] == "ok"
+    assert mapping["status"] == "ok"
+    assert primary["value"]["user1"]["futu_account_ids"] == ["...9999"]
+    assert mapping["value"]["user1"]["trade_source"] == "api"
+
+
+def test_healthcheck_rejects_external_holdings_account(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    monkeypatch.setenv("OM_FEISHU_APP_ID", "cli_xxx")
+    monkeypatch.setenv("OM_FEISHU_APP_SECRET", "secret_xxx")
+    monkeypatch.setenv("OM_FEISHU_HOLDINGS_TABLE", "app_token/table_id")
+    cfg_path = _write_healthcheck_config(
+        tmp_path,
+        cfg=_public_cfg_with_external_holdings("portfolio.runtime.json"),
+        data_config={
+            "option_positions": {"sqlite_path": "output_shared/state/option_positions.sqlite3"},
+            "feishu": {
+                "app_id_env": "OM_FEISHU_APP_ID",
+                "app_secret_env": "OM_FEISHU_APP_SECRET",
+                "tables": {"holdings_env": "OM_FEISHU_HOLDINGS_TABLE"},
+            },
+        },
+    )
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "CONFIG_ERROR"
+
+
+def test_healthcheck_missing_ledger_is_read_only_and_never_bootstraps(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+
+    sqlite_path = tmp_path / "output_shared" / "state" / "option_positions.sqlite3"
+
+    def unexpected_bootstrap(_path):
+        raise AssertionError("healthcheck must not load or bootstrap the positions repository")
+
+    _patch_healthcheck_dependencies(monkeypatch, load_option_positions_repo=unexpected_bootstrap)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    bootstrap = next(item for item in out["data"]["checks"] if item["name"] == "option_positions_bootstrap")
+    assert bootstrap["status"] == "warn"
+    assert bootstrap["value"]["status"] == "read_only_inspection"
+    assert "did not create it" in bootstrap["message"]
+    assert sqlite_path.exists() is False
+    assert out["data"]["summary"]["warning_count"] >= 1
+
+
+def test_healthcheck_inspects_existing_ledger_sqlite_read_only(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+
+    sqlite_path = tmp_path / "output_shared" / "state" / "option_positions.sqlite3"
+    sqlite_path.parent.mkdir(parents=True)
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE trade_events (event_id TEXT PRIMARY KEY)")
+        conn.execute("CREATE TABLE position_lots (position_id TEXT PRIMARY KEY)")
+
+    def unexpected_bootstrap(_path):
+        raise AssertionError("healthcheck must not load or bootstrap the positions repository")
+
+    _patch_healthcheck_dependencies(monkeypatch, load_option_positions_repo=unexpected_bootstrap)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    bootstrap = next(item for item in out["data"]["checks"] if item["name"] == "option_positions_bootstrap")
+    assert bootstrap["status"] == "ok"
+    assert bootstrap["value"]["status"] == "read_only_inspection"
+    assert "inspected read-only" in bootstrap["message"]
+    ledger_store = next(item for item in out["data"]["checks"] if item["name"] == "ledger_store")
+    assert ledger_store["status"] == "ok"
+    assert ledger_store["value"]["trade_event_count"] == 0
+    assert ledger_store["value"]["position_lot_count"] == 0
+
+
+def test_healthcheck_warns_on_notification_placeholder_values(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_ID", "cli_xxx")
+    monkeypatch.setenv("OM_FEISHU_BOT_APP_SECRET", "xxx")
+    monkeypatch.setenv("OM_FEISHU_BOT_USER_OPEN_ID", "ou_xxx")
+    cfg = _public_cfg_with_futu("portfolio.runtime.json")
+    cfg["notifications"] = {
+        "provider": "feishu_app",
+    }
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=cfg)
+
+    _patch_healthcheck_dependencies(monkeypatch)
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert any(item["name"] == "notification_target_placeholder" and item["status"] == "warn" for item in out["data"]["checks"])
+    assert any(item["name"] == "notification_credentials_placeholder" and item["status"] == "warn" for item in out["data"]["checks"])
+    assert any("example Feishu bot user open_id" in item for item in out["warnings"])
+    assert any("example Feishu bot credentials" in item for item in out["warnings"])
+
+
+def test_healthcheck_reports_unified_channel_health(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = _write_healthcheck_config(tmp_path)
+    _patch_healthcheck_dependencies(monkeypatch)
+    bot_config = tmp_path / "resolved" / "config.bot.json"
+    bot_config.parent.mkdir()
+    bot_config.write_text(
+        json.dumps(
+            {
+                "inbound": {
+                    "wechat_clawbot": {
+                        "label": "ops",
+                        "allowed_senders": "wechat:user_1",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "output_shared" / "state" / "channels" / "wechat_clawbot" / "ops"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps({"bot_token": "bot_secret_1", "base_url": "https://example.invalid"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (state_dir / "bindings.json").write_text(
+        json.dumps(
+            {
+                "bindings": {
+                    "ops": {
+                        "to_user_id": "wx_user_1",
+                        "context_token": "ctx_secret_1",
+                        "last_message_id": "msg_1",
+                        "updated_at_utc": "2026-06-18T01:00:00+00:00",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "service.profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(tmp_path),
+                "bot_config_path": str(bot_config),
+                "wechat_clawbot": {
+                    "enabled": True,
+                    "label": "ops",
+                    "state_dir": str(state_dir),
+                    "bot_config_path": str(bot_config),
+                    "allowed_senders_configured": True,
+                    "allowed_senders_source": "config_yaml",
+                },
+                "services": [{"name": "options-monitor-wechat-clawbot.service"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    out = run_tool("healthcheck", {"config_path": str(cfg_path), "profile_path": str(profile_path)})
+
+    checks = {item["name"]: item for item in out["data"]["checks"]}
+    assert checks["channel_health"]["status"] == "ok"
+    assert out["data"]["channel_health"]["wechat_clawbot"]["available"] is True
+    assert out["data"]["channel_health"]["wechat_clawbot"]["allowed_senders_configured"] is True
+    assert "bot_secret_1" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_get_portfolio_context_allows_futu_source_without_explicit_data_config(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["portfolio"]["account"] = "user1"
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _fake_load_portfolio_context(**kwargs):  # type: ignore[no-untyped-def]
+        assert str(kwargs["data_config"]).endswith("portfolio.runtime.json")
+        return {
+            "portfolio_source_name": "futu",
+            "cash_by_currency": {"USD": 1000.0},
+            "stocks_by_symbol": {},
+        }
+
+    _patch_agent_tool_dependencies(monkeypatch, load_portfolio_context=_fake_load_portfolio_context)
+    out = run_tool("get_portfolio_context", {"config_path": str(cfg_path), "account": "user1"})
+
+    assert out["ok"] is True
+    assert out["data"]["portfolio_source_name"] == "futu"
+
+
+def test_get_portfolio_context_materializes_futu_account(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+    import src.application.pipeline_context as pipeline_context
+
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=_public_cfg_with_futu("portfolio.runtime.json", market="hk"), file_name="config.hk.json")
+    monkeypatch.setattr(pipeline_context, "_persist_source_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        pipeline_context,
+        "fetch_futu_portfolio_context",
+        lambda **_kwargs: {
+            "filters": {"broker": "富途", "account": "user1"},
+            "cash_by_currency": {"HKD": 10000.0},
+            "stocks_by_symbol": {
+                "0700.HK": {"symbol": "0700.HK", "shares": 100, "currency": "HKD", "account": "user1"},
+            },
+        },
+    )
+
+    out_root = tmp_path / "agent_tools"
+    out = run_tool(
+        "get_portfolio_context",
+        {"config_path": str(cfg_path), "account": "user1", "output_dir": str(out_root)},
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["filters"]["account"] == "user1"
+    cached = json.loads((out_root / "portfolio_context_state" / "portfolio_context.json").read_text(encoding="utf-8"))
+    assert cached["filters"]["account"] == "user1"
+    assert cached["stocks_by_symbol"]["0700.HK"]["account"] == "user1"
+
+
+def test_get_portfolio_context_rejects_external_holdings_runtime_config(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg = _public_cfg_with_futu("portfolio.runtime.json", market="hk")
+    cfg["account_settings"]["user1"] = {"type": "external_holdings", "holdings_account": "sy"}
+    cfg["portfolio"]["source_by_account"] = {"user1": "holdings"}
+    cfg_path = _write_healthcheck_config(tmp_path, cfg=cfg, file_name="config.hk.json")
+
+    out = run_tool("get_portfolio_context", {"config_path": str(cfg_path), "account": "user1"})
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "CONFIG_ERROR"
+
+
+def test_spec_exposes_broker_as_public_field() -> None:
+    from src.application.tool_execution import build_tool_manifest as build_spec
+
+    spec = build_spec()
+    query_tool = next(item for item in spec["tools"] if item["name"] == "query_cash_headroom")
+    assert "broker" in query_tool["input_schema"]
+    assert "account" in query_tool["input_json_schema"].get("required", [])
+    assert "market" not in query_tool["input_schema"]
+    assert "data_config" in query_tool["input_schema"]
+    assert "pm_config" not in query_tool["input_schema"]
+
+
+def test_version_check_returns_agent_diagnostic(monkeypatch) -> None:
+    import src.application.tool_execution as tool_execution
+
+    def _check_version_update(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "current_version": "1.0.9",
+            "latest_version": "1.0.9",
+            "update_available": False,
+            "remote_name": kwargs["remote_name"],
+            "release_tag": "v1.0.9",
+            "checked_at": "2026-05-05T00:00:00Z",
+            "message": "当前已是最新版本 1.0.9",
+            "error": None,
+        }
+
+    _patch_agent_tool_dependencies(monkeypatch, check_version_update=_check_version_update)
+
+    out = tool_execution.execute_tool("version_check", {"remote_name": "origin"})
+
+    assert out["ok"] is True
+    assert out["warnings"] == []
+    assert out["data"]["current_version"] == "1.0.9"
+    assert out["data"]["remote_name"] == "origin"
+
+
+def test_version_update_defaults_to_dry_run(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+
+    out = run_tool("version_update", {"bump": "patch"})
+
+    assert out["ok"] is True
+    assert out["warnings"] == ["dry-run only; pass apply=true to write VERSION"]
+    assert out["data"]["mode"] == "dry_run"
+    assert out["data"]["current_version"] == "1.0.0"
+    assert out["data"]["target_version"] == "1.0.1"
+    assert out["data"]["would_change"] is True
+    assert out["data"]["changed"] is False
+    assert out["meta"]["version_path"] == ".../VERSION"
+    assert (tmp_path / "VERSION").read_text(encoding="utf-8").strip() == "1.0.0"
+
+
+def test_version_update_apply_writes_version(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+
+    out = run_tool("version_update", {"target_version": "1.1.0", "apply": True, "confirm": True})
+
+    assert out["ok"] is True
+    assert out["warnings"] == []
+    assert out["data"]["mode"] == "applied"
+    assert out["data"]["target_version"] == "1.1.0"
+    assert out["data"]["changed"] is True
+    assert (tmp_path / "VERSION").read_text(encoding="utf-8").strip() == "1.1.0"
+
+
+def test_version_update_apply_requires_write_gate(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+
+    blocked = run_tool("version_update", {"target_version": "1.1.0", "apply": True})
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "PERMISSION_DENIED"
+    assert (tmp_path / "VERSION").read_text(encoding="utf-8").strip() == "1.0.0"
+
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+    needs_confirm = run_tool("version_update", {"target_version": "1.1.0", "apply": True})
+    assert needs_confirm["ok"] is False
+    assert needs_confirm["error"]["code"] == "CONFIRMATION_REQUIRED"
+    assert (tmp_path / "VERSION").read_text(encoding="utf-8").strip() == "1.0.0"
+
+
+def test_version_update_rejects_removed_version_alias(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+
+    out = run_tool("version_update", {"version": "1.1.0"})
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "INPUT_ERROR"
+    assert "target_version" in out["error"]["message"]
+
+
+def test_config_validate_runs_without_opend(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["notifications"] = {
+        "channel": "wechat_clawbot",
+        "target": "clawbot:test-room",
+    }
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    out = run_tool("config_validate", {"config_path": str(cfg_path)})
+
+    assert out["ok"] is True
+    assert out["data"]["ok"] is True
+    assert out["data"]["account_count"] == 1
+    assert out["data"]["symbol_count"] == 1
+    assert out["meta"]["config_path"] == ".../config.us.json"
+
+
+def test_trade_event_cursor_key_uses_fixed_domain_derivation() -> None:
+    from src.application.agent_tools.operations_impl import (
+        _derive_trade_event_cursor_key,
+    )
+
+    derived = _derive_trade_event_cursor_key("test-inbound-key")
+    assert derived == (
+        "f8a57b73413c36f43c5af70050dff538"
+        "edcffd19cd50e9e8842ea3e827ae8c6b"
+    )
+    assert derived != "test-inbound-key"
+
+
+def test_trade_event_pagination_stops_before_ledger_when_secret_backend_fails(
+    monkeypatch,
+) -> None:
+    import src.application.agent_tools.operations_impl as operations_impl
+    from src.application.agent_tool_contracts import AgentToolError
+    from src.application.secret_store import SecretBackendUnavailable
+
+    def _raise_secret_error(_logical_name):
+        raise SecretBackendUnavailable("secret backend unavailable")
+
+    monkeypatch.setattr(operations_impl, "resolve_secret", _raise_secret_error)
+    monkeypatch.setattr(
+        operations_impl,
+        "trade_event_page",
+        lambda *_args, **_kwargs: pytest.fail("ledger query must not run"),
+    )
+
+    with pytest.raises(AgentToolError) as exc_info:
+        operations_impl._events_action(
+            object(),
+            {"account": "lx"},
+            market="us",
+            authorized_accounts=["lx"],
+            normalize_broker=str,
+            normalize_account=str,
+        )
+
+    assert exc_info.value.code == "DEPENDENCY_MISSING"
+    assert exc_info.value.message == "inbound.operation_hmac_key could not be resolved"
+
+
+@pytest.mark.parametrize(
+    ("source_code", "expected_code", "expected_hint"),
+    [
+        (
+            "needs_narrowing",
+            "NEEDS_NARROWING",
+            "单次最多查询 20 条，请缩小数量或增加筛选条件后重新查询。",
+        ),
+        (
+            "cursor_expired",
+            "CURSOR_EXPIRED",
+            "上次查询快照已过期，请重新发起查询；新结果可能与已返回记录重叠。",
+        ),
+    ],
+)
+def test_trade_event_pagination_errors_explain_the_next_user_action(
+    monkeypatch,
+    source_code: str,
+    expected_code: str,
+    expected_hint: str,
+) -> None:
+    import src.application.agent_tools.operations_impl as operations_impl
+    from src.application.agent_tool_contracts import AgentToolError
+    from src.application.ledger.api import TradeEventPaginationError
+
+    monkeypatch.setattr(operations_impl, "resolve_secret", lambda _name: "test-key")
+
+    def fail_page(*_args, **_kwargs):
+        raise TradeEventPaginationError("pagination unavailable", code=source_code)
+
+    monkeypatch.setattr(operations_impl, "trade_event_page", fail_page)
+
+    with pytest.raises(AgentToolError) as exc_info:
+        operations_impl._events_action(
+            object(),
+            {"account": "lx"},
+            market="us",
+            authorized_accounts=["lx"],
+            normalize_broker=str,
+            normalize_account=str,
+        )
+
+    assert exc_info.value.code == expected_code
+    assert exc_info.value.hint == expected_hint
+
+
+def test_option_positions_read_open_assigned_stock_includes_partially_sold(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+    from domain.domain.option_position_lots import parse_exp_to_ms
+    from src.application.ledger.commands import record_manual_assignment
+    from src.application.positions.workflows import execute_manual_assigned_stock_sale
+
+    def _ms(value: str) -> int:
+        out = parse_exp_to_ms(value)
+        assert out is not None
+        return out
+
+    sqlite_path = tmp_path / "output_shared" / "state" / "option_positions.sqlite3"
+    data_cfg_path = tmp_path / "portfolio.runtime.json"
+    data_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    data_cfg_path.write_text(
+        json.dumps({"option_positions": {"sqlite_path": str(sqlite_path)}}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(
+        json.dumps(_public_cfg_with_futu(str(data_cfg_path)), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    repo = ledger_repository.SQLiteOptionPositionsRepository(sqlite_path)
+    ledger_manual_trades.persist_manual_open_event(
+        repo,
+        broker="富途",
+        account="user1",
+        symbol="NVDA",
+        option_type="put",
+        side="short",
+        contracts=1,
+        currency="USD",
+        strike=100.0,
+        multiplier=100,
+        expiration_ymd="2026-06-19",
+        premium_per_share=2.5,
+        opened_at_ms=_ms("2026-04-03"),
+    )
+    lot = repo.list_position_lots()[0]
+    record_manual_assignment(
+        repo,
+        lot_id=str(lot["record_id"]),
+        contracts_to_close=1,
+        stock_side="buy",
+        stock_qty=100,
+        stock_price=100.0,
+        as_of_ms=_ms("2026-05-15"),
+    )
+    assignment_event = [item for item in repo.list_trade_events() if item.get("event_type") == "assignment"][0]
+    lot_id = f"assigned-stock-{assignment_event['event_id']}"
+    execute_manual_assigned_stock_sale(
+        repo,
+        target_lot_id=lot_id,
+        account="user1",
+        broker="富途",
+        symbol="NVDA",
+        currency="USD",
+        shares=40,
+        price=105.0,
+        trade_time_ms=_ms("2026-06-01"),
+        dry_run=False,
+    )
+
+    quote_snapshots = [{"symbol": "NVDA", "spot": 98.0, "quote_time_ms": _ms("2026-06-02")}]
+    open_rows = run_tool(
+        "option_positions_read",
+        {
+            "config_path": str(cfg_path),
+            "action": "assigned-stock",
+            "account": "user1",
+            "status": "open",
+            "quote_snapshots": quote_snapshots,
+        },
+    )
+    partially_sold_rows = run_tool(
+        "option_positions_read",
+        {
+            "config_path": str(cfg_path),
+            "action": "assigned-stock",
+            "account": "user1",
+            "status": "partially_sold",
+            "quote_snapshots": quote_snapshots,
+        },
+    )
+    closed_rows = run_tool(
+        "option_positions_read",
+        {
+            "config_path": str(cfg_path),
+            "action": "assigned-stock",
+            "account": "user1",
+            "status": "closed",
+            "quote_snapshots": quote_snapshots,
+        },
+    )
+
+    assert open_rows["ok"] is True
+    assert open_rows["data"]["row_count"] == 1
+    open_row = open_rows["data"]["rows"][0]
+    assert open_row["stock_lot_id"] == lot_id
+    assert open_row["status"] == "partially_sold"
+    assert open_row["shares_remaining"] == 60
+    assert open_row["shares_sold"] == 40
+    assert partially_sold_rows["ok"] is True
+    assert partially_sold_rows["data"]["row_count"] == 1
+    assert closed_rows["ok"] is True
+    assert closed_rows["data"]["row_count"] == 0
+    assert closed_rows["data"]["assigned_stock_sale_rows"] == []
+    assert closed_rows["data"]["assigned_stock_review_rows"] == []
+
+    other_symbol = run_tool(
+        "option_positions_read",
+        {
+            "config_path": str(cfg_path),
+            "action": "assigned-stock",
+            "account": "user1",
+            "symbol": "MSFT",
+            "refresh_quotes": False,
+            "quote_snapshots": quote_snapshots,
+        },
+    )
+    assert other_symbol["data"]["assigned_stock_lots"] == []
+    assert other_symbol["data"]["assigned_stock_sale_rows"] == []
+    assert other_symbol["data"]["assigned_stock_review_rows"] == []
+
+
+def test_runtime_status_summarizes_runtime_files(tmp_path: Path) -> None:
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["notifications"] = {
+        "channel": "wechat_clawbot",
+        "target": "clawbot:test-room",
+    }
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state_dir = tmp_path / "output_shared" / "state"
+    report_dir = tmp_path / "output_shared" / "reports"
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    accounts_root = tmp_path / "output_accounts"
+    runs_root = tmp_path / "output_runs"
+    for path in (state_dir, report_dir, shared_state_dir, accounts_root / "user1" / "state", accounts_root / "user1" / "reports"):
+        path.mkdir(parents=True, exist_ok=True)
+
+    (shared_state_dir / "last_run.json").write_text(json.dumps({"status": "ok", "run_id": "run-1"}), encoding="utf-8")
+    (state_dir / "auto_trade_intake_status.json").write_text(
+        json.dumps(
+            {
+                "status": "listening",
+                "stage": "deal_processed",
+                "last_heartbeat_utc": "2026-01-01T00:00:00+00:00",
+                "last_push_received_utc": "2026-01-01T00:01:00+00:00",
+                "last_push_deal_id": "deal-1",
+                "last_backfill_check_utc": "2026-01-01T00:05:00+00:00",
+                "last_backfill_window_start_utc": "2026-01-01T00:00:00+00:00",
+                "last_backfill_window_end_utc": "2026-01-01T00:05:00+00:00",
+                "last_backfill_deal_count": 2,
+                "last_backfill_applied_count": 1,
+                "last_backfill_skipped_duplicate_count": 1,
+                "missed_push_backfill_count": 1,
+                "last_deal_result": {"status": "applied", "deal_id": "deal-1"},
+                "last_backfill_result": {"status": "skipped", "deal_id": "deal-0"},
+                "last_receipt_result": {"status": "sent", "delivery_confirmed": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "auto_trade_intake_state.json").write_text(
+        json.dumps(
+            {
+                "processed_deal_ids": {
+                    "deal-1": {
+                        "status": "applied",
+                        "receipt": {"status": "sent", "delivery_confirmed": True},
+                    }
+                },
+                "failed_deal_ids": {},
+                "unresolved_deal_ids": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "auto_trade_intake_audit.jsonl").write_text('{"phase":"receipt_sent"}\n', encoding="utf-8")
+    (state_dir / "option_positions_context.json").write_text(
+        json.dumps(
+            {
+                "ledger": {
+                    "status": "ok",
+                    "reason": "ledger_shadow_ok",
+                    "read_model": "ledger_shadow",
+                    "fail_closed": False,
+                    "source_record_count": 1,
+                    "imported_event_count": 1,
+                    "lot_count": 1,
+                    "open_lot_count": 1,
+                    "view_count": 1,
+                },
+                "open_positions_min": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    projection_verify_dir = shared_state_dir / "option_positions" / "current"
+    projection_verify_dir.mkdir(parents=True, exist_ok=True)
+    (projection_verify_dir / "projection_verify.latest.json").write_text(
+        json.dumps({"ok": True, "mode_used": "checkpoint_reuse", "summary": {"matched": 1}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "upgrade_status.json").write_text(
+        json.dumps({"status": "upgraded", "target_version": "1.2.99"}),
+        encoding="utf-8",
+    )
+    (report_dir / "symbols_notification.txt").write_text("shared notification\n", encoding="utf-8")
+    (accounts_root / "user1" / "state" / "last_run.json").write_text(json.dumps({"status": "account_ok"}), encoding="utf-8")
+    (accounts_root / "user1" / "reports" / "symbols_notification.txt").write_text("account notification\n", encoding="utf-8")
+
+    run_dir = runs_root / "run-1"
+    (run_dir / "state").mkdir(parents=True, exist_ok=True)
+    (run_dir / "accounts" / "user1" / "state").mkdir(parents=True, exist_ok=True)
+    (shared_state_dir / "last_run_dir.txt").write_text(str(run_dir), encoding="utf-8")
+    (run_dir / "state" / "tick_metrics.json").write_text(
+        json.dumps(
+            {
+                "scheduler_decision": {
+                    "should_run_scan": True,
+                    "is_notify_window_open": True,
+                    "reason": "到达运行点 11:00：执行扫描并允许通知。",
+                },
+                "notify_summary": {
+                    "account_messages_count": 1,
+                    "send_attempted_count": 1,
+                    "send_confirmed_count": 1,
+                    "send_failed_count": 0,
+                },
+                "sent_accounts": ["user1"],
+                "reason": "sent",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "accounts" / "user1" / "symbols_notification.txt").write_text("run account notification\n", encoding="utf-8")
+    (run_dir / "accounts" / "user1" / "state" / "required_data_prefetch_summary.json").write_text(
+        json.dumps(
+            {
+                "to_fetch": 3,
+                "deduped_count": 1,
+                "errors": 0,
+                "run_fetch_summary": {
+                    "bottleneck": "option_chain_rate_gate",
+                    "opend_calls": {
+                        "total": 6,
+                        "option_chain": 4,
+                        "option_expiration": 1,
+                        "market_snapshot": 1,
+                    },
+                    "cache": {
+                        "option_chain_hits": 2,
+                        "option_expiration_hits": 3,
+                    },
+                    "rate_gate_wait_sec": {
+                        "option_chain": 12.5,
+                    },
+                    "snapshot": {
+                        "requested_codes": 20,
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "accounts" / "user1" / "state" / "expired_position_maintenance.json").write_text(
+        json.dumps(
+            {
+                "mode": "applied",
+                "applied_closed": 1,
+                "receipt": {
+                    "status": "sent",
+                    "delivery_confirmed": True,
+                    "message_id": "msg-auto-1",
+                    "attempt_count": 1,
+                    "receipt_key": "receipt-key-1",
+                    "updated_at": "2026-05-15T16:10:00+00:00",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out = _execute_private_runtime_status(
+        {
+            "config_path": str(cfg_path),
+            "state_dir": str(state_dir),
+            "report_dir": str(report_dir),
+            "shared_state_dir": str(shared_state_dir),
+            "accounts_root": str(accounts_root),
+            "runs_root": str(runs_root),
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["warnings"] == []
+    assert out["data"]["summary"]["ok"] is True
+    assert out["data"]["summary"]["latest_status"] == "ok"
+    shared_compatibility = out["data"]["shared"]["compatibility_notification"]
+    assert shared_compatibility["text"] == "shared notification\n"
+    assert shared_compatibility["artifact_kind"] == "compatibility_notification_bundle"
+    assert shared_compatibility["primary_renderer"] == "compact"
+    assert shared_compatibility["may_include"] == ["close_advice"]
+    assert shared_compatibility["authority"] == "compatibility_only"
+    assert shared_compatibility["delivery_evidence"] is False
+    assert "deprecated_field" not in shared_compatibility
+    assert out["data"]["shared"]["notification"] == {**shared_compatibility, "deprecated_field": True}
+    account_compatibility = out["data"]["accounts"]["user1"]["compatibility_notification"]
+    assert account_compatibility["text"] == "account notification\n"
+    assert out["data"]["accounts"]["user1"]["notification"] == {
+        **account_compatibility,
+        "deprecated_field": True,
+    }
+    assert out["data"]["latest_run"]["state"]["tick_metrics"]["json"]["notify_summary"]["send_confirmed_count"] == 1
+    assert out["data"]["option_positions_context"]["ledger"]["status"] == "ok"
+    assert out["data"]["summary"]["ledger_status"] == "ok"
+    assert out["data"]["summary"]["ledger_fail_closed"] is False
+    assert out["data"]["ledger_store"]["runtime_root"] == str(tmp_path.resolve())
+    assert out["data"]["ledger_store"]["sqlite_path"] == str((tmp_path / "output_shared" / "state" / "option_positions.sqlite3").resolve())
+    assert out["data"]["summary"]["ledger_sqlite_path"] == out["data"]["ledger_store"]["sqlite_path"]
+    assert out["data"]["projection_verify"]["json"]["ok"] is True
+    assert out["data"]["summary"]["projection_verify_ok"] is True
+    assert out["data"]["summary"]["projection_verify_mode"] == "checkpoint_reuse"
+    assert out["data"]["service_upgrade"]["json"]["status"] == "upgraded"
+    assert out["data"]["summary"]["service_upgrade_status"] == "upgraded"
+    assert out["data"]["summary"]["service_upgrade_target_version"] == "1.2.99"
+    assert out["data"]["notification_diagnosis"]["status"] == "sent"
+    assert out["data"]["notification_diagnosis"]["scheduler_should_run_scan"] is True
+    assert out["data"]["notification_diagnosis"]["send_confirmed_count"] == 1
+    run_compatibility = out["data"]["latest_run"]["accounts"]["user1"]["compatibility_notification"]
+    assert run_compatibility["text"] == "run account notification\n"
+    assert out["data"]["latest_run"]["accounts"]["user1"]["notification"] == {
+        **run_compatibility,
+        "deprecated_field": True,
+    }
+    authority = out["data"]["notification_authority"]
+    assert authority["ordinary_scheduled_renderer"] == "daily_brief"
+    assert authority["legacy_renderer"] == {
+        "renderer": "legacy",
+        "status": "deprecated",
+        "removal_phase": "phase_c",
+    }
+    assert authority["legacy_aliases"]["shared.notification"]["replacement"] == "shared.compatibility_notification"
+    account_summary = out["data"]["account_summary"]
+    assert account_summary["accounts"]["user1"]["compatibility_notification_exists"] is True
+    assert account_summary["accounts"]["user1"]["notification_exists"] is True
+
+
+    assert account_summary["accounts_with_compatibility_notification"] == 1
+    assert account_summary["accounts_with_notification"] == 1
+    assert out["data"]["latest_run"]["accounts"]["user1"]["required_data_prefetch"]["exists"] is True
+    assert out["data"]["latest_run"]["accounts"]["user1"]["expired_position_maintenance"]["json"]["receipt"]["status"] == "sent"
+    assert out["data"]["latest_run"]["accounts"]["user1"]["auto_close_receipt"]["receipt_key"] == "receipt-key-1"
+    assert out["data"]["latest_run"]["accounts"]["user1"]["auto_close_receipt"]["attempt_count"] == 1
+    assert out["data"]["summary"]["prefetch_available"] is True
+    assert out["data"]["summary"]["prefetch_bottleneck"] == "option_chain_rate_gate"
+    assert out["data"]["required_data_prefetch"]["total_opend_calls"] == 6
+    assert out["data"]["required_data_prefetch"]["total_rate_gate_wait_sec"] == 12.5
+    assert out["data"]["required_data_prefetch"]["accounts"]["user1"]["deduped_count"] == 1
+    assert out["data"]["required_data_prefetch"]["accounts"]["user1"]["cache"]["option_expiration_hits"] == 3
+    assert out["data"]["trade_intake"]["summary"]["listener_status"] == "listening"
+    assert out["data"]["trade_intake"]["summary"]["last_push_received_utc"] == "2026-01-01T00:01:00+00:00"
+    assert out["data"]["trade_intake"]["summary"]["last_push_deal_id"] == "deal-1"
+    assert out["data"]["trade_intake"]["summary"]["last_backfill_check_utc"] == "2026-01-01T00:05:00+00:00"
+    assert out["data"]["trade_intake"]["summary"]["last_backfill_applied_count"] == 1
+    assert out["data"]["trade_intake"]["summary"]["missed_push_backfill_count"] == 1
+    assert out["data"]["trade_intake"]["summary"]["processed_count"] == 1
+    assert out["data"]["trade_intake"]["summary"]["receipt_confirmed_count"] == 1
+    assert out["data"]["trade_intake"]["audit"]["exists"] is True
+    assert "option_positions_feishu_sync" not in out["data"]
+    assert "option_positions_feishu_sync_status" not in out["data"]["summary"]
+    assert "option_positions_feishu_sync_receipt_status" not in out["data"]["summary"]
+
+
+def test_runtime_status_public_projection_omits_private_runtime_payloads(tmp_path: Path) -> None:
+    from src.application.agent_tool_contracts import mask_path
+    from src.application.agent_tools.runtime_status_impl import runtime_status_tool
+    from src.application.bot.control.audit import InboundAuditStore
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["notifications"] = {"channel": "feishu", "target": "ou_A9x7PrivateRecipient"}
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    bot_path = tmp_path / "resolved" / "config.bot.json"
+    bot_path.parent.mkdir(parents=True)
+    bot_path.write_text(
+        json.dumps(
+            {
+                "bot": {'enabled': False, 'llm': {'provider': 'openai', 'model': 'private-model-name', 'base_url': 'https://' + 'private-user:private-password@private.example/v1', 'api_key_env': 'PRIVATE_MODEL_API_KEY'}}
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    audit_db = tmp_path / "inbound.sqlite3"
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "command-private-marker",
+            "channel": "feishu",
+            "sender_id": "ou_A9x7PrivateSender",
+            "conversation_id": "oc_B8y6PrivateConversation",
+            "message_id": "om_C7z5PrivateMessage",
+            "raw_text": "private portfolio question marker",
+            "response": {"data": {"position": "PRIVATE-HOLDING-MARKER"}},
+        }
+    )
+
+    shared_state = tmp_path / "output_shared" / "state"
+    reports = tmp_path / "output_shared" / "reports"
+    runs = tmp_path / "output_runs"
+    run_dir = runs / "run-public-safe"
+    (run_dir / "state").mkdir(parents=True)
+    reports.mkdir(parents=True)
+    shared_state.mkdir(parents=True)
+    (shared_state / "last_run.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "sender_id": "ou_A9x7PrivateSender",
+                "positions": [{"symbol": "PRIVATE-HOLDING-MARKER", "balance": 123456.78}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (shared_state / "last_run_dir.txt").write_text(str(run_dir), encoding="utf-8")
+    (reports / "symbols_notification.txt").write_text("private notification text marker\n", encoding="utf-8")
+    (run_dir / "state" / "tick_metrics.json").write_text(
+        json.dumps({"ran_scan": True, "message_id": "om_C7z5PrivateMessage"}),
+        encoding="utf-8",
+    )
+
+    data, warnings, meta = runtime_status_tool(
+        {
+            "config_path": str(cfg_path),
+            "bot_config_path": str(bot_path),
+            "wechat_clawbot": {"audit_db": str(audit_db)},
+            "shared_state_dir": str(shared_state),
+            "state_dir": str(shared_state),
+            "report_dir": str(reports),
+            "runs_root": str(runs),
+            "accounts_root": str(tmp_path / "output_accounts"),
+        },
+        load_runtime_config=lambda **_kwargs: (cfg_path, cfg),
+        normalize_accounts=lambda value, fallback=(): list(value or fallback),
+        accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+        read_json_object_or_empty=lambda path: json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+        repo_base=lambda: tmp_path,
+        mask_path=mask_path,
+    )
+
+    serialized = json.dumps({"data": data, "warnings": warnings, "meta": meta}, ensure_ascii=False)
+    for marker in (
+        str(tmp_path),
+        "ou_A9x7PrivateSender",
+        "ou_A9x7PrivateRecipient",
+        "oc_B8y6PrivateConversation",
+        "om_C7z5PrivateMessage",
+        "private portfolio question marker",
+        "private notification text marker",
+        "PRIVATE-HOLDING-MARKER",
+        "private-password",
+        "private.example",
+        "PRIVATE_MODEL_API_KEY",
+    ):
+        assert marker not in serialized
+    assert data["schema_version"] == "runtime-status-public.v2"
+    assert data["summary"]["latest_run_id"] == "run-public-safe"
+    assert data["latest_run"]["run_id"] == "run-public-safe"
+
+
+@pytest.mark.parametrize("identity_count", [0, 4])
+def test_runtime_status_reads_account_trade_intake_sources(tmp_path: Path, identity_count: int) -> None:
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["accounts"] = ["lx", "sy"]
+    cfg["portfolio"]["data_config"] = "portfolio.runtime.json"
+    cfg["account_settings"] = {
+        "lx": {
+            "type": "futu",
+            "futu": {
+                "account_id": "999000000000000001",
+                "host": "127.0.0.1",
+                "port": 11111,
+            },
+        },
+        "sy": {
+            "type": "futu",
+            "futu": {
+                "account_id": "281756479859383817",
+                "host": "127.0.0.1",
+                "port": 11112,
+            },
+        },
+    }
+    cfg["trade_intake"] = {"enabled": True, "mode": "apply"}
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    (tmp_path / "portfolio.runtime.json").write_text(
+        json.dumps({"option_positions": {"sqlite_path": "output_shared/state/option_positions.sqlite3"}}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "output_shared" / "state"
+    report_dir = tmp_path / "output_shared" / "reports"
+    accounts_root = tmp_path / "output_accounts"
+    runs_root = tmp_path / "output_runs"
+    for account in ("lx", "sy"):
+        (state_dir / "trade_intake" / account).mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(state_dir / "option_positions.sqlite3"):
+        pass
+    report_dir.mkdir(parents=True)
+    accounts_root.mkdir(parents=True)
+    runs_root.mkdir(parents=True)
+
+    (state_dir / "trade_intake" / "lx" / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "listening",
+                "last_push_received_utc": "2026-01-01T00:01:00+00:00",
+                "last_push_deal_id": "lx-deal-1",
+                "inbox": {"identity_needs_review_count": identity_count},
+                "last_fee_sync": {
+                    "attempted_at_ms": 1_767_225_780_000,
+                    "actual_count": 1,
+                    "already_actual_count": 0,
+                    "pending_count": 1,
+                    "failed_count": 1,
+                    "last_error": "provider_order_query_failed",
+                    "last_error_type": "ConnectionError",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "trade_intake" / "lx" / "state.json").write_text(
+        json.dumps(
+            {
+                "processed_deal_ids": {
+                    "lx-deal-1": {
+                        "receipt": {"status": "sent", "delivery_confirmed": True},
+                    }
+                },
+                "failed_deal_ids": {},
+                "unresolved_deal_ids": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "trade_intake" / "lx" / "audit.jsonl").write_text('{"phase":"lx"}\n', encoding="utf-8")
+    (state_dir / "trade_intake" / "sy" / "status.json").write_text(
+        json.dumps(
+            {
+                "status": "listening",
+                "last_push_received_utc": "2026-01-01T00:02:00+00:00",
+                "last_push_deal_id": "sy-deal-1",
+                "last_backfill_check_utc": "2026-01-01T00:03:00+00:00",
+                "last_backfill_applied_count": 1,
+                "last_fee_sync": {
+                    "attempted_at_ms": 1_767_225_720_000,
+                    "actual_count": 0,
+                    "already_actual_count": 1,
+                    "pending_count": 0,
+                    "failed_count": 0,
+                    "last_error": None,
+                    "last_error_type": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "trade_intake" / "sy" / "state.json").write_text(
+        json.dumps(
+            {
+                "processed_deal_ids": {},
+                "failed_deal_ids": {"sy-deal-1": {"reason": "source_classification_pending"}},
+                "unresolved_deal_ids": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (state_dir / "trade_intake" / "sy" / "audit.jsonl").write_text(
+        json.dumps({"deal_id": "sy-deal-1", "result": {"reason": "not_option_deal"}}) + "\n",
+        encoding="utf-8",
+    )
+
+    out = _execute_private_runtime_status(
+        {
+            "config_path": str(cfg_path),
+            "state_dir": str(state_dir),
+            "report_dir": str(report_dir),
+            "shared_state_dir": str(state_dir),
+            "accounts_root": str(accounts_root),
+            "runs_root": str(runs_root),
+        },
+    )
+
+    assert out["ok"] is True
+    trade = out["data"]["trade_intake"]
+    assert trade["status"]["source_count"] == 2
+    assert trade["state"]["source_count"] == 2
+    assert trade["audit"]["source_count"] == 2
+    assert [item["account"] for item in trade["sources"]] == ["lx", "sy"]
+    assert trade["sources"][0]["summary"]["last_push_deal_id"] == "lx-deal-1"
+    assert trade["sources"][1]["summary"]["last_push_deal_id"] == "sy-deal-1"
+    assert trade["sources"][1]["summary"]["pending_after_reconcile_count"] == 1
+    assert trade["sources"][1]["summary"]["audit_reconciliation"]["pending_after_reconcile_count"] == 0
+    assert trade["summary"]["listener_status"] == "listening"
+    assert trade["summary"]["source_count"] == 2
+    assert trade["summary"]["processed_count"] == 1
+    assert trade["summary"]["failed_count"] == 1
+    assert trade["summary"]["receipt_confirmed_count"] == 1
+    assert trade["summary"]["last_push_deal_id"] == "sy-deal-1"
+    assert trade["summary"]["last_backfill_applied_count"] == 1
+    assert trade["summary"]["fee_actual_count"] == 1
+    assert trade["summary"]["fee_already_actual_count"] == 1
+    assert trade["summary"]["fee_pending_count"] == 1
+    assert trade["summary"]["fee_failed_count"] == 1
+    assert trade["summary"]["fee_failed_source_count"] == 1
+    assert trade["summary"]["last_fee_attempted_at_ms"] == 1_767_225_780_000
+    assert trade["summary"]["last_fee_error"] == "provider_order_query_failed"
+    assert trade["summary"]["last_fee_error_type"] == "ConnectionError"
+    assert trade["summary"]["identity_review_required"] is bool(identity_count)
+    assert ("TRADE_INTAKE_IDENTITY_REVIEW_REQUIRED" in out["data"]["summary"]["warning_codes"]) is bool(identity_count)
+    from src.application.agent_tools.diagnostics import _runtime_status_tool
+    public, warnings, _ = _runtime_status_tool({
+        "config_path": str(cfg_path), "state_dir": str(state_dir),
+        "report_dir": str(report_dir), "shared_state_dir": str(state_dir),
+        "accounts_root": str(accounts_root), "runs_root": str(runs_root),
+    })
+    assert public["trade_intake"]["summary"]["identity_review_required"] is bool(identity_count)
+    assert ("runtime_status:TRADE_INTAKE_IDENTITY_REVIEW_REQUIRED" in warnings) is bool(identity_count)
+    assert "lx-deal-1" not in json.dumps(public)
+
+    sy_dir = state_dir / "trade_intake" / "sy"
+    legacy_out = _execute_private_runtime_status({
+        "config_path": str(cfg_path),
+        "state_dir": str(state_dir),
+        "report_dir": str(report_dir),
+        "shared_state_dir": str(state_dir),
+        "accounts_root": str(accounts_root),
+        "runs_root": str(runs_root),
+        "trade_intake_status_path": str(sy_dir / "status.json"),
+        "trade_intake_state_path": str(sy_dir / "state.json"),
+        "trade_intake_audit_path": str(sy_dir / "audit.jsonl"),
+    })
+    legacy_trade = legacy_out["data"]["trade_intake"]
+    assert "sources" not in legacy_trade
+    assert legacy_trade["summary"]["pending_after_reconcile_count"] == 1
+    assert legacy_trade["summary"]["audit_reconciliation"]["pending_after_reconcile_count"] == 0
+
+
+def test_trade_intake_summary_reports_single_fee_failed_source() -> None:
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    summary = runtime_status._trade_intake_summary(
+        {},
+        {"last_fee_sync": {"failed_count": 2}},
+    )
+
+    assert summary["fee_failed_source_count"] == 1
+
+
+def test_runtime_status_reconciliation_preview_skips_historical_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    calls: list[dict[str, Any]] = []
+
+    def _preview(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {"available": True}
+
+    monkeypatch.setattr(
+        runtime_status,
+        "preview_trade_intake_reconciliation_from_sqlite",
+        _preview,
+    )
+    state_path = tmp_path / "state.json"
+    sqlite_path = tmp_path / "ledger.sqlite3"
+
+    summary = runtime_status._trade_intake_reconciliation_summary(
+        state_path=state_path,
+        ledger_store={"sqlite_path": str(sqlite_path)},
+    )
+
+    assert calls == [{"state_path": state_path, "sqlite_path": sqlite_path}]
+    assert summary["reconciliation_preview_available"] is True
+
+
+def test_runtime_status_reports_config_authority(tmp_path: Path) -> None:
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["_generated"]["sources"] = [
+        {"role": "system", "loaded": True, "inline": True, "sha256": "system-sha"},
+        {"role": "common_user", "loaded": False, "optional": True, "enabled": False},
+        {"role": "market_user", "loaded": True, "inline": True, "sha256": "yaml-sha"},
+    ]
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    out = _execute_private_runtime_status(
+        {
+            "config_path": str(cfg_path),
+            "state_dir": str(tmp_path / "state"),
+            "report_dir": str(tmp_path / "reports"),
+            "shared_state_dir": str(tmp_path / "state"),
+            "accounts_root": str(tmp_path / "accounts"),
+            "runs_root": str(tmp_path / "runs"),
+        },
+    )
+
+    assert out["ok"] is True
+    authority = out["data"]["config_authority"]
+    assert authority["ok"] is True
+    assert authority["authoring_source"] == "config.yaml"
+    assert authority["source_format"] == "yaml"
+    assert authority["config_yaml_sha256"] == "yaml-sha"
+    assert authority["system_config_sha256"] == "system-sha"
+    assert authority["identity"]["ok"] is True
+    assert authority["freshness"]["ok"] is True
+    assert out["data"]["summary"]["config_authority_ok"] is True
+
+
+def test_runtime_status_reports_config_authority_for_legacy_runtime_config(tmp_path: Path) -> None:
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["_generated"].pop("source_format")
+    cfg["_generated"]["sources"] = [
+        {"role": "system", "loaded": True, "inline": True, "sha256": "system-sha"},
+        {"role": "market_user", "loaded": True, "inline": True, "sha256": "legacy-json-sha"},
+    ]
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    out = _execute_private_runtime_status(
+        {
+            "config_path": str(cfg_path),
+            "state_dir": str(tmp_path / "state"),
+            "report_dir": str(tmp_path / "reports"),
+            "shared_state_dir": str(tmp_path / "state"),
+            "accounts_root": str(tmp_path / "accounts"),
+            "runs_root": str(tmp_path / "runs"),
+        },
+    )
+
+    assert out["ok"] is True
+    authority = out["data"]["config_authority"]
+    assert authority["ok"] is False
+    assert authority["source_format"] is None
+    assert authority["identity"]["ok"] is False
+    assert authority["stale_or_invalid_reason"] == "runtime config generation metadata is missing source_format"
+    assert "--market us" in authority["rebuild_command"]
+    assert out["data"]["summary"]["config_authority_ok"] is False
+
+
+def _runtime_status_upgrade_fixture(tmp_path: Path, *, target_version: str = "1.2.82") -> dict[str, Any]:
+    (tmp_path / "VERSION").write_text("1.2.82\n", encoding="utf-8")
+    data_config = tmp_path / "portfolio.runtime.json"
+    data_config.write_text("{}", encoding="utf-8")
+    cfg_path = tmp_path / "config.us.json"
+    cfg = {
+        "accounts": ["user1"],
+        "portfolio": {"data_config": str(data_config)},
+        "notifications": {"provider": "wechat_clawbot", "target": "route"},
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    (tmp_path / "output_shared" / "state").mkdir(parents=True)
+    (tmp_path / "output_shared" / "state" / "last_run.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    (tmp_path / "output_shared" / "reports").mkdir(parents=True)
+    (tmp_path / "output_shared" / "reports" / "symbols_notification.txt").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "service.profile.json").write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(tmp_path),
+                "services": [
+                    {"name": "options-monitor-trade-intake.service"},
+                    {"name": "options-monitor-feishu-ws.service"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "upgrade_status.json").write_text(
+        json.dumps(
+            {
+                "ok": False,
+                "status": "failed",
+                "current_version": "1.2.81",
+                "target_version": target_version,
+                "changed": True,
+                "symlink_switched": True,
+                "error": "ServiceRestartError: failed to restart options-monitor-trade-intake.service",
+                "restart_failed_services": ["options-monitor-trade-intake.service"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return {"cfg_path": cfg_path, "cfg": cfg}
+
+
+def _call_runtime_status_for_upgrade(tmp_path: Path, cfg_path: Path, cfg: dict[str, Any]) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    from src.application.agent_tools.runtime_status_impl import private_runtime_status_tool
+
+    def _read_json(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    return private_runtime_status_tool(
+        {"config_path": str(cfg_path)},
+        load_runtime_config=lambda **_kwargs: (cfg_path, cfg),
+        normalize_accounts=lambda value, fallback=(): list(value or fallback),
+        accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+        read_json_object_or_empty=_read_json,
+        repo_base=lambda: tmp_path,
+        mask_path=lambda path: str(path),
+    )
+
+
+def test_runtime_status_diagnostics_survive_unavailable_secret_backend(monkeypatch, tmp_path: Path) -> None:
+    from src.application.secret_store import reset_default_secret_provider
+    from src.infrastructure.secret_store import factory as secret_factory
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+    monkeypatch.delenv("OM_SECRET_BACKEND", raising=False)
+    monkeypatch.setattr(secret_factory.platform, "system", lambda: "Linux")
+    reset_default_secret_provider()
+
+    data, _warnings, _meta = _call_runtime_status_for_upgrade(
+        tmp_path,
+        fixture["cfg_path"],
+        fixture["cfg"],
+    )
+
+    health = data["channel_health"]["feishu"]
+    assert health["configured"] is True
+    assert health["available"] is False
+    assert health["credentials_configured"] is False
+    # resolve_secret_status now degrades gracefully on unavailable backends
+    # instead of raising SecretBackendUnavailable; credential_error is absent
+    # and the credential status reports backend=unavailable.
+    assert "credential_error" not in health or health.get("credential_error") is None
+    assert data["environment"]["secret_credentials"]["summary"]["values_exposed"] is False
+
+
+def test_runtime_status_reports_bot_llm_and_latest_agent_route(monkeypatch, tmp_path: Path) -> None:
+    from src.application.bot.control.audit import InboundAuditStore
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+    bot_dir = tmp_path / "resolved"
+    bot_dir.mkdir()
+    (bot_dir / "config.bot.json").write_text(
+        json.dumps(
+            {
+                "bot": {'enabled': True, 'context_window_messages': 6, 'default_market_scope': 'us', 'llm': {'provider': 'deepseek', 'base_url': 'https://api.deepseek.com', 'model': 'deepseek-v4-flash', 'api_key_env': 'DEEPSEEK_API_KEY', 'context_window_tokens': 24000, 'max_output_tokens': 2048}}
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audit_db = tmp_path / "inbound.sqlite3"
+    monkeypatch.setenv("OM_INBOUND_AUDIT_DB", str(audit_db))
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "in_runtime_status_agent_route",
+            "channel": "feishu",
+            "sender_id": "ou_1",
+            "conversation_id": "feishu:chat_1:ou_1",
+            "message_id": "omsg_1",
+            "raw_text": "系统怎么样",
+            "parser": "llm",
+            "intent_name": "runtime_status",
+            "tool_name": "runtime_status",
+            "decision": "allowed",
+            "result_ok": True,
+            "response": {
+                "meta": {
+                    "bot": {'enabled': False, 'route': 'agent_loop', 'llm': {'attempted': True, 'reason': 'accepted'}, 'context': {'provided': True, 'recent_count': 1, 'pending_count': 0}}
+                }
+            },
+        }
+    )
+
+    data, _warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["bot_runtime"]["config"]["enabled"] is True
+    assert data["bot_runtime"]["config"]["enabled"] is True
+    assert "bot" not in data["bot_runtime"]["config"]
+    assert data["bot_runtime"]["llm"]["enabled"] is True
+    assert data["bot_runtime"]["llm"]["provider"] == "deepseek"
+    assert data["bot_runtime"]["llm"]["endpoint_url"] == "https://api.deepseek.com/chat/completions"
+    assert data["bot_runtime"]["llm"]["api_key_configured"] is True
+    assert data["bot_runtime"]["audit"]["latest"]["route"] == "agent_loop"
+    assert data["bot_runtime"]["audit"]["latest"]["llm_reason"] == "accepted"
+    assert data["summary"]["bot_enabled"] is True
+    assert "bot_bot_portfolio_enabled" not in data["summary"]
+    assert data["summary"]["bot_latest_route"] == "agent_loop"
+
+
+def test_runtime_status_does_not_report_llm_endpoint_when_llm_disabled(tmp_path: Path) -> None:
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+
+    data, _warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["bot_runtime"]["config"]["enabled"] is False
+    assert data["bot_runtime"]["llm"]["enabled"] is False
+    assert data["bot_runtime"]["llm"]["provider"] == ""
+    assert data["bot_runtime"]["llm"]["endpoint_url"] is None
+
+
+def test_runtime_status_uses_service_profile_bot_config_and_env_file(tmp_path: Path) -> None:
+    from src.application.bot.control.audit import InboundAuditStore
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+    bot_path = tmp_path / "assistant" / "config.bot.json"
+    bot_path.parent.mkdir()
+    bot_path.write_text(
+        json.dumps(
+            {
+                "bot": {'enabled': False, 'llm': {'provider': 'deepseek', 'base_url': 'https://api.deepseek.com', 'model': 'deepseek-v4-flash', 'api_key_env': 'DEEPSEEK_API_KEY'}}
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    audit_db = tmp_path / "profile-audit.sqlite3"
+    env_file = tmp_path / "options-monitor.env"
+    env_file.write_text(
+        f"DEEPSEEK_API_KEY=sk-profile\nOM_INBOUND_AUDIT_DB={audit_db}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "service.profile.json").write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(tmp_path),
+                "env_file": str(env_file),
+                "bot_config_path": str(bot_path),
+                "feishu_ws": {
+                    "bot_config_path": str(bot_path),
+                    "audit_db": str(audit_db),
+                },
+                "services": [{"name": "options-monitor-feishu-ws.service"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    InboundAuditStore(audit_db).record_result(
+        {
+            "command_id": "in_profile_runtime_status_agent_route",
+            "channel": "feishu",
+            "sender_id": "ou_1",
+            "conversation_id": "feishu:chat_1:ou_1",
+            "message_id": "omsg_profile",
+            "raw_text": "系统怎么样",
+            "parser": "llm",
+            "intent_name": "runtime_status",
+            "tool_name": "runtime_status",
+            "decision": "allowed",
+            "result_ok": True,
+            "response": {
+                "meta": {
+                    "bot": {'enabled': False, 'route': 'agent_loop', 'llm': {'attempted': True, 'reason': 'accepted'}}
+                }
+            },
+        }
+    )
+
+    data, _warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["bot_runtime"]["config"]["path"] == str(bot_path)
+    assert data["bot_runtime"]["config"]["enabled"] is False
+    assert data["bot_runtime"]["llm"]["api_key_configured"] is True
+    assert data["bot_runtime"]["llm"]["env_file"] == str(env_file)
+    assert data["bot_runtime"]["llm"]["env_file_loaded"] is True
+    assert data["bot_runtime"]["audit"]["path"] == str(audit_db)
+    assert data["bot_runtime"]["audit"]["latest"]["route"] == "agent_loop"
+    assert data["environment"]["env_file"] == str(env_file)
+    assert data["environment"]["env_file_loaded"] is True
+    assert data["environment"]["entries"]["DEEPSEEK_API_KEY"]["configured"] is True
+    assert data["environment"]["entries"]["DEEPSEEK_API_KEY"]["source"] == f"env_file:{env_file}"
+    assert data["summary"]["env_file_loaded"] is True
+
+
+def test_runtime_status_ignores_unreadable_profile_env_file_when_env_is_injected(monkeypatch, tmp_path: Path) -> None:
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+    bot_path = tmp_path / "assistant" / "config.bot.json"
+    bot_path.parent.mkdir()
+    bot_path.write_text(
+        json.dumps(
+            {
+                "bot": {'enabled': False, 'llm': {'provider': 'deepseek', 'base_url': 'https://api.deepseek.com', 'model': 'deepseek-v4-flash', 'api_key_env': 'DEEPSEEK_API_KEY'}}
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    env_file = tmp_path / "options-monitor.env"
+    env_file.write_text("DEEPSEEK_API_KEY=sk-profile\n", encoding="utf-8")
+    (tmp_path / "service.profile.json").write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(tmp_path),
+                "env_file": str(env_file),
+                "bot_config_path": str(bot_path),
+                "services": [{"name": "options-monitor-wechat-clawbot.service"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-systemd")
+
+    original_read_text = Path.read_text
+
+    def _read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == env_file:
+            raise PermissionError("Permission denied")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _read_text)
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert not any("failed to read env file" in item for item in warnings)
+    assert "ENV_FILE" not in data["summary"]["warning_codes"]
+    assert data["environment"]["warnings"] == []
+    assert data["environment"]["env_file_loaded"] is False
+    assert data["environment"]["entries"]["DEEPSEEK_API_KEY"]["configured"] is True
+    assert data["environment"]["entries"]["DEEPSEEK_API_KEY"]["source"] == "process_env"
+    assert data["bot_runtime"]["llm"]["api_key_configured"] is True
+
+
+def test_runtime_status_reports_wechat_clawbot_channel_health(tmp_path: Path) -> None:
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+    bot_path = tmp_path / "assistant" / "config.bot.json"
+    bot_path.parent.mkdir()
+    bot_path.write_text(
+        json.dumps(
+            {
+                "inbound": {
+                    "wechat_clawbot": {
+                        "label": "ops",
+                        "allowed_senders": "wechat:user_1",
+                        "reply_enabled": False,
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "output_shared" / "state" / "channels" / "wechat_clawbot" / "ops"
+    state_dir.mkdir(parents=True)
+    (state_dir / "state.json").write_text(
+        json.dumps({"bot_token": "bot_secret_1", "base_url": "https://example.invalid"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (state_dir / "bindings.json").write_text(
+        json.dumps(
+            {
+                "bindings": {
+                    "ops": {
+                        "to_user_id": "wx_user_1",
+                        "context_token": "ctx_secret_1",
+                        "last_message_id": "msg_1",
+                        "updated_at_utc": "2026-06-18T01:00:00+00:00",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "service.profile.json").write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(tmp_path),
+                "bot_config_path": str(bot_path),
+                "wechat_clawbot": {
+                    "enabled": True,
+                    "label": "ops",
+                    "state_dir": str(state_dir),
+                    "bot_config_path": str(bot_path),
+                },
+                "services": [{"name": "options-monitor-wechat-clawbot.service"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    data, _warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    health = data["channel_health"]["wechat_clawbot"]
+    assert health["configured"] is True
+    assert health["available"] is True
+    assert health["label"] == "ops"
+    assert health["allowed_senders_configured"] is True
+    assert health["bot_token_configured"] is True
+    assert health["binding_count"] == 1
+    assert health["bindings"]["ops"]["has_context_token"] is True
+    assert health["reply_enabled"] is False
+    assert data["summary"]["wechat_clawbot_available"] is True
+    assert "bot_secret_1" not in json.dumps(data, ensure_ascii=False)
+    assert "ctx_secret_1" not in json.dumps(data, ensure_ascii=False)
+
+
+def test_runtime_status_auto_loads_runtime_service_profile_paths(tmp_path: Path) -> None:
+    from src.application.agent_tools.runtime_status_impl import private_runtime_status_tool as runtime_status_tool
+
+    release_root = tmp_path / "release"
+    runtime_root = tmp_path / "runtime"
+    release_root.mkdir()
+    runtime_root.mkdir()
+    (release_root / "VERSION").write_text("1.2.82\n", encoding="utf-8")
+
+    cfg_path = runtime_root / "config.us.json"
+    data_config = runtime_root / "portfolio.runtime.json"
+    data_config.write_text("{}", encoding="utf-8")
+    cfg = {
+        "accounts": ["user1"],
+        "portfolio": {"data_config": str(data_config)},
+        "notifications": {"provider": "wechat_clawbot", "target": "route"},
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    shared_state_dir = runtime_root / "output_shared" / "state"
+    report_dir = runtime_root / "output_shared" / "reports"
+    shared_state_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True)
+    (shared_state_dir / "last_run.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    (runtime_root / "service.profile.json").write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "runtime_root": str(runtime_root),
+                "accounts": ["user1"],
+                "paths": {
+                    "report_dir": str(report_dir),
+                    "state_dir": str(runtime_root / "output_shared" / "state"),
+                    "shared_state_dir": str(shared_state_dir),
+                    "accounts_root": str(runtime_root / "output_accounts"),
+                    "runs_root": str(runtime_root / "output_runs"),
+                },
+                "config_paths": {"us": str(cfg_path)},
+                "services": [{"name": "options-monitor-feishu-ws.service"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    data, warnings, _meta = runtime_status_tool(
+        {"config_path": str(cfg_path)},
+        load_runtime_config=lambda **_kwargs: (cfg_path, cfg),
+        normalize_accounts=lambda value, fallback=(): list(value or fallback),
+        accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+        read_json_object_or_empty=lambda path: json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+        repo_base=lambda: release_root,
+        mask_path=lambda path: str(path),
+    )
+
+    assert data["shared"]["last_run"]["exists"] is True
+    assert data["shared"]["compatibility_notification"]["exists"] is False
+    assert data["shared"]["notification"]["exists"] is False
+    assert str(data["shared"]["last_run"]["path"]).endswith("last_run.json")
+    assert str(data["shared"]["compatibility_notification"]["path"]).endswith("symbols_notification.txt")
+    assert "openclaw_profile" not in data
+    assert data["service_profile"]["profile"]["loaded"] is True
+    assert data["service_profile"]["loaded"] is True
+    assert "No last_run.json found under output_shared/state or output_shared/state." not in warnings
+    assert "No symbols_notification.txt found under output_shared/reports or output_accounts/<account>/reports." not in warnings
+    assert "No symbols_notification.txt found for latest scanned run or legacy report paths." not in warnings
+    assert all("symbols_notification.txt" not in warning for warning in warnings)
+
+
+def test_runtime_status_does_not_expect_scan_notification_for_auto_close_run(tmp_path: Path) -> None:
+    from src.application.agent_tools.runtime_status_impl import private_runtime_status_tool as runtime_status_tool
+
+    release_root = tmp_path / "release"
+    runtime_root = tmp_path / "runtime"
+    release_root.mkdir()
+    runtime_root.mkdir()
+
+    cfg_path = runtime_root / "config.hk.json"
+    cfg = {
+        "accounts": ["user1"],
+        "portfolio": {"broker": "富途"},
+    }
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    shared_state_dir = runtime_root / "output_shared" / "state"
+    shared_state_dir.mkdir(parents=True)
+    run_dir = runtime_root / "output_runs" / "20260529T213013Z-db952f"
+    account_state = run_dir / "accounts" / "user1" / "state"
+    account_state.mkdir(parents=True)
+    (shared_state_dir / "last_run.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    (shared_state_dir / "last_run_dir.txt").write_text(str(run_dir), encoding="utf-8")
+    (account_state / "expired_position_maintenance.json").write_text(
+        json.dumps(
+            {
+                "mode": "error",
+                "reason": "missing_data_config",
+                "applied_closed": 0,
+                "errors": ["missing_data_config: /var/lib/options-monitor/portfolio.runtime.json"],
+                "receipt": {"status": "sent"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    data, warnings, _meta = runtime_status_tool(
+        {
+            "config_path": str(cfg_path),
+            "state_dir": str(shared_state_dir),
+            "shared_state_dir": str(shared_state_dir),
+            "report_dir": str(runtime_root / "output_shared" / "reports"),
+            "accounts_root": str(runtime_root / "output_accounts"),
+            "runs_root": str(runtime_root / "output_runs"),
+        },
+        load_runtime_config=lambda **_kwargs: (cfg_path, cfg),
+        normalize_accounts=lambda value, fallback=(): list(value or fallback),
+        accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+        read_json_object_or_empty=lambda path: json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+        repo_base=lambda: release_root,
+        mask_path=lambda path: str(path),
+    )
+
+    assert "No symbols_notification.txt found for latest scanned run or legacy report paths." not in warnings
+    assert "Auto-close user1 failed: missing_data_config." in warnings
+    assert data["summary"]["warning_codes"] == ["AUTO_CLOSE_FAILED"]
+
+
+def test_runtime_status_service_profile_does_not_default_to_us_when_market_is_ambiguous(tmp_path: Path) -> None:
+    from src.application.agent_tools.runtime_status_impl import private_runtime_status_tool as runtime_status_tool
+
+    profile_path = tmp_path / "service.profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "config_paths": {
+                    "us": str(tmp_path / "config.us.json"),
+                    "hk": str(tmp_path / "config.hk.json"),
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, Any]] = []
+
+    def _load_runtime_config(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop after config-scope capture")
+
+    with pytest.raises(RuntimeError) as _caught:
+        runtime_status_tool(
+            {"profile_path": str(profile_path)},
+            load_runtime_config=_load_runtime_config,
+            normalize_accounts=lambda value, fallback=(): list(value or fallback),
+            accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+            read_json_object_or_empty=lambda path: json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+            repo_base=lambda: tmp_path,
+            mask_path=lambda path: str(path),
+        )
+    exc = _caught.value
+    assert str(exc) == "stop after config-scope capture"
+
+    assert calls == [{"config_key": None, "config_path": None, "require_identity": False}]
+
+
+def test_runtime_status_service_profile_resolves_config_key_to_profile_config_path(tmp_path: Path) -> None:
+    from src.application.agent_tools.runtime_status_impl import private_runtime_status_tool as runtime_status_tool
+
+    us_path = tmp_path / "config.us.json"
+    hk_path = tmp_path / "config.hk.json"
+    profile_path = tmp_path / "service.profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "service_provider": "systemd",
+                "config_paths": {
+                    "us": str(us_path),
+                    "hk": str(hk_path),
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    calls: list[dict[str, Any]] = []
+
+    def _load_runtime_config(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop after config-scope capture")
+
+    with pytest.raises(RuntimeError) as _caught:
+        runtime_status_tool(
+            {"profile_path": str(profile_path), "config_key": "hk"},
+            load_runtime_config=_load_runtime_config,
+            normalize_accounts=lambda value, fallback=(): list(value or fallback),
+            accounts_from_config=lambda loaded: list(loaded.get("accounts") or []),
+            read_json_object_or_empty=lambda path: json.loads(path.read_text(encoding="utf-8")) if path.exists() else {},
+            repo_base=lambda: tmp_path,
+            mask_path=lambda path: str(path),
+        )
+    exc = _caught.value
+    assert str(exc) == "stop after config-scope capture"
+
+    assert calls == [{"config_key": "hk", "config_path": str(hk_path), "require_identity": False}]
+
+
+def test_runtime_status_marks_remediated_upgrade_failure(monkeypatch, tmp_path: Path) -> None:
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+
+    def _service_status(profile: dict[str, Any], *, include_status: bool = False) -> dict[str, Any]:
+        services_raw = profile.get("services")
+        services = services_raw if isinstance(services_raw, list) else []
+        return {
+            "provider": profile.get("service_provider"),
+            "services": [{**item, "status": "ok", "returncode": 0} for item in services if isinstance(item, dict)],
+            "status_checked": include_status,
+        }
+
+    monkeypatch.setattr(runtime_status, "service_status_from_profile", _service_status)
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["service_upgrade"]["evaluation"]["status"] == "remediated"
+    assert data["service_upgrade"]["evaluation"]["runtime_failed"] is False
+    assert data["summary"]["service_upgrade_status"] == "remediated"
+    assert data["summary"]["service_upgrade_historical_status"] == "failed"
+    assert data["summary"]["service_upgrade_runtime_failed"] is False
+    assert "SERVICE_UPGRADE_REMEDIATED" in data["summary"]["warning_codes"]
+    assert "SERVICE_DRIFT_REQUIRED_UNIT_MISSING" in data["summary"]["warning_codes"]
+    assert "Service upgrade previously failed but current release and restart services look remediated." in warnings
+    assert (
+        "Service drift detected: required maintenance units are missing: "
+            "options-monitor-projection-verify.timer."
+    ) in warnings
+
+
+def test_runtime_status_normalizes_v_prefixed_upgrade_target(monkeypatch, tmp_path: Path) -> None:
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path, target_version="v1.2.82")
+
+    def _service_status(profile: dict[str, Any], *, include_status: bool = False) -> dict[str, Any]:
+        services_raw = profile.get("services")
+        services = services_raw if isinstance(services_raw, list) else []
+        return {
+            "provider": profile.get("service_provider"),
+            "services": [{**item, "status": "ok", "returncode": 0} for item in services if isinstance(item, dict)],
+            "status_checked": include_status,
+        }
+
+    monkeypatch.setattr(runtime_status, "service_status_from_profile", _service_status)
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["service_upgrade"]["evaluation"]["target_version"] == "1.2.82"
+    assert data["summary"]["service_upgrade_status"] == "remediated"
+    assert data["summary"]["service_upgrade_target_version"] == "1.2.82"
+    assert "Service upgrade status still indicates an unrecovered runtime failure." not in warnings
+
+
+def test_runtime_status_keeps_upgrade_failed_when_service_still_failed(monkeypatch, tmp_path: Path) -> None:
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    fixture = _runtime_status_upgrade_fixture(tmp_path)
+
+    def _service_status(profile: dict[str, Any], *, include_status: bool = False) -> dict[str, Any]:
+        services_raw = profile.get("services")
+        services = services_raw if isinstance(services_raw, list) else []
+        out = []
+        for item in services:
+            if not isinstance(item, dict):
+                continue
+            status = "warn" if item.get("name") == "options-monitor-trade-intake.service" else "ok"
+            out.append({**item, "status": status, "returncode": 3 if status == "warn" else 0})
+        return {"provider": profile.get("service_provider"), "services": out, "status_checked": include_status}
+
+    monkeypatch.setattr(runtime_status, "service_status_from_profile", _service_status)
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["service_upgrade"]["evaluation"]["status"] == "failed"
+    assert data["summary"]["service_upgrade_runtime_failed"] is True
+    assert "SERVICE_UPGRADE_FAILED" in data["summary"]["warning_codes"]
+    assert "SERVICE_DRIFT_REQUIRED_UNIT_MISSING" in data["summary"]["warning_codes"]
+    assert "Service upgrade status still indicates an unrecovered runtime failure." in warnings
+    assert (
+        "Service drift detected: required maintenance units are missing: "
+            "options-monitor-projection-verify.timer."
+    ) in warnings
+
+
+def test_runtime_status_treats_older_failed_upgrade_as_historical(tmp_path: Path) -> None:
+    fixture = _runtime_status_upgrade_fixture(tmp_path, target_version="1.2.81")
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["service_upgrade"]["evaluation"]["status"] == "historical_failed"
+    assert data["summary"]["service_upgrade_status"] == "historical_failed"
+    assert data["summary"]["service_upgrade_runtime_failed"] is False
+    assert "SERVICE_UPGRADE_HISTORICAL_FAILED" in data["summary"]["warning_codes"]
+    assert "SERVICE_DRIFT_REQUIRED_UNIT_MISSING" in data["summary"]["warning_codes"]
+    assert "Service upgrade status file contains a historical failure for a non-current target version." in warnings
+    assert (
+        "Service drift detected: required maintenance units are missing: "
+            "options-monitor-projection-verify.timer."
+    ) in warnings
+
+
+def test_runtime_status_keeps_newer_failed_upgrade_as_runtime_failure(tmp_path: Path) -> None:
+    fixture = _runtime_status_upgrade_fixture(tmp_path, target_version="1.2.83")
+
+    data, warnings, _meta = _call_runtime_status_for_upgrade(tmp_path, fixture["cfg_path"], fixture["cfg"])
+
+    assert data["service_upgrade"]["evaluation"]["status"] == "failed"
+    assert data["service_upgrade"]["evaluation"]["runtime_failed"] is True
+    assert data["service_upgrade"]["evaluation"]["reason"] == "upgrade_target_version_not_active"
+    assert data["summary"]["service_upgrade_status"] == "failed"
+    assert data["summary"]["service_upgrade_runtime_failed"] is True
+    assert "SERVICE_UPGRADE_FAILED" in data["summary"]["warning_codes"]
+    assert "Service upgrade status still indicates an unrecovered runtime failure." in warnings
+
+
+def test_runtime_status_can_inspect_scanned_run_after_skipped_latest(tmp_path: Path) -> None:
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg["accounts"] = ["user1", "user2"]
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state_dir = tmp_path / "output_shared" / "state"
+    report_dir = tmp_path / "output_shared" / "reports"
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    accounts_root = tmp_path / "output_accounts"
+    runs_root = tmp_path / "output_runs"
+    for path in (state_dir, report_dir, shared_state_dir, runs_root):
+        path.mkdir(parents=True, exist_ok=True)
+    (report_dir / "symbols_notification.txt").write_text("shared notification\n", encoding="utf-8")
+    write_json(shared_state_dir / "last_run.json", {"status": "ok", "run_id": "run-skip"})
+
+    run_scan = runs_root / "run-scan"
+    run_skip = runs_root / "run-skip"
+    write_json(
+        run_scan / "state" / "tick_metrics.json",
+        {
+            "accounts": {
+                "user1": {"ran_scan": True, "pipeline_ms": 1234, "reason": "force: bypass guard"},
+                "user2": {"ran_scan": True, "pipeline_ms": 987, "reason": "force: bypass guard"},
+            }
+        },
+    )
+    write_json(
+        run_skip / "state" / "tick_metrics.json",
+        {
+            "accounts": {
+                "user1": {"ran_scan": False, "pipeline_ms": None, "reason": "业务运行窗口外"},
+                "user2": {"ran_scan": False, "pipeline_ms": None, "reason": "业务运行窗口外"},
+            }
+        },
+    )
+    for account in ("user1", "user2"):
+        write_json(run_scan / "accounts" / account / "state" / "last_run.json", {"ran_scan": True, "status": "ok"})
+        write_json(run_skip / "accounts" / account / "state" / "last_run.json", {"ran_scan": False, "status": "skipped"})
+        (run_scan / "accounts" / account / "symbols_notification.txt").write_text("持仓扫描结果\n", encoding="utf-8")
+
+    write_json(
+        run_scan / "accounts" / "user1" / "state" / "required_data_prefetch_summary.json",
+        {
+            "errors": 0,
+            "cached_unique_symbols": 0,
+            "deduped_count": 0,
+            "skipped": 0,
+            "force_refresh": True,
+        },
+    )
+    (shared_state_dir / "last_run_dir.txt").write_text(str(run_skip), encoding="utf-8")
+
+    payload = {
+        "config_path": str(cfg_path),
+        "state_dir": str(state_dir),
+        "report_dir": str(report_dir),
+        "shared_state_dir": str(shared_state_dir),
+        "accounts_root": str(accounts_root),
+        "runs_root": str(runs_root),
+    }
+    out = _execute_private_runtime_status(payload)
+
+    assert out["ok"] is True
+    assert out["warnings"] == []
+    data = out["data"]
+    assert data["latest_run"]["path"].endswith("run-skip")
+    assert data["latest_run_selection"]["source"] == "last_run_dir_or_mtime"
+    assert data["latest_scanned_run"]["path"].endswith("run-scan")
+    assert data["summary"]["latest_scanned_run_path"].endswith("run-scan")
+    assert data["required_data_prefetch"]["available"] is False
+
+    scanned_prefetch = data["latest_scanned_run_required_data_prefetch"]
+    assert scanned_prefetch["available"] is True
+    assert scanned_prefetch["available_account_count"] == 1
+    assert scanned_prefetch["missing_account_count"] == 1
+    assert scanned_prefetch["force_refresh_account_count"] == 1
+    assert scanned_prefetch["shared_run_summary"] is True
+    assert scanned_prefetch["shared_summary_account"] == "user1"
+    assert scanned_prefetch["opend_calls_reported_account_count"] == 0
+    assert scanned_prefetch["total_opend_calls"] == 0
+    assert scanned_prefetch["total_cached_unique_symbols"] == 0
+    assert scanned_prefetch["accounts"]["user1"]["force_refresh"] is True
+    assert scanned_prefetch["accounts"]["user1"]["opend_calls_reported"] is False
+
+    out_by_id = _execute_private_runtime_status({**payload, "run_id": "run-scan"})
+    assert out_by_id["ok"] is True
+    assert out_by_id["data"]["latest_run_selection"]["source"] == "run_id"
+    assert out_by_id["data"]["latest_run_selection"]["found"] is True
+    assert out_by_id["data"]["latest_run"]["path"].endswith("run-scan")
+    assert out_by_id["data"]["required_data_prefetch"]["available"] is True
+
+    out_by_dir = _execute_private_runtime_status({**payload, "run_dir": str(run_scan)})
+    assert out_by_dir["ok"] is True
+    assert out_by_dir["data"]["latest_run_selection"]["source"] == "run_dir"
+    assert out_by_dir["data"]["latest_run_selection"]["found"] is True
+    assert out_by_dir["data"]["latest_run"]["path"].endswith("run-scan")
+
+
+def test_runtime_status_latest_scanned_run_respects_config_market(tmp_path: Path) -> None:
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg = _minimal_cfg()
+    cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_dir = tmp_path / "output_shared" / "reports"
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    runs_root = tmp_path / "output_runs"
+    for path in (report_dir, shared_state_dir, runs_root):
+        path.mkdir(parents=True, exist_ok=True)
+    (report_dir / "symbols_notification.txt").write_text("shared notification\n", encoding="utf-8")
+    write_json(shared_state_dir / "last_run.json", {"status": "ok", "run_id": "run-hk"})
+
+    run_us = runs_root / "run-us"
+    run_hk = runs_root / "run-hk"
+    write_json(
+        run_us / "state" / "tick_metrics.json",
+        {
+            "ran_scan": True,
+            "markets_to_run": ["US"],
+            "scheduler_markets": ["US"],
+            "accounts": {"user1": {"ran_scan": True}},
+        },
+    )
+    write_json(
+        run_hk / "state" / "tick_metrics.json",
+        {
+            "ran_scan": True,
+            "markets_to_run": ["HK"],
+            "scheduler_markets": ["HK"],
+            "accounts": {"user1": {"ran_scan": True}},
+        },
+    )
+    os.utime(run_us, (1_000_000, 1_000_000))
+    os.utime(run_hk, (2_000_000, 2_000_000))
+
+    out = _execute_private_runtime_status(
+        {
+            "config_key": "us",
+            "config_path": str(cfg_path),
+            "report_dir": str(report_dir),
+            "shared_state_dir": str(shared_state_dir),
+            "runs_root": str(runs_root),
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["latest_run"]["path"].endswith("run-us")
+    assert out["data"]["latest_run_selection"]["market_filter"] == "US"
+    assert out["data"]["latest_run_selection"]["skipped_market_mismatch_count"] == 1
+    selection = out["data"]["latest_scanned_run_selection"]
+    assert out["data"]["latest_scanned_run"]["path"].endswith("run-us")
+    assert selection["market_filter"] == "US"
+    assert selection["skipped_market_mismatch_count"] == 1
+
+
+def test_runtime_status_does_not_warn_missing_notification_for_expected_skip(tmp_path: Path) -> None:
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(), ensure_ascii=False, indent=2), encoding="utf-8")
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    runs_root = tmp_path / "output_runs"
+    run_skip = runs_root / "run-skip"
+    shared_state_dir.mkdir(parents=True)
+    write_json(shared_state_dir / "last_run.json", {"status": "skipped", "run_id": "run-skip"})
+    write_json(
+        run_skip / "state" / "tick_metrics.json",
+        {
+            "ran_scan": False,
+            "scheduler_decision": {
+                "should_run_scan": False,
+                "should_notify": False,
+                "is_notify_window_open": False,
+                "reason": "业务运行窗口内，当前没有待执行运行点。",
+            },
+            "accounts": [{"account": "user1", "status": "skipped", "ran_scan": False}],
+        },
+    )
+    write_json(run_skip / "accounts" / "user1" / "state" / "last_run.json", {"status": "skipped", "ran_scan": False})
+    (shared_state_dir / "last_run_dir.txt").write_text(str(run_skip), encoding="utf-8")
+
+    out = _execute_private_runtime_status(
+        {
+            "config_key": "us",
+            "config_path": str(cfg_path),
+            "shared_state_dir": str(shared_state_dir),
+            "runs_root": str(runs_root),
+            "report_dir": str(tmp_path / "output_shared" / "reports"),
+            "accounts_root": str(tmp_path / "output_accounts"),
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["warnings"] == []
+    assert out["data"]["summary"]["ok"] is True
+    assert out["data"]["latest_run"]["path"].endswith("run-skip")
+
+
+def test_runtime_status_notification_diagnosis_uses_shared_last_run_counts(tmp_path: Path) -> None:
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(), ensure_ascii=False, indent=2), encoding="utf-8")
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    runs_root = tmp_path / "output_runs"
+    latest_run = runs_root / "run-audit-only"
+    write_json(
+        shared_state_dir / "last_run.json",
+        {
+            "run_id": "run-audit-only",
+            "sent": True,
+            "sent_accounts": ["user1", "user2"],
+            "notify_summary": {
+                "account_messages_count": 2,
+                "send_attempted_count": 2,
+                "send_confirmed_count": 2,
+                "send_failed_count": 0,
+            },
+        },
+    )
+    write_json(latest_run / "state" / "audit_events.json", {"status": "ok"})
+    (shared_state_dir / "last_run_dir.txt").write_text(str(latest_run), encoding="utf-8")
+
+    out = _execute_private_runtime_status(
+        {
+            "config_key": "us",
+            "config_path": str(cfg_path),
+            "shared_state_dir": str(shared_state_dir),
+            "runs_root": str(runs_root),
+            "report_dir": str(tmp_path / "output_shared" / "reports"),
+            "accounts_root": str(tmp_path / "output_accounts"),
+        },
+    )
+
+    diagnosis = out["data"]["notification_diagnosis"]
+    assert diagnosis["status"] == "sent"
+    assert diagnosis["account_messages_count"] == 2
+    assert diagnosis["send_attempted_count"] == 2
+    assert diagnosis["send_confirmed_count"] == 2
+
+
+def test_runtime_status_historical_run_does_not_borrow_current_shared_delivery_counts(
+    tmp_path: Path,
+) -> None:
+
+    def write_json(path: Path, payload: dict[str, object]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(), ensure_ascii=False, indent=2), encoding="utf-8")
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    runs_root = tmp_path / "output_runs"
+    historical_run = runs_root / "run-historical"
+    write_json(
+        shared_state_dir / "last_run.json",
+        {
+            "run_id": "run-current",
+            "sent": True,
+            "sent_accounts": ["user1"],
+            "notify_summary": {
+                "account_messages_count": 1,
+                "send_attempted_count": 1,
+                "send_confirmed_count": 1,
+                "send_failed_count": 0,
+            },
+        },
+    )
+    write_json(
+        historical_run / "state" / "tick_metrics.json",
+        {
+            "sent": False,
+            "sent_accounts": [],
+            "notify_summary": {
+                "account_messages_count": 1,
+                "send_attempted_count": 1,
+                "send_confirmed_count": 0,
+                "send_failed_count": 1,
+            },
+        },
+    )
+
+    out = _execute_private_runtime_status(
+        {
+            "config_key": "us",
+            "config_path": str(cfg_path),
+            "run_id": "run-historical",
+            "shared_state_dir": str(shared_state_dir),
+            "runs_root": str(runs_root),
+            "report_dir": str(tmp_path / "output_shared" / "reports"),
+            "accounts_root": str(tmp_path / "output_accounts"),
+        },
+    )
+
+    diagnosis = out["data"]["notification_diagnosis"]
+    assert diagnosis["status"] == "send_failed_or_unconfirmed"
+    assert diagnosis["send_confirmed_count"] == 0
+    assert diagnosis["send_failed_count"] == 1
+    assert diagnosis["sent_accounts"] == []
+    assert out["data"]["summary"]["ok"] is False
+    assert "NOTIFICATION_DELIVERY_FAILED" in out["data"]["summary"]["warning_codes"]
+    assert out["data"]["notification_delivery"] == {
+        "status": "degraded",
+        "reason_codes": ["NOTIFICATION_DELIVERY_FAILED"],
+        "expected": True,
+    }
+
+
+def test_runtime_status_preserves_both_notification_health_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg()), encoding="utf-8")
+    shared_state_dir = tmp_path / "output_shared" / "state"
+    shared_state_dir.mkdir(parents=True)
+    runs_root = tmp_path / "output_runs"
+    run_dir = runs_root / "run-notify"
+    metrics_path = run_dir / "state" / "tick_metrics.json"
+    metrics_path.parent.mkdir(parents=True)
+    (shared_state_dir / "last_run_dir.txt").write_text(str(run_dir), encoding="utf-8")
+    payload = {
+        "config_key": "us",
+        "config_path": str(cfg_path),
+        "run_id": "run-notify",
+        "shared_state_dir": str(shared_state_dir),
+        "runs_root": str(runs_root),
+        "report_dir": str(tmp_path / "output_shared" / "reports"),
+        "accounts_root": str(tmp_path / "output_accounts"),
+    }
+
+    for confirmed in (False, True):
+        notify_summary = {
+            "account_messages_count": 1,
+            "send_attempted_count": 1,
+            "send_confirmed_count": int(confirmed),
+            "send_failed_count": int(not confirmed),
+        }
+        (shared_state_dir / "last_run.json").write_text(
+            json.dumps({"run_id": "run-notify", "status": "ok", "sent": confirmed,
+                        "sent_accounts": ["user1"] if confirmed else [],
+                        "notify_summary": notify_summary}),
+            encoding="utf-8",
+        )
+        metrics_path.write_text(json.dumps({"sent": confirmed, "notify_summary": notify_summary,
+                                            "sent_accounts": ["user1"] if confirmed else []}),
+                                encoding="utf-8")
+        out = _execute_private_runtime_status(payload)["data"]
+        summary = out["summary"]
+        delivery = out["notification_delivery"]
+        assert summary["ok"] is confirmed
+        assert ("NOTIFICATION_DELIVERY_FAILED" in summary["warning_codes"]) == (not confirmed)
+        assert delivery["status"] == ("confirmed" if confirmed else "degraded")
+        assert delivery["reason_codes"] == ([] if confirmed else ["NOTIFICATION_DELIVERY_FAILED"])
+
+    import src.application.agent_tools.runtime_status_impl as runtime_status
+
+    for status, duplicate_count, code in (
+        ("sent_partial", 0, "NOTIFICATION_PARTIAL_FAILURE"),
+        ("notification_route_missing", 0, "NOTIFICATION_ROUTE_MISSING"),
+        ("sent", 1, "NOTIFICATION_DUPLICATE_RISK"),
+    ):
+        monkeypatch.setattr(
+            runtime_status, "_notification_diagnosis",
+            lambda **_kwargs: {"status": status, "reason": "fixture",
+                               "duplicate_risk_count": duplicate_count},
+        )
+        out = _execute_private_runtime_status(payload)["data"]
+        assert out["summary"]["ok"] is False
+        assert code in out["summary"]["warning_codes"]
+        assert out["notification_delivery"]["status"] == "degraded"
+        assert code in out["notification_delivery"]["reason_codes"]
+
+
+def test_runtime_status_shows_unconfirmed_system_alert_separately(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg()), encoding="utf-8")
+    state_dir = tmp_path / "output_shared" / "state"
+    state_dir.mkdir(parents=True)
+    (state_dir / "system_alerts.json").write_text(json.dumps({"incident": {
+        "status": "failed", "last_attempt_at": "2026-09-24T00:00:00+00:00",
+        "delivery_confirmed": False, "fallback_used": False, "provider": None,
+    }}), encoding="utf-8")
+    out = _execute_private_runtime_status({
+        "config_key": "us", "config_path": str(cfg_path),
+        "shared_state_dir": str(state_dir), "runs_root": str(tmp_path / "output_runs"),
+        "report_dir": str(tmp_path / "output_shared" / "reports"),
+        "accounts_root": str(tmp_path / "output_accounts"),
+    })["data"]
+    assert out["system_alert_delivery"]["status"] == "degraded"
+    assert "SYSTEM_ALERT_DELIVERY_UNCONFIRMED" in out["summary"]["warning_codes"]
+    assert out["summary"]["ok"] is False
+
+
+def test_runtime_status_loads_service_profile_and_masks_external_paths(tmp_path: Path) -> None:
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(), ensure_ascii=False, indent=2), encoding="utf-8")
+    report_dir = tmp_path / "reports"
+    shared_state_dir = tmp_path / "state"
+    accounts_root = tmp_path / "accounts"
+    runs_root = tmp_path / "runs"
+    for path in (report_dir, shared_state_dir, accounts_root / "user1" / "state", accounts_root / "user1" / "reports", runs_root):
+        path.mkdir(parents=True, exist_ok=True)
+    (shared_state_dir / "last_run.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    (accounts_root / "user1" / "state" / "last_run.json").write_text(json.dumps({"status": "account_ok"}), encoding="utf-8")
+    (accounts_root / "user1" / "reports" / "symbols_notification.txt").write_text("account notification\n", encoding="utf-8")
+
+    profile_path = tmp_path / "service.profile.json"
+    profile_path.write_text(
+        json.dumps(
+                {
+                    "service_provider": "systemd",
+                    "services": [],
+                    "config_path": str(cfg_path),
+                    "accounts": ["user1"],
+                "paths": {
+                    "report_dir": str(report_dir),
+                    "shared_state_dir": str(shared_state_dir),
+                    "accounts_root": str(accounts_root),
+                    "runs_root": str(runs_root),
+                },
+                "trigger_source": "om_direct",
+                "trigger_job_id": "hk-direct-11",
+                "delivery": {"mode": "none"},
+                "timeoutSeconds": 700,
+                "max_run_age_minutes": 30,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    out = _execute_private_runtime_status({"profile_path": str(profile_path)})
+
+    assert out["ok"] is True
+    assert out["warnings"] == ["Outer delivery.mode is none; the task runner will not announce run output."]
+    assert "openclaw_profile" not in out["data"]
+    assert out["data"]["service_profile"]["profile"]["loaded"] is True
+    assert out["data"]["trigger_context"]["source"] == "om_direct"
+    assert out["data"]["trigger_context"]["job_id"] == "hk-direct-11"
+    assert out["data"]["trigger_context"]["delivery_mode"] == "none"
+    assert out["data"]["trigger_context"]["announce_expected"] is False
+    assert out["data"]["trigger_context"]["timeout_seconds"] == 700
+    assert out["data"]["config"]["config_path"] == ".../config.us.json"
+    assert out["data"]["paths"]["report_dir"] == ".../reports"
+    assert out["data"]["account_summary"]["accounts"]["user1"]["last_status"] == "account_ok"
+    assert out["data"]["freshness"]["status"] == "fresh"
+
+
+def test_runtime_runs_agent_tool_lists_and_selects_runs(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    runs_root = tmp_path / "output_runs"
+    run_dir = runs_root / "run-1"
+    (run_dir / "state").mkdir(parents=True, exist_ok=True)
+    (run_dir / "state" / "tick_metrics.json").write_text(
+        json.dumps(
+            {
+                "ran_scan": True,
+                "sent": True,
+                "accounts": [{"account": "lx", "ran_scan": True}],
+                "reason": "sent",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    listed = run_tool("runtime_runs", {"runs_root": str(runs_root), "limit": 5})
+    selected = run_tool("runtime_runs", {"runs_root": str(runs_root), "run_id": "run-1"})
+
+    assert listed["ok"] is True
+    assert listed["data"]["schema_version"] == "runtime_runs.v1"
+    assert listed["data"]["summary"]["total_count"] == 1
+    assert listed["data"]["runs"][0]["run_id"] == "run-1"
+    assert listed["data"]["runs"][0]["ran_scan"] is True
+    assert listed["meta"]["runs_root"] == ".../output_runs"
+    assert selected["ok"] is True
+    assert selected["data"]["summary"]["requested_found"] is True
+    assert selected["data"]["selected_run"]["run_id"] == "run-1"
+
+
+def test_runtime_logs_agent_tool_returns_content_free_bounded_metadata(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    runs_root = tmp_path / "output_runs"
+    audit = runs_root / "run-1" / "state" / "audit_events.jsonl"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_text('{"message":"private-first"}\n{"message":"private-second"}\n', encoding="utf-8")
+    logs_root = tmp_path / "logs"
+    logs_root.mkdir()
+    service_log = logs_root / "service.log"
+    service_log.write_text("private-one\nprivate-two\nprivate-three\n", encoding="utf-8")
+
+    audit_out = run_tool(
+        "runtime_logs",
+        {"runs_root": str(runs_root), "run_id": "run-1", "kind": "audit", "lines": 1},
+    )
+    file_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(service_log), "lines": 2},
+    )
+
+    assert audit_out["ok"] is True
+    assert audit_out["data"]["schema_version"] == "runtime_logs-public.v2"
+    assert audit_out["data"]["summary"]["requested_run_found"] is True
+    assert audit_out["data"]["files"][0]["kind"] == "audit"
+    assert audit_out["data"]["files"][0]["tail_line_count"] == 1
+    assert "path" not in audit_out["data"]["files"][0]
+    assert "tail" not in audit_out["data"]["files"][0]
+    assert "private-second" not in json.dumps(audit_out, ensure_ascii=False)
+    assert audit_out["meta"]["runs_root"] == ".../output_runs"
+    assert file_out["ok"] is True
+    assert file_out["data"]["files"][0]["kind"] == "service"
+    assert file_out["data"]["files"][0]["tail_line_count"] == 2
+    assert "private-three" not in json.dumps(file_out, ensure_ascii=False)
+
+
+def test_runtime_logs_agent_tool_labels_journal_only_service(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    out = run_tool("runtime_logs", {"kind": "service", "logs_root": str(logs),
+                                    "runs_root": str(tmp_path / "runs")})
+    assert out["ok"] is True
+    assert out["data"]["summary"]["file_count"] == 0
+    assert out["data"]["summary"]["log_source"] == "journal_only"
+    assert "journalctl" in out["data"]["journal_hint"]
+
+
+def test_runtime_logs_agent_tool_rejects_outside_root_and_symlink(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    logs_root = tmp_path / "logs"
+    logs_root.mkdir()
+    outside = tmp_path / "private.log"
+    outside.write_text("private-value\n", encoding="utf-8")
+
+    outside_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(outside), "lines": 1},
+    )
+    assert outside_out["ok"] is False
+    assert outside_out["error"]["code"] == "POLICY_ERROR"
+    assert str(outside) not in json.dumps(outside_out, ensure_ascii=False)
+
+    linked = logs_root / "linked.log"
+    linked.symlink_to(outside)
+    linked_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(linked), "lines": 1},
+    )
+    assert linked_out["ok"] is False
+    assert linked_out["error"]["code"] == "POLICY_ERROR"
+    assert "private-value" not in json.dumps(linked_out, ensure_ascii=False)
+
+
+def test_runtime_logs_agent_tool_caps_lines_type_and_tails_large_file(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    logs_root = tmp_path / "logs"
+    logs_root.mkdir()
+    bounded = logs_root / "bounded.log"
+    bounded.write_text("\n".join(f"line-{index}" for index in range(250)) + "\n", encoding="utf-8")
+
+    bounded_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(bounded), "lines": 10_000},
+    )
+    assert bounded_out["ok"] is True
+    assert bounded_out["data"]["summary"]["lines"] == 200
+    assert bounded_out["data"]["summary"]["lines_capped"] is True
+    assert bounded_out["data"]["files"][0]["tail_line_count"] == 200
+
+    unsupported = logs_root / "credentials.env"
+    unsupported.write_text("private-value\n", encoding="utf-8")
+    unsupported_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(unsupported), "lines": 1},
+    )
+    assert unsupported_out["ok"] is False
+    assert unsupported_out["error"]["code"] == "POLICY_ERROR"
+
+    oversized = logs_root / "oversized.log"
+    with oversized.open("wb") as stream:
+        stream.truncate(92 * 1024 * 1024)
+        stream.seek(-len(b"\nlast-line\n"), 2)
+        stream.write(b"\nlast-line\n")
+    oversized_out = run_tool(
+        "runtime_logs",
+        {"logs_root": str(logs_root), "log_file": str(oversized), "lines": 1},
+    )
+    assert oversized_out["ok"] is True
+    assert oversized_out["data"]["files"][0]["tail_truncated"] is True
+    assert oversized_out["data"]["files"][0]["tail_line_count"] == 1
+
+
+def test_runtime_logs_rejects_removed_file_alias(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    service_log = tmp_path / "service.log"
+    service_log.write_text("one\n", encoding="utf-8")
+
+    out = run_tool("runtime_logs", {"file": str(service_log), "lines": 1})
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "INPUT_ERROR"
+    assert "log_file" in out["error"]["message"]
+
+
+def test_close_advice_read_uses_the_bytes_bound_during_validation(
+    tmp_path: Path,
+) -> None:
+    from src.application.agent_tools import close_advice_read_impl as reader
+
+    report_dir = tmp_path / "report"
+    original_row = {
+        "account": "lx",
+        "symbol": "NVDA",
+        "option_type": "put",
+        "position_side": "short",
+        "evaluation_status": "priced",
+        "recommendation_state": "hold",
+        "policy_version": "strict_profit_capture.v1",
+        "decision_basis": "net_capture_below_threshold",
+        "decision_evidence_status": "complete",
+    }
+    _write_close_advice_report(
+        report_dir,
+        [original_row],
+        run_id="run-1",
+        market="US",
+    )
+    source = reader._Source(
+        report_dir / "close_advice.csv",
+        source_type="explicit",
+        run_id="run-1",
+        account="lx",
+    )
+
+    validation = reader._validate_source_manifest(
+        source,
+        desired_market="US",
+        query_account="lx",
+        expected_run_id="run-1",
+    )
+    pd.DataFrame([{**original_row, "symbol": "TSLA"}]).to_csv(
+        source.path,
+        index=False,
+    )
+
+    assert validation["ok"] is True
+    assert [row["symbol"] for row in reader._read_rows(source)] == ["NVDA"]
+
+
+def test_close_advice_read_fails_closed_for_non_strict_policy_rows() -> None:
+    from src.application.agent_tools.close_advice_read_impl import (
+        _decision_fields_for_read,
+    )
+
+    sealed = {
+        "quote_mode": "frozen_snapshot",
+        "required_data_snapshot_manifest_sha256": _SEALED_SNAPSHOT_SHA256,
+        "close_advice_required_data_plan_sha256": _SEALED_PLAN_SHA256,
+        "_source_manifest_run_id": "run-1",
+        "_source_manifest_quote_mode": "frozen_snapshot",
+        "_source_snapshot_manifest_sha256": _SEALED_SNAPSHOT_SHA256,
+        "_source_required_data_plan_sha256": _SEALED_PLAN_SHA256,
+    }
+    for row in (
+        {"recommendation_state": "close"},
+        {
+            "recommendation_state": "close",
+            "policy_version": "legacy_close_policy.v1",
+        },
+        {
+            "recommendation_state": "close",
+            "policy_version": "remaining_yield_capture.v1",
+        },
+        {
+            "recommendation_state": "close",
+            "policy_version": "remaining_yield_capture.v2",
+        },
+    ):
+        projected = _decision_fields_for_read({**sealed, **row})
+        assert projected["recommendation_state"] == "not_evaluable"
+        assert projected["evaluation_status"] == "not_evaluable"
+        assert projected["decision_basis"] == "unsupported_or_missing_strict_policy_version"
+
+    decision_metrics = {
+        "capital_basis": 10000,
+        "remaining_max_annualized_return": 0.05,
+        "net_capture_ratio": 0.95,
+    }
+    for row, expected_basis in (
+        (
+            {
+                "recommendation_state": "close",
+                "policy_version": "remaining_yield_capture.v3",
+                "decision_evidence_status": "complete",
+            },
+            "missing_strict_decision_basis",
+        ),
+        (
+            {
+                "recommendation_state": "close",
+                "policy_version": "remaining_yield_capture.v3",
+                "decision_basis": "strict_profit_capture_all_gates_passed",
+                "decision_evidence_status": "not_evaluable",
+                "evaluation_status": "priced",
+                **decision_metrics,
+            },
+            "invalid_strict_decision_evidence_status",
+        ),
+        (
+            {
+                "recommendation_state": "close",
+                "policy_version": "remaining_yield_capture.v3",
+                "decision_basis": "strict_profit_capture_all_gates_passed",
+                "decision_evidence_status": "complete",
+                "evaluation_status": "not_evaluable",
+                **decision_metrics,
+            },
+            "strict_decision_not_priced",
+        ),
+        (
+            {
+                "recommendation_state": "not_evaluable",
+                "policy_version": "remaining_yield_capture.v3",
+                "decision_basis": "missing_required_quote",
+                "decision_evidence_status": "not_evaluable",
+                "evaluation_status": "priced",
+            },
+            "strict_not_evaluable_marked_priced",
+        ),
+    ):
+        projected = _decision_fields_for_read({**sealed, **row})
+        assert projected["recommendation_state"] == "not_evaluable"
+        assert projected["evaluation_status"] == "not_evaluable"
+        assert projected["decision_basis"] == expected_basis
+
+
+def test_close_advice_read_requires_new_metrics_and_sorts_by_remaining_yield(
+    tmp_path: Path,
+) -> None:
+    from src.application.agent_tools.close_advice_read_impl import _decision_fields_for_read
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us")), encoding="utf-8")
+    common = {
+        "account": "lx",
+        "option_type": "put",
+        "position_side": "short",
+        "evaluation_status": "priced",
+        "recommendation_state": "close",
+        "policy_version": "remaining_yield_capture.v3",
+        "decision_basis": "remaining_yield_capture_all_gates_passed",
+        "decision_evidence_status": "complete",
+        "capital_basis": 10000,
+        "quote_mode": "frozen_snapshot",
+        "required_data_snapshot_manifest_sha256": _SEALED_SNAPSHOT_SHA256,
+        "close_advice_required_data_plan_sha256": _SEALED_PLAN_SHA256,
+        "_source_manifest_run_id": "run-1",
+        "_source_manifest_quote_mode": "frozen_snapshot",
+        "_source_snapshot_manifest_sha256": _SEALED_SNAPSHOT_SHA256,
+        "_source_required_data_plan_sha256": _SEALED_PLAN_SHA256,
+    }
+    missing = {**common, "net_capture_ratio": 0.95}
+    assert _decision_fields_for_read(missing)["decision_basis"] == "missing_current_policy_decision_metrics"
+    rows = [
+        {
+            **common,
+            "position_lot_id": "high",
+            "symbol": "HIGH",
+            "net_capture_ratio": 0.95,
+            "remaining_max_annualized_return": 0.08,
+        },
+        {
+            **common,
+            "position_lot_id": "low",
+            "symbol": "LOW",
+            "net_capture_ratio": 0.85,
+            "remaining_max_annualized_return": 0.03,
+        },
+    ]
+    report_dir = tmp_path / "report"
+    _write_close_advice_report(report_dir, rows, run_id="run-1", market="US")
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "report_path": str(report_dir / "close_advice.csv"),
+            "account": "lx",
+            "run_id": "run-1",
+            "query": {"limit": 1},
+        },
+    )
+    assert out["ok"] is True
+    assert out["data"]["matched_count"] == 2
+    assert out["data"]["rows"][0]["symbol"] == "LOW"
+    assert out["data"]["rows"][0]["remaining_max_annualized_return"] == 0.03
+
+
+def test_close_advice_read_rejects_explicit_report_without_manifest(
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(
+        json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    csv_path = tmp_path / "close_advice.csv"
+    pd.DataFrame(
+        [
+            {
+                "account": "lx",
+                "symbol": "NVDA",
+                "recommendation_state": "close",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "strict_profit_capture_all_gates_passed",
+                "decision_evidence_status": "complete",
+            }
+        ]
+    ).to_csv(csv_path, index=False)
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "report_path": str(csv_path),
+            "account": "lx",
+        },
+    )
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "DEPENDENCY_INVALID"
+    assert (
+        out["error"]["details"]["reason"]
+        == "close_advice_manifest_missing"
+    )
+
+
+def test_close_advice_read_projects_unsealed_explicit_history_as_not_evaluable(
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us")), encoding="utf-8")
+    report_dir = tmp_path / "legacy-report"
+    report_dir.mkdir()
+    csv_path = report_dir / "close_advice.csv"
+    text_path = report_dir / "close_advice.txt"
+    context_path = report_dir / "option_positions_context.json"
+    rows = [
+        {
+            "account": "lx",
+            "symbol": "NVDA",
+            "option_type": "put",
+            "position_side": "short",
+            "evaluation_status": "priced",
+            "recommendation_state": "close",
+            "policy_version": "remaining_yield_capture.v3",
+            "decision_basis": "remaining_yield_capture_all_gates_passed",
+            "decision_evidence_status": "complete",
+            "capital_basis": 10000,
+            "net_capture_ratio": 0.95,
+            "remaining_max_annualized_return": 0.03,
+        }
+    ]
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    text_path.write_text("", encoding="utf-8")
+    context = {
+        "context_status": "available",
+        "filters": {"account": "lx"},
+        "open_positions_min": [],
+    }
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    publish_close_advice_report_manifest(
+        csv_path=csv_path,
+        text_path=text_path,
+        context_path=context_path,
+        context=context,
+        rows=rows,
+        markets_to_run=["US"],
+        run_id="legacy-run",
+        quote_mode="legacy_mutable",
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "report_path": str(csv_path),
+            "account": "lx",
+        },
+    )
+
+    assert out["ok"] is True
+    row = out["data"]["rows"][0]
+    assert row["recommendation_state"] == "not_evaluable"
+    assert row["evaluation_status"] == "not_evaluable"
+    assert row["decision_basis"] == "unsealed_or_incomplete_report_provenance"
+
+def test_close_advice_read_rejects_report_with_tampered_text(
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(
+        json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    report_dir = tmp_path / "report"
+    rows = [
+        {
+            "account": "lx",
+            "symbol": "NVDA",
+            "option_type": "put",
+            "position_side": "short",
+            "evaluation_status": "priced",
+            "recommendation_state": "close",
+            "policy_version": "strict_profit_capture.v1",
+            "decision_basis": "strict_profit_capture_all_gates_passed",
+            "decision_evidence_status": "complete",
+        }
+    ]
+    _write_close_advice_report(
+        report_dir,
+        rows,
+        run_id="run-1",
+        market="US",
+    )
+    (report_dir / "close_advice.txt").write_text(
+        "stale or tampered preview\n",
+        encoding="utf-8",
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "report_path": str(report_dir / "close_advice.csv"),
+            "account": "lx",
+            "run_id": "run-1",
+        },
+    )
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "DEPENDENCY_INVALID"
+    assert (
+        out["error"]["details"]["reason"]
+        == "close_advice_text_bytes_mismatch"
+    )
+
+
+def test_close_advice_read_skips_newer_run_with_invalid_manifest(
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(
+        json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    runs_root = tmp_path / "output_runs"
+    valid_report = runs_root / "run-valid" / "accounts" / "lx"
+    _write_run_account_config(valid_report, market="us")
+    rows = [
+        {
+            "account": "lx",
+            "symbol": "NVDA",
+            "option_type": "put",
+            "position_side": "short",
+            "evaluation_status": "priced",
+            "recommendation_state": "hold",
+            "policy_version": "strict_profit_capture.v1",
+            "decision_basis": "net_capture_below_threshold",
+            "decision_evidence_status": "complete",
+        }
+    ]
+    _write_close_advice_report(
+        valid_report,
+        rows,
+        run_id="run-valid",
+        market="US",
+    )
+
+    invalid_report = runs_root / "run-invalid" / "accounts" / "lx"
+    invalid_report.mkdir(parents=True)
+    _write_run_account_config(invalid_report, market="us")
+    pd.DataFrame(rows).to_csv(invalid_report / "close_advice.csv", index=False)
+    os.utime(runs_root / "run-valid", (1_000_000, 1_000_000))
+    os.utime(runs_root / "run-invalid", (2_000_000, 2_000_000))
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "runs_root": str(runs_root),
+            "account": "lx",
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["source"]["run_id"] == "run-valid"
+
+
+def test_close_advice_read_stops_at_first_valid_request_report(monkeypatch, tmp_path: Path) -> None:
+    from src.application.agent_tools import close_advice_read_impl as reader
+
+    output_root = tmp_path / "agent_tools"
+    reports = {}
+    for name, symbol, timestamp in (
+        ("older", "PDD", 1_000_000),
+        ("valid", "NVDA", 2_000_000),
+        ("invalid", "AAPL", 3_000_000),
+    ):
+        report_dir = output_root / "requests" / name / "reports"
+        _write_close_advice_report(
+            report_dir,
+            [{
+                "account": "lx", "symbol": symbol, "option_type": "put",
+                "position_side": "short", "evaluation_status": "priced",
+                "recommendation_state": "hold", "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold", "decision_evidence_status": "complete",
+                "net_capture_ratio": 0.5,
+            }],
+            run_id=name,
+            market="US",
+        )
+        reports[name] = report_dir / "close_advice.csv"
+        if name == "invalid":
+            (report_dir / "close_advice.txt").write_text("tampered", encoding="utf-8")
+        os.utime(reports[name], (timestamp, timestamp))
+
+    validated = []
+    original_validate = reader._validate_source_manifest
+    expected_bytes = reports["valid"].read_bytes()
+
+    def tracked_validate(source, **kwargs):
+        validated.append(source.path)
+        result = original_validate(source, **kwargs)
+        if source.path == reports["valid"]:
+            assert result["ok"] is True
+            assert source.csv_bytes == expected_bytes
+        return result
+
+    monkeypatch.setattr(reader, "_validate_source_manifest", tracked_validate)
+    data, warnings, _meta = reader.close_advice_read_tool(
+        {"config_key": "us", "output_dir": str(output_root), "account": "lx"},
+        load_runtime_config=lambda **_kwargs: (tmp_path / "config.us.json", _minimal_cfg(market="us")),
+        resolve_output_root=lambda value: Path(value),
+        repo_base=lambda: tmp_path,
+        mask_path=str,
+    )
+
+    assert validated == [reports["invalid"], reports["valid"]]
+    assert warnings == []
+    assert data["source"]["type"] == "agent_tool"
+    assert data["row_count"] == 1
+    assert data["rows"][0]["symbol"] == "NVDA"
+    assert data["rows"][0]["net_capture_ratio"] == 0.5
+
+def test_close_advice_read_uses_symbol_market_over_default_config(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2), encoding="utf-8")
+    runs_root = tmp_path / "output_runs"
+
+    us_report = runs_root / "run-us" / "accounts" / "lx"
+    us_report.mkdir(parents=True)
+    _write_run_account_config(us_report, market="us")
+    us_rows = [
+            {
+                "account": "lx",
+                "symbol": "FUTU",
+                "option_type": "put",
+                "position_side": "short",
+                "expiration": "2026-08-21",
+                "strike": 152.45,
+                "evaluation_status": "priced",
+                "recommendation_state": "hold",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold",
+                "decision_evidence_status": "complete",
+            },
+        ]
+    _write_close_advice_report(
+        us_report,
+        us_rows,
+        run_id="run-us",
+        market="US",
+    )
+
+    hk_report = runs_root / "run-hk" / "accounts" / "sy"
+    hk_report.mkdir(parents=True)
+    _write_run_account_config(hk_report, market="hk")
+    hk_rows = [
+            {
+                "account": "sy",
+                "symbol": "9992.HK",
+                "option_type": "call",
+                "position_side": "short",
+                "expiration": "2026-07-30",
+                "strike": 172.5,
+                "evaluation_status": "priced",
+                "recommendation_state": "hold",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold",
+                "decision_evidence_status": "complete",
+            },
+        ]
+    _write_close_advice_report(
+        hk_report,
+        hk_rows,
+        run_id="run-hk",
+        market="HK",
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "runs_root": str(runs_root),
+            "query": {"symbol": "9992.HK", "option_type": "call", "side": "short", "status": "open"},
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["matched_count"] == 1
+    assert out["data"]["source"]["run_id"] == "run-hk"
+    assert out["data"]["rows"][0]["account"] == "sy"
+    assert out["meta"]["market_filter"] == "HK"
+    assert out["meta"]["market_filter_source"] == "query_symbol"
+    assert out["meta"]["config_market_filter"] == "US"
+
+
+def test_close_advice_read_all_market_scope_does_not_infer_missing_side_from_context(
+    tmp_path: Path,
+) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2), encoding="utf-8")
+    runs_root = tmp_path / "output_runs"
+
+    us_report = runs_root / "run-us" / "accounts" / "lx"
+    us_report.mkdir(parents=True)
+    _write_run_account_config(us_report, market="us")
+    us_rows = [
+            {
+                "account": "lx",
+                "symbol": "FUTU",
+                "option_type": "put",
+                "position_side": "short",
+                "expiration": "2026-08-21",
+                "strike": 152.45,
+                "evaluation_status": "priced",
+                "recommendation_state": "hold",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold",
+                "decision_evidence_status": "complete",
+            },
+        ]
+    _write_close_advice_report(
+        us_report,
+        us_rows,
+        run_id="run-us",
+        market="US",
+    )
+
+    hk_report = runs_root / "run-hk" / "accounts" / "sy"
+    (hk_report / "state").mkdir(parents=True)
+    _write_run_account_config(hk_report, market="hk")
+    (hk_report / "state" / "option_positions_context.json").write_text(
+        json.dumps(
+            {
+                "open_positions_min": [
+                    {
+                        "account": "sy",
+                        "symbol": "9992.HK",
+                        "option_type": "call",
+                        "side": "short",
+                        "expiration": 1785369600000,
+                        "strike": 172.5,
+                        "contracts_open": 1,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    hk_rows = [
+            {
+                "account": "sy",
+                "symbol": "9992.HK",
+                "option_type": "call",
+                "expiration": "2026-07-30",
+                "strike": 172.5,
+                "evaluation_status": "priced",
+                "recommendation_state": "hold",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold",
+                "decision_evidence_status": "complete",
+            },
+        ]
+    _write_close_advice_report(
+        hk_report,
+        hk_rows,
+        run_id="run-hk",
+        market="HK",
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "market_scope": "all",
+            "runs_root": str(runs_root),
+            "query": {"option_type": "call", "side": "short", "status": "open"},
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["row_count"] == 2
+    assert out["data"]["matched_count"] == 0
+    assert out["data"]["source"]["run_ids"] == ["run-hk", "run-us"]
+    assert "fallback" not in out["data"]
+    assert out["meta"]["market_scope"] == "all"
+    assert out["data"]["rows"] == []
+
+
+def test_close_advice_read_respects_config_market_when_selecting_latest_run(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2), encoding="utf-8")
+    runs_root = tmp_path / "output_runs"
+    run_us = runs_root / "run-us" / "accounts" / "lx"
+    run_hk = runs_root / "run-hk" / "accounts" / "lx"
+    for account_dir, market, symbol, net_capture in (
+        (run_us, "us", "NVDA", 0.95),
+        (run_hk, "hk", "0700.HK", 0.91),
+    ):
+        account_dir.mkdir(parents=True)
+        _write_run_account_config(account_dir, market=market)
+        rows = [
+                {
+                    "account": "lx",
+                    "symbol": symbol,
+                    "option_type": "call",
+                    "position_side": "short",
+                    "expiration": "2026-08-21",
+                    "strike": 100,
+                    "evaluation_status": "priced",
+                    "recommendation_state": "close",
+                    "policy_version": "strict_profit_capture.v1",
+                    "decision_basis": "strict_profit_capture_all_gates_passed",
+                    "decision_evidence_status": "complete",
+                    "net_capture_ratio": net_capture,
+                }
+            ]
+        _write_close_advice_report(
+            account_dir,
+            rows,
+            run_id=account_dir.parents[1].name,
+            market=market.upper(),
+        )
+
+    os.utime(runs_root / "run-us", (1_000_000, 1_000_000))
+    os.utime(runs_root / "run-hk", (2_000_000, 2_000_000))
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_key": "us",
+            "config_path": str(cfg_path),
+            "runs_root": str(runs_root),
+            "query": {"option_type": "call", "side": "short"},
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["source"]["run_id"] == "run-us"
+    assert out["meta"]["market_filter"] == "US"
+    assert out["data"]["row_count"] == 1
+    assert out["data"]["rows"][0]["symbol"] == "NVDA"
+    assert out["data"]["rows"][0]["net_capture_ratio"] == 0.95
+
+
+def test_close_advice_read_derives_runs_root_from_explicit_config_path(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    runtime_root = tmp_path / "runtime"
+    cfg_path = runtime_root / "config.us.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report_dir = runtime_root / "output_runs" / "run-1" / "accounts" / "lx"
+    report_dir.mkdir(parents=True)
+    _write_run_account_config(report_dir, market="us")
+    rows = [
+            {
+                "account": "lx",
+                "symbol": "NVDA",
+                "option_type": "call",
+                "position_side": "short",
+                "expiration": "2026-08-21",
+                "strike": 100,
+                "evaluation_status": "priced",
+                "recommendation_state": "hold",
+                "policy_version": "strict_profit_capture.v1",
+                "decision_basis": "net_capture_below_threshold",
+                "decision_evidence_status": "complete",
+                "net_capture_ratio": 0.50,
+            }
+        ]
+    _write_close_advice_report(
+        report_dir,
+        rows,
+        run_id="run-1",
+        market="US",
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "run_id": "run-1",
+            "query": {"option_type": "call", "side": "short"},
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["source"]["run_id"] == "run-1"
+    assert out["data"]["row_count"] == 1
+    assert out["data"]["rows"][0]["symbol"] == "NVDA"
+
+
+def test_close_advice_read_default_agent_report_prefers_runtime_root(monkeypatch, tmp_path: Path) -> None:
+    from src.application.agent_tools.close_advice_read_impl import close_advice_read_tool
+
+    release_root = tmp_path / "release"
+    runtime_root = tmp_path / "runtime"
+    cfg_path = release_root / "config.us.json"
+    cfg_path.parent.mkdir(parents=True)
+    cfg_path.write_text(json.dumps(_minimal_cfg(market="us"), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    for root, symbol, net_capture in (
+        (runtime_root, "NVDA", 0.95),
+        (release_root, "PDD", 0.91),
+    ):
+        report_dir = root / "output_shared" / "agent_tools" / "reports"
+        report_dir.mkdir(parents=True)
+        rows = [
+            {
+                "account": "lx",
+                "symbol": symbol,
+                "option_type": "call",
+                "position_side": "short",
+                "expiration": "2026-08-21",
+                "strike": 100,
+                "evaluation_status": "priced",
+                "recommendation_state": "close",
+                "policy_version": "strict_profit_capture.v1",
+                "net_capture_ratio": net_capture,
+            }
+        ]
+        _write_close_advice_report(
+            report_dir,
+            rows,
+            run_id=f"run-{symbol.lower()}",
+            market="US",
+        )
+
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(runtime_root))
+
+    data, warnings, meta = close_advice_read_tool(
+        {"config_key": "us", "query": {"option_type": "call", "side": "short"}},
+        load_runtime_config=lambda **_kwargs: (cfg_path, _minimal_cfg(market="us")),
+        resolve_output_root=lambda _output_dir=None: release_root / "output_shared" / "agent_tools",
+        repo_base=lambda: release_root,
+        mask_path=lambda path: f".../{Path(path).name}",
+    )
+
+    assert warnings == []
+    assert meta["market_filter"] == "US"
+    assert data["row_count"] == 1
+    assert data["source"]["type"] == "agent_tool"
+    assert data["rows"][0]["symbol"] == "NVDA"
+    assert data["rows"][0]["net_capture_ratio"] == 0.95
+
+
+def test_close_advice_read_rejects_agent_report_from_another_market(
+    tmp_path: Path,
+) -> None:
+    from src.application.close_advice_report_manifest import (
+        publish_close_advice_report_manifest,
+    )
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.hk.json"
+    cfg_path.write_text(
+        json.dumps(_minimal_cfg(market="hk"), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    output_root = tmp_path / "output_shared" / "agent_tools"
+    report_dir = output_root / "reports"
+    report_dir.mkdir(parents=True)
+    rows = [
+        {
+            "account": "lx",
+            "symbol": "NVDA",
+            "recommendation_state": "hold",
+            "policy_version": "strict_profit_capture.v1",
+        }
+    ]
+    csv_path = report_dir / "close_advice.csv"
+    text_path = report_dir / "close_advice.txt"
+    context_path = report_dir / "option_positions_context.json"
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    text_path.write_text("", encoding="utf-8")
+    context = {
+        "context_status": "available",
+        "filters": {"account": "lx"},
+        "open_positions_min": [],
+    }
+    context_path.write_text(json.dumps(context), encoding="utf-8")
+    publish_close_advice_report_manifest(
+        csv_path=csv_path,
+        text_path=text_path,
+        context_path=context_path,
+        context=context,
+        rows=rows,
+        markets_to_run=["US"],
+    )
+
+    out = run_tool(
+        "close_advice_read",
+        {
+            "config_path": str(cfg_path),
+            "output_dir": str(output_root),
+            "account": "lx",
+        },
+    )
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "DEPENDENCY_MISSING"
+
+
+def test_scan_summary_rows_normalizes_account_labels() -> None:
+    from src.application.agent_tools.materialization_impl import scan_summary_rows
+
+    summary = scan_summary_rows(
+        [
+            {"account": " LX ", "symbol": "NVDA", "side": "sell_put", "net_income": 100},
+            {"account_label": "lx", "symbol": "TSLA", "side": "sell_call", "net_income": 50},
+        ],
+        as_float=lambda value: float(value) if value not in (None, "") else None,
+    )
+
+    assert summary["account_counts"] == {"lx": 2}
+    assert [item["account"] for item in summary["top_candidates"]] == ["lx", "lx"]
+
+
+def test_scan_opportunities_returns_summary_fields(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(_minimal_cfg(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    import src.application.config_loader as config_loader
+    import src.application.config_profiles as config_profiles
+    import src.application.pipeline_symbol as pipeline_symbol
+    import src.application.pipeline_context as pipeline_context
+    import src.application.pipeline_watchlist as pipeline_watchlist
+    import src.application.report_builders as report_builders
+    monkeypatch.setattr(config_loader, "load_config", lambda **kwargs: _minimal_cfg())
+    monkeypatch.setattr(config_profiles, "apply_profiles", lambda cfg, **kwargs: cfg)
+    monkeypatch.setattr(pipeline_watchlist, "run_watchlist_pipeline", lambda **kwargs: [
+        {"symbol": "NVDA", "account": "user1", "side": "sell_put", "net_income": 320, "annualized_net_return": 0.18, "strike": 100, "expiration": "2026-06-19"},
+        {"symbol": "TSLA", "account": "user1", "side": "sell_call", "net_income": 210, "annualized_net_return": 0.11, "strike": 320, "expiration": "2026-06-26"},
+    ])
+    monkeypatch.setattr(pipeline_symbol, "process_symbol", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline_context, "build_pipeline_context", lambda **kwargs: {})
+    monkeypatch.setattr(report_builders, "build_symbols_summary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(report_builders, "build_symbols_digest", lambda *args, **kwargs: None)
+
+    out = run_tool("scan_opportunities", {"config_path": str(cfg_path), "output_dir": str(tmp_path / "output_shared" / "agent_tools")})
+
+    assert out["ok"] is True
+    assert out["data"]["summary"]["row_count"] == 2
+    assert out["data"]["summary"]["strategy_counts"]["sell_put"] == 1
+    assert out["data"]["summary"]["strategy_counts"]["sell_call"] == 1
+    assert out["data"]["top_candidates"][0]["symbol"] == "NVDA"
+
+
+def test_candidate_rank_explain_reads_sealed_account_snapshot(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+    from src.application.candidate_snapshot_manifest import (
+        load_candidate_snapshot_bundle,
+    )
+
+    rows = [
+        (
+            "liquid",
+            {
+                "symbol": "NVDA",
+                "contract_symbol": "NVDA_PUT_LIQUID",
+                "option_type": "put",
+                "expiration": "2026-06-19",
+                "strike": 95,
+                "annualized_net_return_on_cash_basis": 0.115,
+                "net_income": 100,
+                "period_net_return_on_cash_basis": 0.00945,
+            },
+        ),
+        (
+            "wide",
+            {
+                "symbol": "NVDA",
+                "contract_symbol": "NVDA_PUT_WIDE",
+                "option_type": "put",
+                "expiration": "2026-06-19",
+                "strike": 100,
+                "annualized_net_return_on_cash_basis": 0.120,
+                "net_income": 100,
+                "period_net_return_on_cash_basis": 0.0090,
+            },
+        ),
+    ]
+    seal_opening_candidate_fixture(
+        tmp_path,
+        run_id="run-1",
+        account="lx",
+        accepted_rows=[facts for _candidate_id, facts in rows],
+    )
+    sealed = load_candidate_snapshot_bundle(
+        base=tmp_path,
+        run_id="run-1",
+        account="lx",
+    )["owners"]["opening"]
+    expected_rank_reason = sealed["ranked_candidates"][0]["ranking"][
+        "rank_reason"
+    ]
+
+    out = run_tool(
+        "candidate_rank_explain",
+        {
+            "runtime_root": str(tmp_path),
+            "run_id": "run-1",
+            "account": "lx",
+            "mode": "put",
+            "top_n": 1,
+        },
+    )
+
+    assert out["ok"] is True
+    assert out["data"]["row_count"] == 2
+    assert out["data"]["ranked"][0]["contract_symbol"] == "NVDA_PUT_LIQUID"
+    assert out["data"]["ranked"][0]["rank_reason"] == expected_rank_reason
+    assert out["data"]["groups"][0]["ranking_policy"] == (
+        "opening_candidate_snapshot"
+    )
+    assert out["meta"]["source_files"][0]["path"].endswith(
+        "opening_candidate_snapshot.json"
+    )
+    assert out["meta"]["source_files"][0]["manifest_content_sha256"]
+
+
+def test_manage_symbols_list_and_dry_run_add(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    _config_yaml, cfg_path = _write_manage_symbols_generation(tmp_path)
+
+    out_list = run_tool("manage_symbols", {"config_path": str(cfg_path), "action": "list"})
+    assert out_list["ok"] is True
+    assert out_list["data"]["symbol_count"] == 1
+    assert out_list["data"]["symbols"][0]["symbol"] == "NVDA"
+    assert out_list["data"]["symbols"][0]["broker"] == "US"
+    assert "market" not in out_list["data"]["symbols"][0]
+
+    out_dry = run_tool(
+        "manage_symbols",
+        {
+            "config_path": str(cfg_path),
+            "action": "add",
+            "symbol": "TSLA",
+            "sell_put_enabled": True,
+            "sell_put_min_dte": 20,
+            "sell_put_max_dte": 45,
+            "sell_put_min_strike": 100,
+            "sell_put_max_strike": 120,
+            "dry_run": True,
+        },
+    )
+    assert out_dry["ok"] is True
+    assert out_dry["data"]["dry_run"] is True
+    assert out_dry["data"]["symbol_count"] == 2
+    added = next(item for item in out_dry["data"]["symbols"] if item["symbol"] == "TSLA")
+    assert "market" not in added
+
+    current = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert [x["symbol"] for x in current["symbols"]] == ["NVDA"]
+
+
+def test_symbol_config_read_routes_to_calibrated_symbol_market(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    us_cfg = _minimal_cfg()
+    us_cfg["symbols"][0]["sell_call"] = {"enabled": True, "min_strike": 190}
+    hk_cfg = _minimal_cfg(market="hk")
+    hk_cfg["symbols"][0].update(
+        {
+            "symbol": "0700.HK",
+            "market": "HK",
+            "sell_call": {"enabled": True, "min_strike": 550},
+        }
+    )
+    us_path = tmp_path / "config.us.json"
+    hk_path = tmp_path / "config.hk.json"
+    us_path.write_text(json.dumps(us_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    hk_path.write_text(json.dumps(hk_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(tmp_path))
+
+    hk_out = run_tool(
+        "symbol_config_read",
+        {"config_key": "us", "symbol": "腾讯", "strategy": "cc", "field": "min_strike"},
+    )
+    us_out = run_tool(
+        "symbol_config_read",
+        {"config_path": str(hk_path), "symbol": "NVDA", "strategy": "sell_call", "field": "min_strike"},
+    )
+
+    assert hk_out["ok"] is True
+    assert hk_out["data"]["value"] == 550
+    assert hk_out["meta"]["config_path"].endswith("config.hk.json")
+    assert us_out["ok"] is True
+    assert us_out["data"]["value"] == 190
+    assert us_out["meta"]["config_path"].endswith("config.us.json")
+
+    hk_path.unlink()
+    missing = run_tool(
+        "symbol_config_read",
+        {"config_key": "us", "symbol": "腾讯", "strategy": "sell_call", "field": "min_strike"},
+    )
+    assert missing["ok"] is False
+    assert missing["error"]["code"] == "CONFIG_ERROR"
+    assert "config.hk.json" in missing["error"]["message"]
+
+
+def test_manage_symbols_write_requires_gate_and_confirm(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    _config_yaml, cfg_path = _write_manage_symbols_generation(tmp_path)
+
+    blocked = run_tool(
+        "manage_symbols",
+        {
+            "config_path": str(cfg_path),
+            "action": "add",
+            "symbol": "TSLA",
+        },
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"]["code"] == "PERMISSION_DENIED"
+
+
+def test_manage_symbols_write_applies_when_enabled(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    config_yaml, cfg_path = _write_manage_symbols_generation(tmp_path)
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+
+    out = run_tool(
+        "manage_symbols",
+        {
+            "config_path": str(cfg_path),
+            "action": "add",
+            "symbol": "TSLA",
+            "broker": "US",
+            "sell_put_enabled": True,
+            "sell_put_min_dte": 20,
+            "sell_put_max_dte": 45,
+            "sell_put_min_strike": 100,
+            "sell_put_max_strike": 120,
+            "confirm": True,
+        },
+    )
+    assert out["ok"] is True
+    assert out["meta"]["write_applied"] is True
+
+    current = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert [x["symbol"] for x in current["symbols"]] == ["NVDA", "TSLA"]
+    added = next(item for item in current["symbols"] if item["symbol"] == "TSLA")
+    assert added["broker"] == "US"
+    assert "market" not in added
+    source = config_yaml.read_text(encoding="utf-8")
+    assert "TSLA" in source
+    assert out["data"]["authoring"]["source_format"] == "yaml"
+
+
+@pytest.mark.parametrize("max_strike", [None, 120])
+def test_manage_symbols_add_calibrates_symbol_before_write(monkeypatch, tmp_path: Path, max_strike) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    config_yaml, cfg_path = _write_manage_symbols_generation(tmp_path, market="hk")
+    before = {path: path.read_bytes() for path in (config_yaml, cfg_path)}
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+
+    strike = {} if max_strike is None else {"sell_put_max_strike": max_strike}
+    out = run_tool(
+        "manage_symbols",
+        {
+            "config_path": str(cfg_path),
+            "action": "add",
+            "symbol": "HK.09988",
+            "sell_put_enabled": True,
+            "sell_put_min_dte": 20,
+            "sell_put_max_dte": 45,
+            **strike,
+            "confirm": True,
+        },
+    )
+
+    if max_strike is None:
+        assert out["ok"] is False
+        assert out["error"]["code"] == "INPUT_ERROR"
+        assert out["error"]["message"] == "9988.HK CSP requires max_strike"
+        assert {path: path.read_bytes() for path in before} == before
+        return
+
+    assert out["ok"] is True
+    current = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert [item["symbol"] for item in current["symbols"]] == ["0700.HK", "9988.HK"]
+    assert current["symbols"][1]["sell_put"]["max_strike"] == max_strike
+
+
+def test_manage_symbols_add_allows_single_near_bound_modes(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    _config_yaml, cfg_path = _write_manage_symbols_generation(tmp_path)
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+
+    out = run_tool(
+        "manage_symbols",
+        {
+            "config_path": str(cfg_path),
+            "action": "add",
+            "symbol": "TSLA",
+            "broker": "US",
+            "sell_put_enabled": True,
+            "sell_put_min_dte": 20,
+            "sell_put_max_dte": 45,
+            "sell_put_max_strike": 120,
+            "sell_call_enabled": True,
+            "sell_call_min_dte": 20,
+            "sell_call_max_dte": 45,
+            "sell_call_min_strike": 140,
+            "confirm": True,
+        },
+    )
+    assert out["ok"] is True
+
+    current = json.loads(cfg_path.read_text(encoding="utf-8"))
+    added = next(item for item in current["symbols"] if item["symbol"] == "TSLA")
+    assert added["sell_put"]["max_strike"] == 120
+    assert "min_strike" not in added["sell_put"]
+    assert added["sell_call"]["min_strike"] == 140
+    assert "max_strike" not in added["sell_call"]
+
+
+def test_preview_notification_is_canonical_daily_brief_projection(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import (
+        persist_daily_decision_brief_success,
+    )
+    from src.application.tool_execution import execute_tool as run_tool
+
+    lifecycle = persist_daily_decision_brief_success(
+        base=tmp_path,
+        brief={
+            "schema_version": "daily_decision_brief.v1",
+            "market": "US",
+            "market_trading_date": "2026-10-05",
+            "account": "lx",
+            "revision": 999,
+            "run_id": "run-preview",
+            "generated_at_utc": "2026-10-05T08:00:00+00:00",
+            "data_as_of_utc": "2026-10-05T07:59:00+00:00",
+            "valid_until_utc": "2026-10-05T20:00:00+00:00",
+            "status": "ready",
+            "actionability": "live_actionable",
+            "strategy_summary": "preview test",
+            "actions": [],
+            "positions": [],
+            "capacity": {},
+            "candidates": {
+                "sell_put": [],
+                "covered_call": [],
+                "combo_yield": [],
+            },
+            "rejections": {},
+            "events": [],
+            "data_gaps": [],
+            "source_artifacts": [],
+        },
+    )
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(tmp_path))
+    delivery_path = (
+        tmp_path
+        / "output_accounts"
+        / "lx"
+        / "state"
+        / "daily_decision_brief.US.delivery.json"
+    )
+
+    selectors = {
+        "account": "lx",
+        "market": "US",
+        "date": "2026-10-05",
+        "revision": lifecycle["brief"]["revision"],
+    }
+    canonical = run_tool("daily_decision_brief_read", selectors)
+    out = run_tool("preview_notification", selectors)
+
+    assert canonical["ok"] is True
+    assert out["ok"] is True
+    assert out["data"]["schema_version"] == "preview_notification.output.v2"
+    assert out["data"]["query"] == canonical["data"]["query"]
+    assert out["data"]["reason"] == canonical["data"]["reason"]
+    assert out["data"]["source"] == canonical["data"]["source"]
+    assert out["data"]["freshness"] == canonical["data"]["freshness"]
+    assert out["data"]["notification_text"] == canonical["data"]["rendered_markdown"]
+    assert out["data"]["renderer"] == "daily_decision_brief.query"
+    assert out["data"]["authority"] == "daily_decision_brief"
+    assert out["data"]["delivery_evidence"] is False
+    assert out["warnings"] == canonical["warnings"]
+    assert out["meta"] == canonical["meta"]
+    assert not delivery_path.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"alerts_text": "legacy text"},
+        {"account": "lx", "market": "US", "revision": 0},
+        {"account": "lx", "market": "US", "date": "2026-10-05", "revision": -1},
+        {"market": "EU"},
+    ],
+)
+def test_preview_notification_rejects_legacy_or_invalid_selectors(payload) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    out = run_tool("preview_notification", payload)
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "INPUT_ERROR"
+
+
+def test_version_update_auto_apply_requires_preview_fields(monkeypatch, tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+    monkeypatch.setenv("OM_AGENT_ENABLE_WRITE_TOOLS", "true")
+
+    out = run_tool("version_update", {"bump": "auto", "apply": True, "confirm": True})
+
+    assert out["ok"] is False
+    assert out["error"]["code"] == "INPUT_ERROR"
+    assert "recommendation_digest" in out["error"]["message"]
+    assert (tmp_path / "VERSION").read_text(encoding="utf-8").strip() == "1.0.0"
+
+
+def test_version_update_auto_preview_adapts_warnings_and_contract(monkeypatch, tmp_path: Path) -> None:
+    import src.application.agent_tools.runtime as runtime_tools
+    from src.application.tool_execution import execute_tool as run_tool
+
+    (tmp_path / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    _patch_agent_tool_dependencies(monkeypatch, repo_base=lambda: tmp_path)
+
+    def _preview(**kwargs: Any) -> dict[str, Any]:
+        assert kwargs["bump"] == "auto"
+        assert kwargs["remote_name"] == "origin"
+        return {
+            "schema_version": "release_version_recommendation.v1",
+            "status": "recommended",
+            "mode": "dry_run",
+            "review_flags": ["COMPATIBILITY_SENSITIVE_PATH_CHANGED"],
+            "recommendation": {"bump": "minor", "target_version": "1.1.0"},
+            "recommendation_digest": "sha256:" + "a" * 64,
+            "write": {"changed": False, "already_at_target": False},
+        }
+
+    monkeypatch.setattr(runtime_tools, "update_local_version", _preview)
+    out = run_tool("version_update", {"bump": "auto", "apply": False})
+
+    assert out["ok"] is True
+    assert out["data"]["status"] == "recommended"
+    assert out["warnings"] == [
+        "compatibility-sensitive files changed; confirm Unreleased impact classification",
+        "recommendation only; confirm before writing VERSION",
+    ]
+    assert out["meta"]["remote_name"] == "origin"
+
+
+def test_scheduler_status_exposes_processed_scan_target_watermark(tmp_path: Path) -> None:
+    from src.application.tool_execution import execute_tool as run_tool
+
+    cfg = _minimal_cfg()
+    cfg["schedule"] = {
+        "enabled": True,
+        "timezone": "America/New_York",
+        "cron_interval_min": 10,
+        "run_window": {"start": "09:30", "end": "16:00", "breaks": []},
+        "run_points": {"start_plus_min": 10, "hourly_minute": 0, "end_minus_min": 10},
+    }
+    cfg_path = tmp_path / "config.us.json"
+    cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+    state_path = tmp_path / "state" / "scheduler_state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_run_utc_by_account": {"user1": "2026-07-21T14:31:00+00:00"},
+                "last_processed_scan_target_utc_by_account": {
+                    "user1": "2026-07-21T14:30:00+00:00"
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out = run_tool(
+        "scheduler_status",
+        {"config_path": str(cfg_path), "state": str(state_path), "account": "user1"},
+    )
+
+    assert out["data"]["state"]["last_processed_scan_target_utc_for_account"] == (
+        "2026-07-21T14:30:00+00:00"
+    )

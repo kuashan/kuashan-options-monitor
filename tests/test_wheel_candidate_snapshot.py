@@ -1,0 +1,358 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from domain.domain.decision_state_fingerprint import canonical_sha256
+from src.application.wheel.candidate_snapshot import (
+    WHEEL_CANDIDATE_SNAPSHOT_FILE_V1,
+    WHEEL_CANDIDATE_SNAPSHOT_SCHEMA_V1,
+    WHEEL_CANDIDATE_SNAPSHOT_SCHEMA_V2,
+    WHEEL_CANDIDATE_SNAPSHOT_SCHEMA_V3,
+    WheelCandidateSnapshotError,
+    load_wheel_candidate_snapshot,
+    seal_wheel_candidate_snapshot,
+)
+
+
+def _dependencies() -> list[dict]:
+    return [
+        {"kind": kind, "relpath": None, "sha256": char * 64}
+        for kind, char in (
+            ("required_data", "a"),
+            ("portfolio", "b"),
+            ("ledger", "c"),
+            ("fx", "d"),
+            ("earnings_rv", "e"),
+        )
+    ]
+
+
+def _scope(*, direction: str = "call", candidate_count: int = 1) -> dict:
+    return {"symbol": "NVDA", "direction": direction, "status": "completed", "candidate_count": candidate_count}
+
+
+def _seal(base: Path, run_id: str = "run-1", **overrides) -> dict:
+    return seal_wheel_candidate_snapshot(
+        base=base,
+        run_id=run_id,
+        account="lx",
+        market="us",
+        account_config_sha256="a" * 64,
+        strategy_policy_sha256="b" * 64,
+        dependencies=_dependencies(),
+        run_mode={"scan_mode": "standard", "executable": True},
+        **overrides,
+    )
+
+
+def _candidate() -> dict:
+    return {
+        "candidate_id": "wheel-candidate-1",
+        "final_candidate_id": "wheel-candidate-1",
+        "account": "lx",
+        "symbol": "NVDA",
+        "stock_lot_id": "stock-1",
+        "wheel_branch_id": "branch-call-1",
+        "direction": "call",
+        "contract_symbol": "NVDA-CALL-110",
+        "multiplier": 100,
+        "granted_contracts": 1,
+    }
+
+
+def _batch(*, final: bool = True) -> dict:
+    candidate = _candidate()
+    return {
+        "account": "lx",
+        "symbol": "NVDA",
+        "stock_lot_id": "stock-1",
+        "wheel_branch_id": "branch-call-1",
+        "direction": "call",
+        "batch_generation_hash": "1" * 64,
+        "projection_hash": "2" * 64,
+        "reason_codes": [],
+        "raw_candidates": [{key: value for key, value in candidate.items() if key != "final_candidate_id"}],
+        "requested_contracts": 1,
+        "requested_shares": 100,
+        "granted_contracts": 1 if final else 0,
+        "granted_shares": 100 if final else 0,
+        "capacity_before": 100,
+        "capacity_after": 0 if final else 100,
+        "final_candidate": candidate if final else None,
+    }
+
+
+def test_wheel_candidate_snapshot_seals_one_account_run_owner(tmp_path: Path) -> None:
+    payload = _seal(
+        tmp_path,
+        scope_results=[
+            {
+                "symbol": "NVDA",
+                "direction": "call",
+                "status": "completed",
+                "reason_code": "candidates_found",
+                "candidate_count": 1,
+            }
+        ],
+        batches=[_batch()],
+    )
+
+    assert payload["candidate_owner"] == "wheel"
+    assert payload["schema_version"] == WHEEL_CANDIDATE_SNAPSHOT_SCHEMA_V3
+    assert payload["opening_status"] == "candidates_found"
+    assert load_wheel_candidate_snapshot(base=tmp_path, run_id="run-1", account="lx") == payload
+
+
+def test_wheel_candidate_snapshot_rejects_final_candidate_not_from_raw_top(tmp_path: Path) -> None:
+    batch = _batch()
+    batch["final_candidate"] = {**_candidate(), "candidate_id": "other", "final_candidate_id": "other"}
+    with pytest.raises(WheelCandidateSnapshotError, match="allocation"):
+        _seal(
+            tmp_path,
+            scope_results=[_scope()],
+            batches=[batch],
+        )
+
+
+def test_wheel_candidate_snapshot_rejects_positive_grant_without_final_candidate(
+    tmp_path: Path,
+) -> None:
+    batch = _batch(final=False)
+    batch["granted_contracts"] = 1
+
+    with pytest.raises(WheelCandidateSnapshotError, match="grant requires final candidate"):
+        _seal(
+            tmp_path,
+            scope_results=[_scope()],
+            batches=[batch],
+        )
+
+
+def test_wheel_candidate_snapshot_accepts_rejected_candidate_with_zero_grant(
+    tmp_path: Path,
+) -> None:
+    batch = _batch(final=False)
+    batch["reason_code"] = "wheel_capacity_grant_candidate_rejected"
+
+    payload = _seal(
+        tmp_path,
+        scope_results=[_scope()],
+        batches=[batch],
+    )
+
+    assert payload["batches"][0]["granted_contracts"] == 0
+    assert payload["batches"][0]["final_candidate"] is None
+
+
+def test_wheel_candidate_snapshot_allows_same_symbol_across_directions(
+    tmp_path: Path,
+) -> None:
+    call_batch = _batch(final=False)
+    put_batch = {
+        **_batch(final=False),
+        "stock_lot_id": None,
+        "wheel_branch_id": "branch-put-1",
+        "direction": "put",
+    }
+    payload = _seal(
+        tmp_path,
+        scope_results=[_scope(candidate_count=0), _scope(direction="put", candidate_count=0)],
+        batches=[call_batch, put_batch],
+    )
+
+    assert [(row["symbol"], row["direction"]) for row in payload["scope_results"]] == [
+        ("NVDA", "call"),
+        ("NVDA", "put"),
+    ]
+
+
+def test_wheel_candidate_snapshot_loader_adapts_legacy_file_location(
+    tmp_path: Path,
+) -> None:
+    payload = _seal(
+        tmp_path,
+        run_id="run-v2",
+        scope_results=[_scope(candidate_count=0)],
+        batches=[_batch(final=False)],
+    )
+    legacy = dict(payload)
+    legacy["schema_version"] = WHEEL_CANDIDATE_SNAPSHOT_SCHEMA_V1
+    legacy["scope_results"] = [
+        {key: value for key, value in row.items() if key != "direction"}
+        for row in legacy["scope_results"]
+    ]
+    legacy["batches"] = [
+        {
+            **{
+                key: value
+                for key, value in row.items()
+                if key not in {"direction", "wheel_branch_id", "batch_generation_hash"}
+            },
+            "batch_generation_hash": row["batch_generation_hash"],
+        }
+        for row in legacy["batches"]
+    ]
+    binding = {
+        "run_id": legacy["run_id"],
+        "account": legacy["account"],
+        "account_config_sha256": legacy["account_config_sha256"],
+        "strategy_policy_sha256": legacy["strategy_policy_sha256"],
+        "required_data_manifest_sha256": legacy["required_data_manifest_sha256"],
+        "scope_results": legacy["scope_results"],
+        "batches": legacy["batches"],
+        "capacity_allocations": legacy["capacity_allocations"],
+    }
+    legacy["snapshot_hash"] = canonical_sha256(binding)
+    legacy["content_sha256"] = canonical_sha256(
+        {key: value for key, value in legacy.items() if key != "content_sha256"}
+    )
+    target = tmp_path / "output_runs" / "run-v1" / "accounts" / "lx" / "state"
+    target.mkdir(parents=True)
+    legacy["run_id"] = "run-v1"
+    binding["run_id"] = "run-v1"
+    legacy["snapshot_hash"] = canonical_sha256(binding)
+    legacy["content_sha256"] = canonical_sha256(
+        {key: value for key, value in legacy.items() if key != "content_sha256"}
+    )
+    (target / WHEEL_CANDIDATE_SNAPSHOT_FILE_V1).write_text(
+        json.dumps(legacy),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WheelCandidateSnapshotError, match="artifact_version_mismatch"):
+        load_wheel_candidate_snapshot(
+            base=tmp_path,
+            run_id="run-v1",
+            account="lx",
+        )
+
+
+def test_wheel_candidate_snapshot_rejects_mixed_v1_v2_files(tmp_path: Path) -> None:
+    _seal(
+        tmp_path,
+        run_id="run-mixed",
+        scope_results=[_scope(candidate_count=0)],
+        batches=[_batch(final=False)],
+        capacity_allocations=[],
+        sealed_at="2026-09-09T00:00:00Z",
+    )
+    target = tmp_path / "output_runs" / "run-mixed" / "accounts" / "lx" / "state"
+    (target / WHEEL_CANDIDATE_SNAPSHOT_FILE_V1).write_text("{}", encoding="utf-8")
+
+    with pytest.raises(WheelCandidateSnapshotError, match="artifact_version_mismatch"):
+        load_wheel_candidate_snapshot(
+            base=tmp_path,
+            run_id="run-mixed",
+            account="lx",
+        )
+
+
+def test_wheel_candidate_snapshot_v2_binds_put_cash_allocation(
+    tmp_path: Path,
+) -> None:
+    candidate = {
+        "candidate_id": "wheel-put-candidate-1",
+        "final_candidate_id": "wheel-put-candidate-1",
+        "account": "lx",
+        "symbol": "NVDA",
+        "wheel_branch_id": "branch-put-1",
+        "direction": "put",
+        "contract_symbol": "NVDA-PUT-99",
+        "multiplier": 100,
+        "granted_contracts": 1,
+        "capacity_identity_hash": "3" * 64,
+        "allocation_input_hash": "4" * 64,
+        "cash_reservation_amount": 9_900,
+        "cash_reservation_currency": "USD",
+    }
+    allocation = {
+        "claim_id": "wheel:put:branch-put-1",
+        "strategy_family": "wheel",
+        "wheel_branch_id": "branch-put-1",
+        "direction": "put",
+        "capacity_identity_hash": "3" * 64,
+        "allocation_input_hash": "4" * 64,
+        "granted_contracts": 1,
+        "cash_reservation_amount": 9_900,
+        "cash_reservation_currency": "USD",
+    }
+    payload = _seal(
+        tmp_path,
+        run_id="run-put",
+        scope_results=[_scope(direction="put")],
+        batches=[
+            {
+                "account": "lx",
+                "symbol": "NVDA",
+                "wheel_branch_id": "branch-put-1",
+                "direction": "put",
+                "batch_generation_hash": "1" * 64,
+                "projection_hash": "2" * 64,
+                "raw_candidates": [
+                    {key: value for key, value in candidate.items() if key != "final_candidate_id"}
+                ],
+                "granted_contracts": 1,
+                "final_candidate": candidate,
+            }
+        ],
+        capacity_allocations=[allocation],
+    )
+
+    assert payload["batches"][0]["final_candidate"]["cash_reservation_amount"] == 9_900
+
+
+def test_wheel_candidate_snapshot_v2_preserves_ordinary_cc_allocation(
+    tmp_path: Path,
+) -> None:
+    ordinary = {
+        "claim_id": "covered_call:NVDA",
+        "strategy_family": "covered_call",
+        "account": "lx",
+        "symbol": "NVDA",
+        "granted_contracts": 1,
+    }
+    payload = _seal(
+        tmp_path,
+        run_id="run-ordinary-cc",
+        scope_results=[_scope(candidate_count=0)],
+        batches=[_batch(final=False)],
+        capacity_allocations=[ordinary],
+    )
+
+    assert payload["capacity_allocations"] == [ordinary]
+
+
+def test_confirmation_reads_original_hash_bound_cash_and_ledger_fx(tmp_path, monkeypatch):
+    from hashlib import sha256
+    from cash_evidence_helpers import cash_config, cash_portfolio
+    from src.application.tick_run_workspace import publish_account_run_config
+    from src.application.wheel.candidate_snapshot import load_wheel_candidate_cash_fact
+    import src.application.futu_portfolio_context as futu
+
+    monkeypatch.setattr(futu, "fetch_futu_portfolio_context", lambda **kw: pytest.fail("confirmation must not fetch"))
+    config = cash_config()
+    config["portfolio"]["account"] = "lx"
+    authority = publish_account_run_config(base=tmp_path, run_id="run-1", account="lx", config=config)
+    state = tmp_path / "output_runs/run-1/accounts/lx/state"
+    portfolio = cash_portfolio({"cash_by_currency": {"USD": 123},
+        "source_observed_at": "2026-01-01T00:00:00+00:00", "exchange_rates": {"USD": 999}})
+    deps = _dependencies()
+    for kind, name, payload in (("portfolio", "portfolio_context.json", portfolio),
+                               ("ledger", "option_positions_context.json", {"exchange_rates": {"USD": 7}})):
+        path = state / name
+        path.write_text(json.dumps(payload))
+        deps = [{"kind": kind, "relpath": str(path.relative_to(tmp_path)),
+                 "sha256": sha256(path.read_bytes()).hexdigest()} if row["kind"] == kind else row for row in deps]
+    snapshot = {"run_id": "run-1", "account": "lx", "account_config_sha256": authority.account_config_sha256,
+                "dependencies": deps}
+    fact = load_wheel_candidate_cash_fact(base=tmp_path, snapshot=snapshot)
+    assert fact["cash_by_currency"] == {"USD": 123}
+    assert fact["cash_snapshot"] == portfolio["cash_snapshot"]
+    assert fact["fx_snapshot"] == {"USD": 7}
+    assert fact["cash_evidence"]["cash_source_observed_at"] == "2026-01-01T00:00:00+00:00"
+    assert "cash_evidence_error" in load_wheel_candidate_cash_fact(base=tmp_path / "other-runtime", snapshot=snapshot)
+    (state / "portfolio_context.json").write_text("{}")
+    assert "hash" in load_wheel_candidate_cash_fact(base=tmp_path, snapshot=snapshot)["cash_evidence_error"]

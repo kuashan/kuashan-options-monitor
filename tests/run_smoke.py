@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""Small smoke checks (fast, no OpenD).
+
+Usage:
+  ./.venv/bin/python tests/run_smoke.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import yaml
+
+
+def _ensure_repo_on_path() -> Path:
+    base = Path(__file__).resolve().parents[1]
+    if str(base) not in sys.path:
+        sys.path.insert(0, str(base))
+    return base
+
+
+def _write_managed_wrapper(path: Path, target: Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "# options-monitor managed wrapper",
+                f'exec "{target}" "$@"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _init_yaml_authoring_config(*, output_dir: Path) -> tuple[Path, Path]:
+    _ensure_repo_on_path()
+
+    from src.application.config_yaml_accounts import mutate_yaml_account_config
+    from src.application.config_yaml_init import init_yaml_config
+
+    config_yaml_path = output_dir / "config.yaml"
+    init_yaml_config(
+        repo_root=Path(__file__).resolve().parents[1],
+        output_config_yaml_path=config_yaml_path,
+        runtime_output_dir=output_dir,
+        markets=["us", "hk"],
+        futu_acc_id="999000000000000001",
+        account_label="user1",
+        us_symbols=["NVDA"],
+        hk_symbols=["0700.HK"],
+        build=True,
+    )
+    mutate_yaml_account_config(
+        repo_root=Path(__file__).resolve().parents[1],
+        action="edit",
+        market="us",
+        account_label="user1",
+        config_path=config_yaml_path,
+        futu_host="127.0.0.1",
+        futu_port=11111,
+        rebuild_runtime_root=output_dir,
+        apply=True,
+    )
+    return config_yaml_path, output_dir / "config.us.json"
+
+
+def test_scanners_require_multiplier() -> None:
+    _ensure_repo_on_path()
+
+    import pandas as pd
+    from src.application.scan_sell_put import compute_metrics as put_metrics
+    from src.application.scan_sell_call import compute_metrics as call_metrics
+
+    put_row = pd.Series({'mid': 1.0, 'strike': 90.0, 'spot': 100.0, 'dte': 14, 'currency': 'HKD'})
+    assert put_metrics(put_row) is None
+
+    call_row = pd.Series({'mid': 1.0, 'strike': 110.0, 'spot': 100.0, 'dte': 14, 'currency': 'HKD'})
+    assert call_metrics(call_row, avg_cost=80.0) is None
+
+
+def test_agent_launcher_spec_contract() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    p = subprocess.run(
+        [str(om_agent), "spec"],
+        cwd=str(base),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(p.stdout)
+    assert payload["schema_version"] == "1.0"
+    assert any(str(x.get("name")) == "manage_symbols" for x in payload.get("tools", []))
+    assert any(str(x.get("name")) == "close_advice_read" for x in payload.get("tools", []))
+    assert not any(
+        str(x.get("name")) in {"prepare_close_advice_inputs", "close_advice", "get_close_advice"}
+        for x in payload.get("tools", [])
+    )
+
+
+def test_installed_global_wrappers_work_outside_release_cwd() -> None:
+    base = _ensure_repo_on_path()
+    with tempfile.TemporaryDirectory() as td:
+        temp_root = Path(td)
+        prefix = temp_root / "prefix"
+        releases_dir = prefix / "releases"
+        release_root = releases_dir / "vtest"
+        current = prefix / "current"
+        bin_dir = temp_root / "bin"
+        outside = temp_root / "outside"
+
+        releases_dir.mkdir(parents=True)
+        bin_dir.mkdir()
+        outside.mkdir()
+        release_root.symlink_to(base, target_is_directory=True)
+        current.symlink_to(release_root, target_is_directory=True)
+        _write_managed_wrapper(bin_dir / "om", current / "om")
+        _write_managed_wrapper(bin_dir / "om-agent", current / "om-agent")
+        env_file = outside / "settings.env"
+        env_file.write_text("", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join([str(bin_dir), env.get("PATH", "")])
+        # This smoke process runs outside pytest's backend-isolation fixture and
+        # outside a systemd unit, so select the explicit compatibility backend.
+        # Production Linux remains fail-closed without CREDENTIALS_DIRECTORY.
+        env["OM_SECRET_BACKEND"] = "env"
+
+        om_wrapper = (bin_dir / "om").read_text(encoding="utf-8")
+        om_agent_wrapper = (bin_dir / "om-agent").read_text(encoding="utf-8")
+        assert f'exec "{current / "om"}" "$@"' in om_wrapper
+        assert f'exec "{current / "om-agent"}" "$@"' in om_agent_wrapper
+
+        help_proc = subprocess.run(
+            ["om", "--help"],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        assert "首次安装" in help_proc.stdout and "日常管理" in help_proc.stdout
+        assert "om setup init" in help_proc.stdout and "om help all" in help_proc.stdout
+        full_help_proc = subprocess.run(
+            ["om", "help", "all"],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        assert full_help_proc.stdout.startswith("usage: om ")
+        assert "trade-events" in full_help_proc.stdout
+
+        setup_proc = subprocess.run(
+            ["om", "setup", "check"],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+        setup_payload = json.loads(setup_proc.stdout)
+        assert setup_payload["tool_name"] == "setup.check"
+        assert setup_proc.returncode in {0, 2}
+        assert isinstance(setup_payload["ok"], bool)
+
+        settings_proc = subprocess.run(
+            ["om", "settings", "doctor", "--env-file", str(env_file)],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        settings_payload = json.loads(settings_proc.stdout)
+        assert settings_payload["tool_name"] == "settings.doctor"
+        assert settings_payload["ok"] is True
+        assert settings_payload["data"]["env_file"] == "<configured-env-file>"
+        assert settings_payload["data"]["env_file_loaded"] is True
+        assert str(env_file.resolve()) not in settings_proc.stdout
+
+        config_yaml = outside / "config.yaml"
+        runtime_configs = outside / "runtime-config"
+        init_proc = subprocess.run(
+            [
+                "om",
+                "config",
+                "init", "--account-label", "lx",
+                "--output",
+                str(config_yaml),
+                "--runtime-output-dir",
+                str(runtime_configs),
+                "--futu-acc-id",
+                "12345678",
+                "--us-symbol", "NVDA",
+                "--symbol-strategy", "NVDA=csp",
+                "--csp-max-strike", "NVDA=100",
+                "--hk-symbol", "0700.HK",
+                "--symbol-strategy", "0700.HK=cc",
+                "--cc-min-strike", "0700.HK=400",
+            ],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        init_payload = json.loads(init_proc.stdout)
+        assert init_payload["ok"] is True
+        assert config_yaml.exists()
+        assert (runtime_configs / "config.us.json").exists()
+        assert (runtime_configs / "config.hk.json").exists()
+        us = json.loads((runtime_configs / "config.us.json").read_text())
+        hk = json.loads((runtime_configs / "config.hk.json").read_text())
+        assert [item["symbol"] for item in us["symbols"]] == ["NVDA"]
+        assert [item["symbol"] for item in hk["symbols"]] == ["0700.HK"]
+        assert us["symbols"][0]["sell_put"]["max_strike"] == 100
+        assert hk["symbols"][0]["sell_call"]["min_strike"] == 400
+
+        validate_proc = subprocess.run(
+            ["om", "config", "validate", "--source", "yaml", "--market", "us", "--config-yaml", str(config_yaml)],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        assert json.loads(validate_proc.stdout)["ok"] is True
+
+        build_proc = subprocess.run(
+            [
+                "om",
+                "config",
+                "build",
+                "--source",
+                "yaml",
+                "--market",
+                "hk",
+                "--config-yaml",
+                str(config_yaml),
+                "--output",
+                str(runtime_configs / "config.hk.json"),
+                "--dry-run",
+            ],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        assert json.loads(build_proc.stdout)["dry_run"] is True
+
+        support_proc = subprocess.run(
+            [
+                "om",
+                "support",
+                "bundle",
+                "--config-path",
+                str(runtime_configs / "config.us.json"),
+                "--output-dir",
+                str(outside / "support"),
+                "--no-local-env-file",
+            ],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        support_payload = json.loads(support_proc.stdout)
+        assert support_payload["tool_name"] == "support.bundle"
+        assert (outside / "support" / support_payload["data"]["bundle_name"]).exists()
+        assert "bundle_path" not in support_payload["data"]
+
+        spec_proc = subprocess.run(
+            ["om-agent", "spec"],
+            cwd=str(outside),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=env,
+        )
+        spec_payload = json.loads(spec_proc.stdout)
+        assert spec_payload["name"] == "options-monitor-local-tools"
+
+
+def test_support_bundle_cli_writes_redacted_bundle() -> None:
+    base = _ensure_repo_on_path()
+    om = (base / "om").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        out_dir = Path(td) / "support"
+        p = subprocess.run(
+            [
+                str(om),
+                "support",
+                "bundle",
+                "--config-key",
+                "us",
+                "--output-dir",
+                str(out_dir),
+                "--no-local-env-file",
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(p.stdout)
+        assert payload["tool_name"] == "support.bundle"
+        bundle_path = out_dir / payload["data"]["bundle_name"]
+        assert bundle_path.exists()
+        bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+        assert bundle["schema_version"] == "support_bundle.v1"
+        assert bundle["redaction"]["enabled"] is True
+
+
+def test_agent_yaml_init_minimal_config() -> None:
+    _ensure_repo_on_path()
+    with tempfile.TemporaryDirectory() as td:
+        config_yaml_path, cfg_path = _init_yaml_authoring_config(output_dir=Path(td))
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        assert config_yaml_path.exists()
+        assert cfg_path.name == "config.us.json"
+        assert cfg["accounts"] == ["user1"]
+        assert cfg["account_settings"]["user1"]["futu"]["account_id"] == "999000000000000001"
+        assert cfg["symbols"][0]["symbol"] == "NVDA"
+        assert "pm_config" not in cfg["portfolio"]
+        assert "market" not in cfg["portfolio"]
+        assert cfg["symbols"][0]["broker"] == "US"
+        assert "market" not in cfg["symbols"][0]
+        sell_put_template = cfg["templates"]["put_base"]["sell_put"]
+        assert sell_put_template["strategy"] == "insurance_underwriting"
+        assert "short_vol" not in sell_put_template
+        assert sell_put_template["min_iv_rv_ratio"] == 1.10
+        assert "min_annualized_net_return" not in sell_put_template
+        assert cfg["runtime"]["symbol_timeout_sec"] == 120
+        assert cfg["close_advice"] == {
+            "enabled": True,
+            "quote_source": "auto",
+            "max_items_per_account": 5,
+        }
+        assert cfg["alert_policy"]["change_annual_threshold"] == 0.02
+        assert cfg["alert_policy"]["sell_put"] == {
+            "high_annual": 0.20,
+            "high_spread_max": 0.20,
+            "medium_annual": 0.12,
+        }
+        assert cfg["alert_policy"]["sell_call"] == {
+            "high_annual": 0.10,
+            "high_total": 0.15,
+            "medium_annual": 0.06,
+        }
+        assert "default_multiplier_us" not in cfg["intake"]
+        assert "default_multiplier_hk" not in cfg["intake"]
+
+
+def test_agent_yaml_init_builds_markets_from_shared_authoring() -> None:
+    _ensure_repo_on_path()
+    with tempfile.TemporaryDirectory() as td:
+        config_yaml_path, us_cfg_path = _init_yaml_authoring_config(output_dir=Path(td))
+        us_cfg = json.loads(us_cfg_path.read_text(encoding="utf-8"))
+        hk_cfg = json.loads((Path(td) / "config.hk.json").read_text(encoding="utf-8"))
+        for market, cfg, symbol in (("us", us_cfg, "NVDA"), ("hk", hk_cfg, "0700.HK")):
+            assert cfg["_resolved"]["source_format"] == "yaml"
+            assert Path(cfg["_resolved"]["config_yaml_path"]).resolve() == config_yaml_path.resolve()
+            assert cfg["_resolved"]["market"] == market
+            assert cfg["accounts"] == ["user1"]
+            assert cfg["account_settings"]["user1"]["futu"]["account_id"] == "999000000000000001"
+            assert cfg["symbols"][0]["symbol"] == symbol
+            assert cfg["symbols"][0]["broker"] == market.upper()
+
+
+def test_agent_launcher_add_futu_account() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        config_yaml_path, runtime_path = _init_yaml_authoring_config(output_dir=output_dir)
+        write_env = {**os.environ, "OM_AGENT_ENABLE_WRITE_TOOLS": "true"}
+
+        add_p = subprocess.run(
+            [
+                str(om_agent),
+                "add-account",
+                "--market",
+                "us",
+                "--config-yaml",
+                str(config_yaml_path),
+                "--rebuild-runtime-root",
+                str(output_dir),
+                "--account-label",
+                "sy",
+                "--account-type",
+                "futu",
+                "--futu-acc-id",
+                "381756479859383816",
+                "--futu-host",
+                "127.0.0.1",
+                "--futu-port",
+                "11112",
+                "--confirm",
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=write_env,
+        )
+        payload = json.loads(add_p.stdout)
+        source = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        current = json.loads(runtime_path.read_text(encoding="utf-8"))
+        assert payload["ok"] is True
+        assert source["accounts"]["sy"]["type"] == "futu"
+        assert source["accounts"]["sy"]["futu"]["account_id"] == "381756479859383816"
+        assert source["markets"]["us"]["accounts"] == ["user1", "sy"]
+        assert current["account_settings"]["sy"]["type"] == "futu"
+        assert current["account_settings"]["sy"]["futu"]["account_id"] == "381756479859383816"
+        assert "source_by_account" not in current["portfolio"]
+
+
+def test_agent_launcher_account_write_gate_and_dry_run() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        config_yaml_path, _runtime_path = _init_yaml_authoring_config(output_dir=output_dir)
+        before = config_yaml_path.read_bytes()
+
+        blocked = subprocess.run(
+            [
+                str(om_agent),
+                "add-account",
+                "--market",
+                "us",
+                "--config-yaml",
+                str(config_yaml_path),
+                "--rebuild-runtime-root",
+                str(output_dir),
+                "--account-label",
+                "ext1",
+                "--account-type",
+                "futu",
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "OM_AGENT_ENABLE_WRITE_TOOLS": ""},
+        )
+        assert blocked.returncode == 2
+        blocked_payload = json.loads(blocked.stdout)
+        assert blocked_payload["error"]["code"] == "PERMISSION_DENIED"
+
+        dry_run = subprocess.run(
+            [
+                str(om_agent),
+                "add-account",
+                "--market",
+                "us",
+                "--config-yaml",
+                str(config_yaml_path),
+                "--rebuild-runtime-root",
+                str(output_dir),
+                "--account-label",
+                "ext1",
+                "--account-type",
+                "futu",
+                "--futu-acc-id",
+                "381756479859383816",
+                "--futu-host",
+                "127.0.0.1",
+                "--futu-port",
+                "11112",
+                "--dry-run",
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            check=True,
+            env={**os.environ},
+        )
+        payload = json.loads(dry_run.stdout)
+        source = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        assert payload["ok"] is True
+        assert payload["data"]["dry_run"] is True
+        assert payload["data"]["write_applied"] is False
+        assert config_yaml_path.read_bytes() == before
+        assert "ext1" not in source["accounts"]
+
+
+def test_agent_launcher_rejects_retired_account_options() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        config_yaml_path, runtime_path = _init_yaml_authoring_config(output_dir=output_dir)
+        add_p = subprocess.run(
+            [
+                str(om_agent),
+                "add-account",
+                "--market",
+                "us",
+                "--config-yaml",
+                str(config_yaml_path),
+                "--rebuild-runtime-root",
+                str(output_dir),
+                "--account-label",
+                "sy",
+                "--account-type",
+                "futu",
+                "--holdings-account",
+                "sy",
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert add_p.returncode != 0
+        assert "unrecognized arguments" in add_p.stderr
+        source = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        current = json.loads(runtime_path.read_text(encoding="utf-8"))
+        assert "sy" not in source["accounts"]
+        assert "sy" not in current["account_settings"]
+
+
+def test_agent_launcher_edit_futu_account() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        config_yaml_path, runtime_path = _init_yaml_authoring_config(output_dir=output_dir)
+        write_env = {**os.environ, "OM_AGENT_ENABLE_WRITE_TOOLS": "true"}
+        subprocess.run(
+            [
+                str(om_agent), "add-account",
+                "--market", "us",
+                "--config-yaml", str(config_yaml_path),
+                "--rebuild-runtime-root", str(output_dir),
+                "--account-label", "sy",
+                "--account-type", "futu",
+                "--futu-acc-id", "381756479859383815",
+                "--futu-host", "127.0.0.1",
+                "--futu-port", "11112",
+                "--confirm",
+            ],
+            cwd=str(base), capture_output=True, text=True, check=True, env=write_env,
+        )
+
+        edit_p = subprocess.run(
+            [
+                str(om_agent), "edit-account",
+                "--market", "us",
+                "--config-yaml", str(config_yaml_path),
+                "--rebuild-runtime-root", str(output_dir),
+                "--account-label", "sy",
+                "--account-type", "futu",
+                "--futu-acc-id", "381756479859383816",
+                "--futu-host", "127.0.0.1",
+                "--futu-port", "11112",
+                "--confirm",
+            ],
+            cwd=str(base), capture_output=True, text=True, check=True, env=write_env,
+        )
+        payload = json.loads(edit_p.stdout)
+        source = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        current = json.loads(runtime_path.read_text(encoding="utf-8"))
+        assert payload["ok"] is True
+        assert payload["data"]["account_type"] == "futu"
+        assert source["accounts"]["sy"]["type"] == "futu"
+        assert source["accounts"]["sy"]["futu"]["account_id"] == "381756479859383816"
+        assert current["account_settings"]["sy"]["type"] == "futu"
+        assert current["account_settings"]["sy"]["futu"]["account_id"] == "381756479859383816"
+        assert current["account_settings"]["sy"]["futu"]["host"] == "127.0.0.1"
+        assert current["account_settings"]["sy"]["futu"]["port"] == 11112
+        assert current["trade_intake"]["account_mapping"]["futu"]["381756479859383816"] == "sy"
+        assert "source_by_account" not in current["portfolio"]
+
+
+def test_agent_launcher_remove_account_updates_runtime_config() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    with tempfile.TemporaryDirectory() as td:
+        output_dir = Path(td)
+        config_yaml_path, runtime_path = _init_yaml_authoring_config(output_dir=output_dir)
+        write_env = {**os.environ, "OM_AGENT_ENABLE_WRITE_TOOLS": "true"}
+        subprocess.run(
+            [
+                str(om_agent), "add-account",
+                "--market", "us",
+                "--config-yaml", str(config_yaml_path),
+                "--rebuild-runtime-root", str(output_dir),
+                "--account-label", "sy",
+                "--account-type", "futu",
+                "--futu-acc-id", "381756479859383816",
+                "--futu-host", "127.0.0.1",
+                "--futu-port", "11112",
+                "--confirm",
+            ],
+            cwd=str(base), capture_output=True, text=True, check=True, env=write_env,
+        )
+
+        remove_p = subprocess.run(
+            [
+                str(om_agent), "remove-account",
+                "--market", "us",
+                "--config-yaml", str(config_yaml_path),
+                "--rebuild-runtime-root", str(output_dir),
+                "--account-label", "user1",
+                "--confirm",
+            ],
+            cwd=str(base), capture_output=True, text=True, check=True, env=write_env,
+        )
+        payload = json.loads(remove_p.stdout)
+        source = yaml.safe_load(config_yaml_path.read_text(encoding="utf-8"))
+        current = json.loads(runtime_path.read_text(encoding="utf-8"))
+        assert payload["ok"] is True
+        assert payload["data"]["removed_account"] == "user1"
+        assert source["markets"]["us"]["accounts"] == ["sy"]
+        assert source["markets"]["hk"]["accounts"] == ["user1"]
+        assert "user1" in source["accounts"]
+        assert current["accounts"] == ["sy"]
+        assert current["portfolio"]["account"] == "sy"
+        assert "user1" not in current["trade_intake"]["account_mapping"]["futu"].values()
+
+
+def test_agent_launcher_spec_prefers_broker_field() -> None:
+    base = _ensure_repo_on_path()
+    om_agent = (base / "om-agent").resolve()
+    p = subprocess.run(
+        [str(om_agent), "spec"],
+        cwd=str(base),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = json.loads(p.stdout)
+    tool = next(item for item in payload["tools"] if item["name"] == "query_cash_headroom")
+    assert "broker" in tool["input_schema"]
+    assert "data_config" in tool["input_schema"]
+
+
+def main() -> None:
+    test_scanners_require_multiplier()
+    test_agent_launcher_spec_contract()
+    test_installed_global_wrappers_work_outside_release_cwd()
+    test_support_bundle_cli_writes_redacted_bundle()
+    test_agent_launcher_spec_prefers_broker_field()
+    test_agent_yaml_init_minimal_config()
+    test_agent_yaml_init_builds_markets_from_shared_authoring()
+    test_agent_launcher_add_futu_account()
+    test_agent_launcher_account_write_gate_and_dry_run()
+    test_agent_launcher_rejects_retired_account_options()
+    test_agent_launcher_edit_futu_account()
+    test_agent_launcher_remove_account_updates_runtime_config()
+    print('OK (smoke)')
+
+
+if __name__ == '__main__':
+    main()

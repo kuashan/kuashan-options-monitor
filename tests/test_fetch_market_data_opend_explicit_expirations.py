@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import pytest
+
+
+def _ready_underlier_observation(
+    *,
+    symbol: str = "NVDA",
+    last_price: float = 100.0,
+) -> dict[str, object]:
+    return {
+        "schema_version": "opening_underlier_observation.v1",
+        "code": f"US.{symbol}",
+        "market": "US",
+        "last_price": last_price,
+        "update_time": "2026-04-28 15:59:00",
+        "observed_at_utc": "2026-04-28T19:59:00+00:00",
+        "age_seconds": 1.0,
+        "market_state": "AFTERNOON",
+        "sec_status": "NORMAL",
+        "suspension": False,
+        "status": "ready",
+        "reason_code": None,
+    }
+
+
+def _put_chain_frame(code: object, start: object):
+    import pandas as pd
+
+    return pd.DataFrame(
+        [
+            {
+                "code": f"{code}.{start}.P135",
+                "strike_time": str(start),
+                "strike_price": 135.0,
+                "option_type": "PUT",
+                "lot_size": 100,
+            }
+        ]
+    )
+
+
+def _fetch_symbol(mod, tmp_path, **overrides: object) -> dict:
+    kwargs: dict[str, object] = {
+        "symbol": "NVDA",
+        "limit_expirations": 1,
+        "base_dir": tmp_path,
+        "explicit_expirations": ["2026-04-29"],
+        "option_types": "put",
+        "chain_cache": False,
+    }
+    kwargs.update(overrides)
+    return mod.fetch_symbol(**kwargs)
+
+
+def test_fetch_symbol_explicit_expirations_override_limit_and_cache(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    requested_chain_dates: list[str] = []
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            rows = []
+            for code in codes:
+                if str(code).startswith("US."):
+                    rows.append({"code": code, "last_price": 100.0})
+                else:
+                    rows.append(
+                        {
+                            "code": code,
+                            "last_price": 1.0,
+                            "bid_price": 0.9,
+                            "ask_price": 1.1,
+                            "option_contract_multiplier": 100,
+                        }
+                    )
+            return pd.DataFrame(rows)
+
+        def get_option_expiration_dates(self, code):  # noqa: ANN001
+            import pandas as pd
+
+            return pd.DataFrame([{"strike_time": "2026-04-29"}, {"strike_time": "2026-06-29"}])
+
+        def get_option_chain(self, *, code, start=None, end=None, is_force_refresh=False):  # noqa: ANN001
+            import pandas as pd
+
+            requested_chain_dates.append(str(start))
+            return pd.DataFrame(
+                [
+                    {
+                        "code": f"{code}.{start}.P135",
+                        "strike_time": str(start),
+                        "strike_price": 135.0,
+                        "option_type": "PUT",
+                        "lot_size": 100,
+                    },
+                    {
+                        "code": f"{code}.{start}.C200",
+                        "strike_time": str(start),
+                        "strike_price": 200.0,
+                        "option_type": "CALL",
+                        "lot_size": 100,
+                    },
+                ]
+            )
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "get_trading_date", lambda market: date(2026, 4, 28))
+    payload = _fetch_symbol(
+        mod, tmp_path, explicit_expirations=["2026-04-29", "2026-06-29"],
+        option_types="put,call", chain_cache=True, underlier_observation=_ready_underlier_observation(),
+    )
+
+    expirations = sorted({str(row.get("expiration")) for row in (payload.get("rows") or [])})
+    assert requested_chain_dates == ["2026-04-29", "2026-06-29"]
+    assert expirations == ["2026-04-29", "2026-06-29"]
+
+
+def test_fetch_symbol_normalizes_timestamp_explicit_expirations(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    requested_chain_dates: list[str] = []
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            rows = []
+            for code in codes:
+                if str(code).startswith("US."):
+                    rows.append({"code": code, "last_price": 100.0})
+                else:
+                    rows.append(
+                        {
+                            "code": code,
+                            "last_price": 1.0,
+                            "bid_price": 0.9,
+                            "ask_price": 1.1,
+                            "option_contract_multiplier": 100,
+                        }
+                    )
+            return pd.DataFrame(rows)
+
+        def get_option_chain(self, *, code, start=None, end=None, is_force_refresh=False):  # noqa: ANN001
+            import pandas as pd
+
+            requested_chain_dates.append(str(start))
+            return pd.DataFrame(
+                [
+                    {
+                        "code": f"{code}.{start}.P120",
+                        "strike_time": str(start),
+                        "strike_price": 120.0,
+                        "option_type": "PUT",
+                        "lot_size": 100,
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "get_trading_date", lambda market: date(2026, 4, 28))
+    payload = _fetch_symbol(
+        mod, tmp_path, symbol="FUTU", explicit_expirations=[1777420800, "1781740800000"],
+        underlier_observation=_ready_underlier_observation(symbol="FUTU"),
+    )
+
+    expirations = sorted({str(row.get("expiration")) for row in (payload.get("rows") or [])})
+    assert requested_chain_dates == ["2026-04-29", "2026-06-18"]
+    assert expirations == ["2026-04-29", "2026-06-18"]
+
+
+@pytest.mark.parametrize("clock_behavior", ["flipped", "raises"])
+def test_fetch_symbol_explicit_trading_date_anchors_chain_rv_rows_and_meta(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    clock_behavior: str,
+) -> None:
+    import src.application.opend_symbol_fetching as mod
+    from src.application.short_vol_metrics import (
+        RealizedVolatilitySnapshot,
+        TermMatchedRVObservation,
+    )
+
+    requested_chain_dates: list[tuple[str, str]] = []
+    rv_calls: list[tuple[str, date]] = []
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            return pd.DataFrame(
+                [
+                    {
+                        "code": code,
+                        "last_price": 1.0,
+                        "bid_price": 0.9,
+                        "ask_price": 1.1,
+                        "option_contract_multiplier": 100,
+                        "update_time": "2026-07-27 15:59:00",
+                    }
+                    for code in codes
+                ]
+            )
+
+        def get_option_chain(
+            self,
+            *,
+            code,
+            start=None,
+            end=None,
+            is_force_refresh=False,
+        ):  # noqa: ANN001
+            import pandas as pd
+
+            requested_chain_dates.append((str(start), str(end)))
+            return pd.DataFrame(
+                [
+                    {
+                        "code": f"{code}.{start}.P100",
+                        "strike_time": str(start),
+                        "strike_price": 100.0,
+                        "option_type": "PUT",
+                        "lot_size": 100,
+                    }
+                ]
+            )
+
+    def current_clock(_market: str) -> date:
+        if clock_behavior == "raises":
+            raise AssertionError("ambient clock must not be read")
+        return date(2026, 7, 28)
+
+    def fetch_rv(
+        _gateway: object,
+        *,
+        underlier_code: str,
+        trading_day: date,
+        market: str,
+        expirations: list[str],
+        base_dir: Path,
+        **_rate_limit: object,
+    ) -> RealizedVolatilitySnapshot:
+        rv_calls.append((underlier_code, trading_day))
+        assert market == "US"
+        assert expirations == ["2026-08-07"]
+        assert base_dir == tmp_path
+        term = TermMatchedRVObservation(
+            schema_version="term_matched_rv.v1",
+            expiration="2026-08-07",
+            status="ok",
+            reason=None,
+            term_matched_rv=0.22,
+            remaining_sessions=9,
+            lookback_sessions=20,
+            input_start="2026-06-26",
+            input_end="2026-07-24",
+            input_close_session_count=21,
+            input_return_count=20,
+            input_hash="a" * 64,
+            legacy_weighted_rv=0.212,
+            shadow_difference=0.008,
+        )
+        return RealizedVolatilitySnapshot(
+            rv_20=0.20,
+            rv_60=0.24,
+            rv_120=0.28,
+            rv_estimate=0.25,
+            sample_count=120,
+            status="ok",
+            term_matched={"2026-08-07": term},
+            qfq_history_evidence={"status": "ok"},
+            trading_calendar_evidence={"status": "ok"},
+        )
+
+    monkeypatch.setattr(mod, "get_trading_date", current_clock)
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "fetch_realized_volatility_snapshot", fetch_rv)
+
+    payload = mod.fetch_symbol_request(
+        mod.FetchSymbolRequest(
+            symbol="NVDA",
+            limit_expirations=0,
+            base_dir=tmp_path,
+            explicit_expirations=["2026-08-07"],
+            trading_date="2026-07-27",
+            option_types="put",
+            include_realized_volatility=True,
+            gateway=_Gateway(),
+            underlier_observation=_ready_underlier_observation(),
+        )
+    )
+
+    rows = payload.get("rows") or []
+    meta = payload.get("meta") or {}
+    assert requested_chain_dates == [("2026-08-07", "2026-08-07")]
+    assert rv_calls == [("US.NVDA", date(2026, 7, 27))]
+    assert len(rows) == 1
+    assert rows[0]["expiration"] == "2026-08-07"
+    assert rows[0]["dte"] == 11
+    assert rows[0]["realized_volatility_estimate"] == 0.212
+    assert rows[0]["market"] == "US"
+    assert rows[0]["last_price_update_time"] == "2026-07-27 15:59:00"
+    from src.application.opend_symbol_outputs import save_outputs
+
+    _raw_path, csv_path = save_outputs(
+        tmp_path,
+        "NVDA",
+        payload,
+        output_root=tmp_path / "required_data",
+        publish_cache_metadata=False,
+    )
+    import pandas as pd
+
+    persisted = pd.read_csv(csv_path).iloc[0]
+    assert persisted["market"] == "US"
+    assert persisted["last_price_update_time"] == "2026-07-27 15:59:00"
+    assert meta["status"] == "ok"
+    assert meta["source_outcome"] == "success_rows"
+    assert meta["trading_date"] == "2026-07-27"
+    assert meta["realized_volatility"]["status"] == "ok"
+
+
+def test_list_option_expirations_uses_shared_endpoint_limiter(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_chain_fetching as mod
+
+    endpoints: list[tuple[str, int, float, float]] = []
+
+    class _Gateway:
+        def get_option_expiration_dates(self, code):  # noqa: ANN001
+            import pandas as pd
+
+            assert code == "US.NVDA"
+            return pd.DataFrame([{"strike_time": "2026-04-29"}])
+
+        def close(self):  # noqa: ANN201
+            return None
+
+    def _fake_rate_limited_call(**kwargs):  # type: ignore[no-untyped-def]
+        endpoints.append(
+            (
+                kwargs["endpoint"],
+                int(kwargs["max_calls"]),
+                float(kwargs["window_sec"]),
+                float(kwargs["max_wait_sec"]),
+            )
+        )
+        return kwargs["call"]()
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "rate_limited_opend_call", _fake_rate_limited_call)
+
+    out = mod.list_option_expirations(
+        "NVDA",
+        base_dir=tmp_path,
+        expiration_max_calls=7,
+        expiration_window_sec=17,
+        expiration_max_wait_sec=27,
+    )
+
+    assert out == ["2026-04-29"]
+    assert endpoints == [("option_expiration", 7, 17.0, 27.0)]
+
+
+def test_list_option_expirations_caches_by_underlier_and_asof_date(tmp_path: Path) -> None:
+    import pandas as pd
+    import src.application.opend_symbol_chain_fetching as mod
+    from src.application.opend_fetch_config import OpenDFetchLimits
+
+    calls: list[str] = []
+
+    class _Gateway:
+        def get_option_expiration_dates(self, code):  # noqa: ANN001
+            calls.append(str(code))
+            return pd.DataFrame([{"strike_time": "2026-04-29"}, {"strike_time": "2026-06-29"}])
+
+    def _fake_rate_limited_call(**kwargs):  # type: ignore[no-untyped-def]
+        return kwargs["call"]()
+
+    limit = OpenDFetchLimits.from_flat_kwargs(expiration_max_calls=60).option_expiration
+    first_metrics: dict[str, int] = {}
+    first = mod.list_option_expirations_with_gateway(
+        _Gateway(),
+        underlier_code="US.NVDA",
+        base_dir=tmp_path,
+        asof_date="2026-04-28",
+        expiration_limit=limit,
+        retry_call=lambda _name, fn, **kwargs: fn(),
+        rate_limited_call=_fake_rate_limited_call,
+        metrics=first_metrics,
+    )
+    second_metrics: dict[str, int] = {}
+    second = mod.list_option_expirations_with_gateway(
+        _Gateway(),
+        underlier_code="US.NVDA",
+        base_dir=tmp_path,
+        asof_date="2026-04-28",
+        expiration_limit=limit,
+        retry_call=lambda _name, fn, **kwargs: fn(),
+        rate_limited_call=_fake_rate_limited_call,
+        metrics=second_metrics,
+    )
+    third_metrics: dict[str, int] = {}
+    third = mod.list_option_expirations_with_gateway(
+        _Gateway(),
+        underlier_code="US.NVDA",
+        base_dir=tmp_path,
+        asof_date="2026-04-29",
+        expiration_limit=limit,
+        retry_call=lambda _name, fn, **kwargs: fn(),
+        rate_limited_call=_fake_rate_limited_call,
+        metrics=third_metrics,
+    )
+
+    assert first == ["2026-04-29", "2026-06-29"]
+    assert second == first
+    assert third == first
+    assert calls == ["US.NVDA", "US.NVDA"]
+    assert first_metrics["expiration_opend_calls"] == 1
+    assert second_metrics["expiration_cache_hits"] == 1
+    assert third_metrics["expiration_opend_calls"] == 1
+
+
+def test_fetch_symbol_uses_shared_snapshot_limiter(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    endpoints: list[tuple[str, int, float, float]] = []
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            rows = []
+            for code in codes:
+                if str(code).startswith("US.NVDA."):
+                    rows.append({"code": code, "last_price": 1.0, "bid_price": 0.9, "ask_price": 1.1})
+                else:
+                    rows.append({"code": code, "last_price": 100.0})
+            return pd.DataFrame(rows)
+
+        def get_option_chain(self, *, code, start=None, end=None, is_force_refresh=False):  # noqa: ANN001
+            return _put_chain_frame(code, start)
+
+    def _fake_rate_limited_call(**kwargs):  # type: ignore[no-untyped-def]
+        endpoints.append(
+            (
+                kwargs["endpoint"],
+                int(kwargs["max_calls"]),
+                float(kwargs["window_sec"]),
+                float(kwargs["max_wait_sec"]),
+            )
+        )
+        return kwargs["call"]()
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "rate_limited_opend_call", _fake_rate_limited_call)
+    monkeypatch.setattr(mod, "get_trading_date", lambda market: date(2026, 4, 28))
+
+    payload = _fetch_symbol(mod, tmp_path, snapshot_max_calls=8, snapshot_window_sec=18, snapshot_max_wait_sec=28)
+
+    assert len(payload.get("rows") or []) == 1
+    assert ("market_snapshot", 8, 18.0, 28.0) in endpoints
+
+
+def test_fetch_symbol_reports_underlier_snapshot_errors(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            if codes == ["US.NVDA"]:
+                raise RuntimeError("underlier snapshot unavailable")
+            return pd.DataFrame(
+                [
+                    {
+                        "code": str(codes[0]),
+                        "last_price": 1.0,
+                        "bid_price": 0.9,
+                        "ask_price": 1.1,
+                    }
+                ]
+            )
+
+        def get_option_chain(self, *, code, start=None, end=None, is_force_refresh=False):  # noqa: ANN001
+            return _put_chain_frame(code, start)
+
+        def close(self):  # noqa: ANN201
+            return None
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "get_trading_date", lambda market: date(2026, 4, 28))
+
+    payload = mod.fetch_symbol_request(
+        mod.FetchSymbolRequest(
+            symbol="NVDA",
+            limit_expirations=1,
+            base_dir=tmp_path,
+            explicit_expirations=["2026-04-29"],
+            option_types="put",
+            chain_cache=False,
+        )
+    )
+
+    meta = payload.get("meta") or {}
+    assert len(payload.get("rows") or []) == 1
+    assert meta["status"] == "ok"
+    assert meta["error"] is None
+    assert meta["spot_errors"][0]["stage"] == "underlier_snapshot"
+    assert meta["spot_errors"][0]["error_code"] == "UNKNOWN"
+
+
+def test_fetch_symbol_does_not_retry_underlier_observation_signature(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    calls: list[dict] = []
+
+    class _Gateway:
+        def close(self):  # noqa: ANN201
+            return None
+
+    def _get_underlier_observation(_gateway, _code, **kwargs):  # noqa: ANN001
+        calls.append(dict(kwargs))
+        raise TypeError("underlier observation signature is invalid")
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(
+        mod,
+        "get_underlier_observation_opend",
+        _get_underlier_observation,
+    )
+
+    payload = _fetch_symbol(mod, tmp_path, snapshot_max_calls=8, snapshot_window_sec=18, snapshot_max_wait_sec=28)
+
+    assert len(calls) == 1
+    assert calls[0]["base_dir"] == tmp_path
+    assert calls[0]["market"] == "US"
+    assert calls[0]["snapshot_max_calls"] == 8
+    assert calls[0]["snapshot_window_sec"] == 18
+    assert calls[0]["snapshot_max_wait_sec"] == 28
+    assert "errors" in calls[0]
+    meta = payload.get("meta") or {}
+    assert meta["status"] == "error"
+    assert "TypeError" in str(meta["error"])
+
+
+def test_fetch_symbol_reports_snapshot_rate_limit_errors(monkeypatch, tmp_path: Path) -> None:
+    import src.application.opend_symbol_fetching as mod
+
+    class _Gateway:
+        def get_snapshot(self, codes):  # noqa: ANN001
+            import pandas as pd
+
+            if all(str(code).startswith("US.NVDA.") for code in codes):
+                raise RuntimeError("rate limit wait budget exceeded")
+            return pd.DataFrame([{"code": "US.NVDA", "last_price": 100.0}])
+
+        def get_option_chain(self, *, code, start=None, end=None, is_force_refresh=False):  # noqa: ANN001
+            return _put_chain_frame(code, start)
+
+        def close(self):  # noqa: ANN201
+            return None
+
+    fetch_option_snapshots = mod.fetch_option_snapshots
+
+    def _fetch_option_snapshots(**kwargs):  # type: ignore[no-untyped-def]
+        kwargs["rate_limited_call"] = lambda **call_kwargs: call_kwargs["call"]()
+        return fetch_option_snapshots(**kwargs)
+
+    monkeypatch.setattr(mod, "build_ready_futu_quote_gateway", lambda **kwargs: _Gateway())
+    monkeypatch.setattr(mod, "retry_futu_gateway_call", lambda _name, fn, **kwargs: fn())
+    monkeypatch.setattr(mod, "fetch_option_snapshots", _fetch_option_snapshots)
+    monkeypatch.setattr(mod, "get_trading_date", lambda market: date(2026, 4, 28))
+
+    payload = _fetch_symbol(mod, tmp_path)
+
+    meta = payload.get("meta") or {}
+    assert len(payload.get("rows") or []) == 1
+    assert meta["status"] == "error"
+    assert meta["error_code"] == "SNAPSHOT_COVERAGE_INCOMPLETE"
+    assert meta["snapshot_complete"] is False
+    assert any(item["error_code"] == "RATE_LIMIT" for item in meta["snapshot_errors"])
+    assert meta["snapshot_errors"][0]["stage"] == "market_snapshot"

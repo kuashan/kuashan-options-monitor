@@ -1,0 +1,363 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+
+
+@pytest.fixture(autouse=True)
+def _keep_prefetch_planning_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.application.multi_tick import required_data_prefetch as prefetch_mod
+
+    monkeypatch.setattr(
+        "src.application.required_data_planning.get_underlier_spot",
+        lambda *_args, **_kwargs: 100.0,
+    )
+    monkeypatch.setattr(
+        "src.application.required_data_planning.list_option_expirations",
+        lambda *_args, **_kwargs: ["2026-12-18"],
+    )
+    monkeypatch.setattr(
+        prefetch_mod,
+        "_prefill_spot_observation_cache",
+        lambda **_kwargs: ({}, set()),
+    )
+
+    monkeypatch.setattr(
+        prefetch_mod,
+        "finalize_required_data_quote_candidate",
+        lambda **_kwargs: {"quote_receipt_path": None},
+    )
+    monkeypatch.setattr(
+        prefetch_mod,
+        "prefetch_market_earnings_calendars",
+        lambda **kwargs: {
+            "schema_version": "opend_earnings_calendar.v1",
+            "source": "opend",
+            "market_count": len(kwargs.get("market_requests") or {}),
+            "markets": {},
+        },
+    )
+
+
+def _declared_put_symbol(
+    symbol: str,
+    fetch: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "symbol": symbol,
+        "fetch": fetch,
+        "sell_put": {
+            "enabled": True,
+            "min_dte": 1,
+            "max_dte": 365,
+            "max_strike": 1000,
+        },
+    }
+
+
+def _execution_payload(
+    intent,
+    *,
+    symbol: str | None = None,
+    idempotency_key: str = "k",
+    status: str = "fetched",
+    ok: bool = True,
+    message: str = "fetched",
+    returncode: int = 0,
+    error_code: str | None = None,
+) -> dict[str, object]:
+    """Shape a ToolExecutionService.execute result; defaults are the fixture literals."""
+    return {
+        "schema_kind": "tool_execution",
+        "schema_version": "1.0",
+        "tool_name": intent.tool_name,
+        "symbol": intent.symbol if symbol is None else symbol,
+        "source": intent.source,
+        "limit_exp": int(intent.limit_exp),
+        "idempotency_key": idempotency_key,
+        "status": status,
+        "ok": ok,
+        "message": message,
+        **({"error_code": error_code} if error_code is not None else {}),
+        "returncode": returncode,
+        "started_at_utc": "2026-01-01T00:00:00+00:00",
+        "finished_at_utc": "2026-01-01T00:00:01+00:00",
+    }
+
+
+def _prefetch(
+    tmp_path: Path,
+    symbols: list[dict],
+    *,
+    runtime: dict | None = None,
+    **kwargs,
+) -> dict:
+    """Run prefetch_required_data against the fixture subprocess config and tmp root."""
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    return mod.prefetch_required_data(
+        vpy=Path("/usr/bin/python3"),
+        base=Path(tmp_path),
+        cfg={
+            "runtime": {"prefetch": {"execution_mode": "subprocess"}} if runtime is None else runtime,
+            "symbols": symbols,
+        },
+        shared_required=Path(tmp_path) / "required_data",
+        **kwargs,
+    )
+
+
+def test_scheduler_decision_schema_boundary() -> None:
+    from domain.domain import normalize_scheduler_decision_payload
+
+    out = normalize_scheduler_decision_payload({
+        "should_run_scan": 1,
+        "should_notify": False,
+        "reason": "ok",
+    })
+    assert out["schema_kind"] == "scheduler_decision"
+    assert out["schema_version"] == "1.0"
+    assert out["should_run_scan"] is True
+    assert out["is_notify_window_open"] is False
+    assert out["reason"] == "ok"
+
+
+def test_tool_execution_schema_and_idempotency_key() -> None:
+    from domain.domain import build_tool_idempotency_key, normalize_tool_execution_payload
+
+    k1 = build_tool_idempotency_key(
+        tool_name="required_data_prefetch",
+        symbol="AAPL",
+        source="yahoo",
+        limit_exp=8,
+    )
+    k2 = build_tool_idempotency_key(
+        tool_name="required_data_prefetch",
+        symbol="aapl",
+        source="YAHOO",
+        limit_exp=8,
+    )
+    assert k1 == k2
+
+    out = normalize_tool_execution_payload(
+        tool_name="required_data_prefetch",
+        symbol="AAPL",
+        source="yahoo",
+        limit_exp=8,
+        status="bad_status",
+        ok=True,
+        message="x",
+        idempotency_key=k1,
+    )
+    assert out["schema_kind"] == "tool_execution"
+    assert out["schema_version"] == "1.0"
+    assert out["status"] == "error"
+    assert out["idempotency_key"] == k1
+
+
+def test_notify_window_alias_normalization_prefers_canonical_field() -> None:
+    from domain.domain.tool_boundary import normalize_notify_window_aliases, resolve_notify_window_open
+
+    only_legacy = normalize_notify_window_aliases({"should_notify": 1})
+    assert only_legacy["is_notify_window_open"] is True
+    assert resolve_notify_window_open(only_legacy) is True
+
+    canonical_first = normalize_notify_window_aliases(
+        {"is_notify_window_open": False, "should_notify": True}
+    )
+    assert canonical_first["is_notify_window_open"] is False
+    assert resolve_notify_window_open(canonical_first) is False
+
+
+def test_repository_audit_and_text_writers(tmp_path: Path) -> None:
+    from domain.storage.repositories import run_repo, state_repo
+
+    td = tmp_path
+    base = Path(td)
+    run_id = "r1"
+
+    cfg_path = state_repo.write_account_state_json_text(
+        base,
+        "lx",
+        "config.override.json",
+        {"portfolio": {"account": "lx"}},
+    )
+    assert cfg_path.exists()
+    assert '"account": "lx"' in cfg_path.read_text(encoding="utf-8")
+
+    audit_path = state_repo.append_run_audit_jsonl(
+        base,
+        run_id,
+        "tool_execution_audit.jsonl",
+        {"schema_kind": "tool_execution", "schema_version": "1.0", "symbol": "AAPL"},
+    )
+    assert audit_path.exists()
+    lines = [ln for ln in audit_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 1
+
+    note_path = run_repo.write_run_account_text(base, run_id, "lx", "symbols_notification.txt", "hello\n")
+    assert note_path.exists()
+    copied = run_repo.copy_to_run_account(base, run_id, "lx", cfg_path, "config.override.json")
+    assert copied.exists()
+
+
+def test_prefetch_required_data_idempotency_audit(tmp_path: Path) -> None:
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    calls: list[tuple[str, str, int]] = []
+    old_exec = mod.ToolExecutionService.execute
+
+    def _fake_execute(self, intent):
+        calls.append((intent.tool_name, intent.symbol, int(intent.limit_exp)))
+        return _execution_payload(
+            intent,
+            idempotency_key="k",
+            status="fetched" if len(calls) == 1 else "skipped",
+            message="fetched" if len(calls) == 1 else "idempotent_duplicate",
+        )
+
+    mod.ToolExecutionService.execute = _fake_execute
+    try:
+        out = _prefetch(
+            tmp_path,
+            [
+                _declared_put_symbol("AAPL", {"source": "yahoo", "limit_expirations": 8}),
+                _declared_put_symbol("AAPL", {"source": "yahoo", "limit_expirations": 8}),
+            ],
+        )
+        assert out["fetched_ok"] == 1
+        assert out["skipped"] == 0
+        assert out["deduped_count"] == 1
+        assert len(out["audit"]) == 1
+        assert len(calls) == 1
+    finally:
+        mod.ToolExecutionService.execute = old_exec
+
+
+def test_prefetch_required_data_fails_closed_when_merged_put_plan_lacks_spot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    monkeypatch.setattr(
+        "src.application.required_data_planning.get_underlier_spot",
+        lambda *_args, **_kwargs: None,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="global required-data plan incomplete",
+    ):
+        _prefetch(
+            tmp_path,
+            [
+                _declared_put_symbol("AAPL", {"source": "yahoo", "limit_expirations": 8}),
+                _declared_put_symbol("AAPL", {"source": "yahoo", "limit_expirations": 8}),
+            ],
+        )
+
+
+def test_prefetch_required_data_protections_minimal(monkeypatch, tmp_path: Path) -> None:
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    old_exec = mod.ToolExecutionService.execute
+
+    calls: list[str] = []
+    cooldowns: list[float] = []
+    monkeypatch.setattr(mod, "_sleep_after_rate_limit_wave", lambda wait_sec: cooldowns.append(float(wait_sec)))
+
+    def _fake_execute(self, intent):
+        sym = str(intent.symbol)
+        calls.append(sym)
+        if sym == "AAPL":
+            return _execution_payload(
+                intent, symbol=sym, idempotency_key=f"k-{sym}",
+                message="warning error=should_not_count",
+            )
+        if sym == "MSFT":
+            return _execution_payload(
+                intent, symbol=sym, idempotency_key=f"k-{sym}", status="error", ok=False,
+                message="OpenD rate limit too frequent", returncode=2, error_code="OPEND_RATE_LIMIT",
+            )
+        return _execution_payload(
+            intent, symbol=sym, idempotency_key=f"k-{sym}", status="error", ok=False,
+            message="generic failure", returncode=3,
+        )
+
+    mod.ToolExecutionService.execute = _fake_execute
+    try:
+        out = _prefetch(
+            tmp_path,
+            [
+                _declared_put_symbol("AAPL", {"source": "opend", "limit_expirations": 8}),
+                _declared_put_symbol("MSFT", {"source": "opend", "limit_expirations": 8}),
+                _declared_put_symbol("TSLA", {"source": "opend", "limit_expirations": 8}),
+                _declared_put_symbol("BABA", {"source": "opend", "limit_expirations": 8}),
+            ],
+            runtime={
+                "prefetch": {"execution_mode": "subprocess"},
+                "prefetch_max_workers": 1,
+                "prefetch_fail_budget_consecutive": 2,
+                "prefetch_fail_budget_total": 2,
+            },
+        )
+        assert out["max_workers"] == 1
+        assert out["errors"] == 3
+        assert out["fetched_ok"] == 1
+        assert out["skipped"] == 0
+        assert out["budget_triggered"] is False
+        assert "US" in (out.get("opend_rate_limit_classes") or [])
+        assert calls == ["AAPL", "MSFT", "TSLA", "BABA"]
+        assert cooldowns == []
+    finally:
+        mod.ToolExecutionService.execute = old_exec
+
+
+def test_prefetch_required_data_defaults_to_opend_source(tmp_path: Path) -> None:
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    old_exec = mod.ToolExecutionService.execute
+
+    seen: list[tuple[str, str]] = []
+
+    def _fake_execute(self, intent):
+        seen.append((str(intent.symbol), str(intent.source)))
+        return _execution_payload(intent, idempotency_key="k-default-opend")
+
+    mod.ToolExecutionService.execute = _fake_execute
+    try:
+        out = _prefetch(tmp_path, [_declared_put_symbol("CRDO", {"limit_expirations": 8})])
+        assert out["fetched_ok"] == 1
+        assert seen == [("CRDO", "opend")]
+    finally:
+        mod.ToolExecutionService.execute = old_exec
+
+
+def test_prefetch_required_data_force_refresh_dispatches_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.application.multi_tick import required_data_prefetch as mod
+
+    old_exec = mod.ToolExecutionService.execute
+
+    seen: list[tuple[str, bool]] = []
+    def _fake_execute(self, intent):
+        seen.append((str(intent.symbol), bool(intent.force_refresh)))
+        return _execution_payload(intent, idempotency_key="k-force-cache")
+
+    mod.ToolExecutionService.execute = _fake_execute
+    try:
+        out = _prefetch(
+            tmp_path,
+            [_declared_put_symbol("AAPL", {"source": "opend", "limit_expirations": 8})],
+            force_refresh=True,
+        )
+        assert out["fetched_ok"] == 1
+        assert out["force_refresh"] is True
+        assert seen == [("AAPL", True)]
+    finally:
+        mod.ToolExecutionService.execute = old_exec

@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+
+from candidate_evidence_helpers import earnings_evidence
+from src.application.covered_call_strategy_risk import (
+    enrich_and_filter_covered_call_underwriting,
+    evaluate_covered_call_underwriting_row,
+    resolve_covered_call_underwriting_config,
+)
+from src.infrastructure.exchange_rates import CurrencyConverter, ExchangeRates
+
+
+def _earnings_evidence(*, event_date: str | None = None) -> dict:
+    return earnings_evidence(expiration="2026-06-19", market_date="2026-05-20", event_date=event_date)
+
+
+def _candidate(**overrides):
+    row = {
+        "symbol": "NVDA",
+        "contract_symbol": "NVDA260619C00140000",
+        "expiration": "2026-06-19",
+        "strike": 140.0,
+        "spot": 120.0,
+        "avg_cost": 100.0,
+        "shares_total": 100,
+        "shares_locked": 0,
+        "shares_available_for_cover": 100,
+        "covered_contracts_available": 1,
+        "is_fully_covered_available": True,
+        "multiplier": 100.0,
+        "currency": "USD",
+        "implied_volatility": 0.36,
+        "realized_volatility_estimate": 0.24,
+        "term_matched_rv": 0.24,
+        "delta": 0.20,
+        "annualized_net_premium_return": 0.12,
+        "net_income": 200.0,
+        "spread_ratio": 0.08,
+        "open_interest": 100,
+        "volume": 20,
+        "dte": 30,
+        "strike_above_spot_pct": 0.166667,
+    }
+    row.update(_earnings_evidence())
+    row.update(overrides)
+    return row
+
+
+def _converter(**overrides: float) -> CurrencyConverter:
+    return CurrencyConverter(ExchangeRates(**overrides))
+
+
+def _enrich_underwriting(df, *, sell_call_cfg: dict, **overrides):
+    return enrich_and_filter_covered_call_underwriting(
+        df_labeled=df,
+        symbol="NVDA",
+        sell_call_cfg=sell_call_cfg,
+        portfolio_ctx=None,
+        **overrides,
+    )
+
+
+def test_covered_call_underwriting_enrichment_accepts_and_adds_pricing_fields(tmp_path: Path) -> None:
+    df = pd.DataFrame([_candidate()])
+
+    filtered = _enrich_underwriting(
+        df,
+        sell_call_cfg={"strategy": "insurance_underwriting", "min_strike": 120.0},
+        exchange_rate_converter=_converter(usd_per_cny=0.14),
+    )
+
+    assert len(filtered) == 1
+    top = filtered.iloc[0]
+    assert top["strategy_profile"] == "insurance_underwriting"
+    assert top["iv_rv_ratio"] == 1.5
+    assert top["iv_minus_rv"] == 0.12
+    assert top["short_gamma_profile"] == "short_gamma"
+    assert top["short_vega_profile"] == "short_vega"
+    assert top["covered_notional_cny"] > 0
+    assert top["strike_upside_margin_pct"] == 0.166667
+    assert "call_gap_up_opportunity_cost_cny" not in top
+
+
+def test_covered_call_blocks_near_expiry_but_retains_distant_earnings() -> None:
+    cfg = resolve_covered_call_underwriting_config(
+        {"strategy": "insurance_underwriting"}
+    )
+    near = evaluate_covered_call_underwriting_row(
+        _candidate(
+            net_income_cny=1_400.0,
+            **_earnings_evidence(event_date="2026-06-13"),
+        ),
+        cfg=cfg,
+    )
+    distant = evaluate_covered_call_underwriting_row(
+        _candidate(
+            net_income_cny=1_400.0,
+            **_earnings_evidence(event_date="2026-06-01"),
+        ),
+        cfg=cfg,
+    )
+
+    assert near["accepted"] is False
+    assert near["rule"] == "risk_earnings_event"
+    assert distant["accepted"] is True
+
+
+def test_covered_call_underwriting_does_not_reject_concentration_or_gap_up_budget(tmp_path: Path) -> None:
+    df = pd.DataFrame([_candidate(strike=120.0)])
+
+    filtered = _enrich_underwriting(
+        df,
+        sell_call_cfg={
+            "strategy": "insurance_underwriting",
+            "min_strike": 100.0,
+            "concentration": {"max_single_trade_nav_pct": 0.0001},
+        },
+        exchange_rate_converter=_converter(usd_per_cny=0.14),
+    )
+
+    assert len(filtered) == 1
+    assert filtered.iloc[0]["contract_symbol"] == "NVDA260619C00140000"
+
+
+def test_covered_call_underwriting_rejects_return_below_min(tmp_path: Path) -> None:
+    df = pd.DataFrame([_candidate(annualized_net_premium_return=0.08)])
+
+    filtered = _enrich_underwriting(
+        df,
+        sell_call_cfg={"strategy": "insurance_underwriting", "min_annualized_net_premium_return": 0.10},
+        exchange_rate_converter=_converter(usd_per_cny=0.14),
+    )
+
+    assert filtered.empty
+
+
+def test_covered_call_underwriting_emits_all_decisions_and_resolved_policy() -> None:
+    captured: list[dict] = []
+    filtered = _enrich_underwriting(
+        pd.DataFrame(
+            [
+                _candidate(contract_symbol="ACCEPTED"),
+                _candidate(
+                    contract_symbol="REJECTED",
+                    annualized_net_premium_return=0.09,
+                ),
+            ]
+        ),
+        sell_call_cfg={
+            "strategy": "insurance_underwriting",
+            "min_annualized_net_premium_return": 0.10,
+        },
+        exchange_rate_converter=_converter(usd_per_cny=0.14),
+        decision_sink_fn=captured.extend,
+    )
+
+    assert list(filtered["contract_symbol"]) == ["ACCEPTED"]
+    assert [
+        item["opening_decision"]["accepted"] for item in captured
+    ] == [True, False]
+    assert all(
+        item["normalized_input"]["policy_min_annualized_return"] == 0.10
+        for item in captured
+    )
+    assert all(
+        item["normalized_input"]["policy_min_strike"] == 120.0
+        for item in captured
+    )
+    assert captured[1]["opening_decision"]["rejects"][0]["reason"] == (
+        "return_annualized"
+    )
+
+
+def test_covered_call_underwriting_rejects_when_income_fx_is_missing(tmp_path: Path) -> None:
+    df = pd.DataFrame([_candidate()])
+
+    filtered = _enrich_underwriting(
+        df,
+        sell_call_cfg={"strategy": "insurance_underwriting"},
+        exchange_rate_converter=_converter(),
+    )
+
+    assert filtered.empty
+
+
+def test_covered_call_underwriting_ranking_prefers_upside_margin_and_deduplicates_income(tmp_path: Path) -> None:
+    df = pd.DataFrame(
+        [
+            _candidate(contract_symbol="LOW_UPSIDE", strike=125.0, spot=110.0, net_income=210.0),
+            _candidate(contract_symbol="HIGH_UPSIDE", strike=140.0, spot=110.0, net_income=210.0),
+            _candidate(contract_symbol="RICH", strike=126.0, spot=110.0, net_income=280.0),
+        ]
+    )
+
+    filtered = _enrich_underwriting(
+        df,
+        sell_call_cfg={
+            "strategy": "insurance_underwriting",
+            "min_strike_cost_multiplier": 1.2,
+            "min_net_income": 200.0,
+        },
+        exchange_rate_converter=_converter(usd_per_cny=0.14),
+    )
+
+    assert list(filtered["contract_symbol"]) == ["HIGH_UPSIDE", "RICH", "LOW_UPSIDE"]
+    assert set(filtered["effective_min_strike"]) == {120.0}
+    by_contract = filtered.set_index("contract_symbol")
+    assert "premium_edge_score" not in by_contract.columns
+    assert by_contract.loc["HIGH_UPSIDE", "strike_upside_margin_pct"] > by_contract.loc["RICH", "strike_upside_margin_pct"]

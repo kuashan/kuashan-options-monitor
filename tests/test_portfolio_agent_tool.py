@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import json
+import socket
+import urllib.error
+from urllib.parse import parse_qs, urlsplit
+
+import pytest
+
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.agent_tool_registry import get_tool_definition, pure_read_toolsets
+from src.application.agent_tools import portfolio
+from src.application.bot import tools as bot_tools
+
+
+@pytest.fixture(autouse=True)
+def _portfolio_management_enabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        portfolio,
+        "load_runtime_config",
+        lambda **_kwargs: (
+            None,
+            {"portfolio_management": {"enabled": True}},
+        ),
+    )
+
+
+class _Response:
+    def __init__(self, payload):
+        self.body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        self.headers = {"X-PM-API-Version": "portfolio.api.v1"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, size=-1):
+        return self.body if size < 0 else self.body[:size]
+
+
+def _call(payload, monkeypatch, response):
+    seen = {}
+
+    def fake_urlopen(request, timeout):
+        seen["request"] = request
+        seen["timeout"] = timeout
+        return _Response(response)
+
+    monkeypatch.setattr(portfolio.urllib.request, "urlopen", fake_urlopen)
+    definition = _tool("portfolio_query")
+    data, warnings, meta = definition.call(payload)
+    return data, warnings, meta, seen
+
+
+def _tool(name: str):
+    """Look up a registered tool definition, failing the test when it is absent."""
+    definition = get_tool_definition(name)
+    assert definition is not None
+    return definition
+
+
+def test_portfolio_tools_share_one_pure_read_toolset() -> None:
+    definition = _tool("portfolio_query")
+
+    assert definition.is_pure_read() is True
+    assert definition.side_effects == ()
+    assert definition.requires_confirm is False
+    assert definition.safe_default_input == {"view": "health"}
+    assert "url" not in definition.input_schema
+    assert pure_read_toolsets()["portfolio"] == (
+        "portfolio_query",
+        "portfolio_pnl_bridge",
+        "portfolio_cash_bridge",
+        "portfolio_assignment_scenario",
+    )
+
+
+def test_portfolio_query_disabled_never_opens_transport(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        portfolio,
+        "load_runtime_config",
+        lambda **_kwargs: (
+            None,
+            {"portfolio_management": {"enabled": False}},
+        ),
+    )
+    monkeypatch.setattr(
+        portfolio.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: calls.append(True),
+    )
+
+    definition = _tool("portfolio_query")
+    with pytest.raises(AgentToolError) as raised:
+        definition.call({"view": "health"})
+
+    assert raised.value.code == "PORTFOLIO_MANAGEMENT_DISABLED"
+    assert calls == []
+
+
+def test_assignment_scenario_tool_has_accounts_only_contract(monkeypatch) -> None:
+    expected = {
+        "schema_version": "portfolio.assignment_scenario.v1",
+        "status": "complete",
+        "scope": {"accounts": ["lx"], "include_long_options": False},
+        "assignments": [],
+        "warnings": [],
+    }
+    monkeypatch.setattr(
+        portfolio,
+        "query_portfolio_assignment_scenario",
+        lambda accounts: {**expected, "scope": {**expected["scope"], "accounts": list(accounts)}},
+    )
+    definition = _tool("portfolio_assignment_scenario")
+
+    assert definition.is_pure_read() is True
+    assert definition.safe_default_input == {}
+    assert definition.input_json_schema()["required"] == ["accounts"]
+    assert definition.bot_input_fields == ("accounts",)
+    assert definition.output_contract["source_label"] == (
+        "Futu account + OM SQLite position_lots; PM non-Futu Holdings optional"
+    )
+
+    data, warnings, meta = definition.call({"accounts": ["lx"]})
+
+    assert data == expected
+    assert warnings == []
+    assert meta == {}
+
+    with pytest.raises(AgentToolError, match="accepts only accounts"):
+        definition.call({"accounts": ["lx"], "price": 123})
+
+
+def test_portfolio_query_preserves_payload_and_adds_evidence_metadata(monkeypatch) -> None:
+    monkeypatch.delenv("PORTFOLIO_SERVICE_URL", raising=False)
+    pm_freshness = {
+        "status": "stale",
+        "trust_status": "partial",
+        "observed_at_utc": "2026-07-25T21:00:00Z",
+        "dataset_ids": ["pm.holdings_quantity", "pm.prices"],
+        "reason_codes": ["SOURCE_STALE"],
+    }
+
+    data, warnings, meta, seen = _call(
+        {"view": "overview", "accounts": ["lx", "sy"], "include_details": True},
+        monkeypatch,
+        {
+            "success": True,
+            "accounts": ["lx", "sy"],
+            "total_value": 123.45,
+            "freshness": pm_freshness,
+            "retrieved_at_utc": "2026-07-26T01:00:00Z",
+        },
+    )
+
+    parsed = urlsplit(seen["request"].full_url)
+    assert parsed.scheme == "http"
+    assert parsed.netloc == "127.0.0.1:8765"
+    assert parsed.path == "/api/v1/accounts/overview"
+    assert parse_qs(parsed.query) == {"accounts": ["lx,sy"], "include_details": ["true"]}
+    assert seen["request"].get_method() == "GET"
+    assert data["success"] is True
+    assert data["total_value"] == 123.45
+    assert data["source"] == {"service": "portfolio-management", "transport": "loopback_http"}
+    assert data["scope"] == {"view": "overview", "accounts": ["lx", "sy"]}
+    assert data["freshness"] == pm_freshness
+    assert data["retrieved_at_utc"] == "2026-07-26T01:00:00Z"
+    assert warnings == []
+    assert meta == {}
+
+
+def test_portfolio_query_marks_business_data_unavailable_without_pm_freshness(monkeypatch) -> None:
+    data, warnings, _, _ = _call(
+        {"view": "cash", "account": "lx"},
+        monkeypatch,
+        {"success": True, "items": []},
+    )
+
+    assert data["freshness"]["status"] == "unavailable"
+    assert data["freshness"]["trust_status"] == "unavailable"
+    assert data["freshness"]["reason_codes"] == ["PM_FRESHNESS_EVIDENCE_MISSING"]
+    assert warnings == ["PM freshness evidence is missing; data is unavailable"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "path"),
+    [
+        ({"view": "health"}, "/health"),
+        ({"view": "accounts", "include_default": False}, "/api/v1/accounts"),
+        ({"view": "holdings", "account": "lx"}, "/api/v1/holdings"),
+        ({"view": "cash", "account": "lx"}, "/api/v1/cash"),
+        ({"view": "nav", "account": "lx", "days": 14}, "/api/v1/nav"),
+        ({"view": "distribution", "accounts": ["lx", "sy"]}, "/api/v1/distribution"),
+        ({"view": "full_report", "account": "lx"}, "/api/v1/report/full"),
+    ],
+)
+def test_portfolio_query_maps_supported_views_to_get_endpoints(monkeypatch, payload, path) -> None:
+    _, _, _, seen = _call(payload, monkeypatch, {"success": True})
+
+    assert urlsplit(seen["request"].full_url).path == path
+    assert seen["request"].get_method() == "GET"
+
+
+@pytest.mark.parametrize(
+    ("payload", "service_url", "match", "code"),
+    [
+        ({"view": "health"}, "http://portfolio.internal:8765", "loopback", "CONFIG_ERROR"),
+        ({"view": "health", "service_url": "http://127.0.0.1:9999"}, None, "endpoint fields", "INPUT_ERROR"),
+        ({"view": "holdings"}, None, "account is required", "INPUT_ERROR"),
+    ],
+    ids=["non-loopback-service-url", "model-provided-endpoint-field", "account-required-for-scoped-view"],
+)
+def test_portfolio_query_rejects_invalid_request_before_transport(monkeypatch, payload, service_url, match, code) -> None:
+    if service_url is not None:
+        monkeypatch.setenv("PORTFOLIO_SERVICE_URL", service_url)
+    definition = _tool("portfolio_query")
+
+    with pytest.raises(AgentToolError, match=match) as exc_info:
+        definition.call(payload)
+
+    assert exc_info.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("response", "match", "code"),
+    [
+        ({"success": False, "error": "missing holdings table"}, "missing holdings table", "PORTFOLIO_MANAGEMENT_UNAVAILABLE"),
+        (b"not-json", "invalid JSON", "PORTFOLIO_MANAGEMENT_INCOMPATIBLE"),
+    ],
+    ids=["service-reported-failure", "invalid-json-body"],
+)
+def test_portfolio_query_converts_bad_response_to_agent_tool_error(monkeypatch, response, match, code) -> None:
+    definition = _tool("portfolio_query")
+    monkeypatch.setattr(portfolio.urllib.request, "urlopen", lambda request, timeout: _Response(response))
+
+    with pytest.raises(AgentToolError, match=match) as exc_info:
+        definition.call({"view": "health"})
+
+    assert exc_info.value.code == code
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        urllib.error.URLError("connection refused"),
+        socket.timeout("read timed out"),
+        urllib.error.HTTPError("http://127.0.0.1:8765/health", 503, "unavailable", None, None),
+    ],
+)
+def test_portfolio_query_converts_transport_failures_to_agent_tool_error(monkeypatch, failure) -> None:
+    definition = _tool("portfolio_query")
+
+    def fail(request, timeout):
+        raise failure
+
+    monkeypatch.setattr(portfolio.urllib.request, "urlopen", fail)
+
+    with pytest.raises(AgentToolError) as exc_info:
+        definition.call({"view": "health"})
+
+    assert exc_info.value.code == "PORTFOLIO_MANAGEMENT_UNAVAILABLE"
+
+
+def _bridge_facts(account: str, *, end_date: str = "2026-07-16") -> dict:
+    return {
+        "schema_version": "portfolio.capital_facts.v1",
+        "success": True,
+        "status": "ok",
+        "account": account,
+        "period": {
+            "kind": "mtd",
+            "requested_as_of_month": "2026-07",
+            "calendar_start": "2026-07-01",
+            "anchor_date": "2026-06-30",
+            "end_date": end_date,
+            "timezone": "Asia/Shanghai",
+        },
+        "amounts": {
+            "currency": "CNY",
+            "opening_assets": 1000.0,
+            "external_cash_flow": 100.0,
+            "period_pnl": 150.0,
+            "ending_assets": 1250.0,
+        },
+        "reconciliation": {"status": "ok"},
+    }
+
+
+def test_portfolio_cash_bridge_reports_cash_facts_not_onboarded_without_http(monkeypatch) -> None:
+    monkeypatch.setattr(
+        portfolio.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("HTTP must not be called")),
+    )
+
+    definition = _tool("portfolio_cash_bridge")
+    data, warnings, meta = definition.call(
+        {"period": "mtd", "as_of_month": "2026-07", "accounts": ["lx"]}
+    )
+
+    assert data["status"] == "unavailable"
+    assert data["reason"] == "portfolio_cash_facts_not_onboarded"
+    assert warnings == []
+    assert meta == {}
+
+
+@pytest.mark.parametrize("tool_name", ["portfolio_pnl_bridge", "portfolio_cash_bridge"])
+def test_primary_portfolio_bridges_are_pure_read_and_require_explicit_scope(tool_name) -> None:
+    definition = _tool(tool_name)
+
+    assert definition.is_pure_read() is True
+    assert definition.side_effects == ()
+    assert definition.requires_confirm is False
+    assert definition.safe_default_input == {}
+    schema = definition.input_json_schema()
+    assert schema["required"] == ["period", "as_of_month", "accounts"]
+    assert "url" not in schema["properties"]
+
+
+def test_primary_bridges_use_only_their_authoritative_sources(monkeypatch) -> None:
+    pnl = _tool("portfolio_pnl_bridge")
+    cash = _tool("portfolio_cash_bridge")
+    calls = []
+
+    def fake_capital(*, account, period, as_of_month):
+        calls.append(("capital", account, period, as_of_month))
+        return _bridge_facts(account)
+
+    monkeypatch.setattr(portfolio, "_read_capital_facts", fake_capital)
+    monkeypatch.setattr(
+        portfolio.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("cash bridge must not call HTTP")),
+    )
+
+    pnl_data, pnl_warnings, pnl_meta = pnl.call(
+        {"period": "mtd", "as_of_month": "2026-07", "accounts": ["lx"]}
+    )
+    cash_data, cash_warnings, cash_meta = cash.call(
+        {"period": "mtd", "as_of_month": "2026-07", "accounts": ["lx"]}
+    )
+
+    assert calls == [("capital", "lx", "mtd", "2026-07")]
+    assert pnl_data["status"] == "partial"
+    assert pnl_data["accounts"][0]["option_pnl_evidence"]["status"] == "unavailable"
+    assert cash_data["status"] == "unavailable"
+    assert cash_data["accounts"][0]["option_cash_evidence"]["status"] == "unavailable"
+    assert pnl_warnings == cash_warnings == []
+    assert pnl_meta == cash_meta == {}
+
+
+def test_cash_bridge_is_unavailable_without_opening_transport(monkeypatch) -> None:
+    definition = _tool("portfolio_cash_bridge")
+
+    monkeypatch.setattr(
+        portfolio.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: pytest.fail("cash bridge must not open portfolio transport"),
+    )
+
+    data, warnings, meta = definition.call(
+        {"period": "mtd", "as_of_month": "2026-07", "accounts": ["lx"]}
+    )
+
+    assert data["success"] is True
+    assert data["status"] == "unavailable"
+    assert data["accounts"][0]["reason"] == "portfolio_cash_facts_not_onboarded"
+    assert data["accounts"][0]["steps"] == []
+    assert data["combined"]["reason"] == "portfolio_cash_facts_not_onboarded"
+    assert warnings == []
+    assert meta == {}
+
+
+@pytest.mark.parametrize("view", ["health", "accounts", "overview", "holdings", "cash", "nav", "full_report", "distribution"])
+@pytest.mark.parametrize("selector", [{}, {"account": "lx"}, {"accounts": ["lx"]}, {"account": "lx", "accounts": ["lx"]}])
+def test_portfolio_closed_account_matrix_before_transport(monkeypatch, view, selector):
+    from src.application.tool_execution import execute_tool
+    required = {"holdings", "cash", "nav", "full_report"}
+    allowed = (not selector if view in {"health", "accounts"}
+               else "account" not in selector if view == "overview"
+               else selector == {"account": "lx"} if view in required
+               else len(selector) <= 1)
+    calls = []
+    class Client:
+        def read_view(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return {}
+    monkeypatch.setattr(portfolio, "_portfolio_client", lambda: Client())
+    response = execute_tool("portfolio_query", {"view": view, **selector})
+    assert response["ok"] is allowed, response
+    assert bool(calls) is allowed
+    if not allowed:
+        assert response["error"]["code"] == "INPUT_ERROR"
+
+
+@pytest.mark.parametrize("view", ["health", "accounts", "overview", "distribution"])
+def test_portfolio_empty_optional_account_keeps_unscoped_default(monkeypatch, view):
+    data, _, _, seen = _call({"view": view, "account": " "}, monkeypatch, {})
+    assert data["scope"] == {"view": view}
+    assert "account" not in parse_qs(urlsplit(seen["request"].full_url).query)

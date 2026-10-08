@@ -1,0 +1,182 @@
+from __future__ import annotations
+
+import pytest
+
+import importlib
+from pathlib import Path
+import json
+import threading
+import time
+from typing import Any
+
+
+def _imports() -> tuple[type, type, type]:
+    rate_gate_module = importlib.import_module("src.application.opend_rate_gate")
+    option_chain_module = importlib.import_module("src.application.option_chain_fetching")
+
+    return (
+        rate_gate_module.OpenDRateGate,
+        option_chain_module.FileRateLimiter,
+        option_chain_module.OptionChainRateLimitExceeded,
+    )
+
+
+def _gate(**overrides: object) -> Any:
+    """OpenDRateGate on the basic-window defaults, overridable per case."""
+    OpenDRateGate, _, _ = _imports()
+    values: dict[str, object] = {"max_calls": 3, "window_sec": 0.1, "max_wait_sec": 1.0, "label": "test"}
+    return OpenDRateGate(**{**values, **overrides})
+
+
+def _limiter(state_path: Path, **overrides: object) -> Any:
+    """FileRateLimiter bound to ``state_path``, on the shim test's defaults."""
+    _, FileRateLimiter, _ = _imports()
+    values: dict[str, object] = {"max_calls": 1, "window_sec": 10.0, "max_wait_sec": 0.05, "clock": time.monotonic}
+    return FileRateLimiter(state_path=state_path, **{**values, **overrides})
+
+
+def test_opend_rate_gate_basic_window() -> None:
+    gate = _gate()
+
+    first_three = [gate.acquire() for _ in range(3)]
+    started = time.monotonic()
+    waited = gate.acquire()
+    elapsed = time.monotonic() - started
+
+    assert max(first_three) < 0.03
+    assert waited >= 0.08
+    assert elapsed >= 0.08
+
+
+def test_opend_rate_gate_fair_wakeup_for_concurrent_threads() -> None:
+    gate = _gate(window_sec=0.2, max_wait_sec=2.0, label="fair")
+    start = threading.Barrier(10)
+    arrival_lock = threading.Lock()
+    completion_lock = threading.Lock()
+    next_arrival = [0]
+    completed: list[int] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            start.wait()
+            with arrival_lock:
+                arrival = next_arrival[0]
+                next_arrival[0] += 1
+            gate.acquire()
+            with completion_lock:
+                completed.append(arrival)
+        except BaseException as exc:  # pragma: no cover - failure path
+            with completion_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_worker) for _ in range(10)]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    elapsed = time.monotonic() - started
+
+    assert not errors
+    assert completed == list(range(10))
+    assert elapsed >= 0.55
+    assert elapsed < 1.5
+
+
+def test_opend_rate_gate_times_out_when_budget_exceeded() -> None:
+    gate = _gate(max_calls=1, window_sec=10.0, max_wait_sec=0.5, label="timeout")
+
+    gate.acquire()
+    with pytest.raises(TimeoutError) as _caught:
+        gate.acquire()
+    exc = _caught.value
+    assert "rate limit wait budget exceeded" in str(exc)
+
+
+def test_opend_rate_gate_merges_external_state_file(tmp_path: Path) -> None:
+    state_path = tmp_path / "opend_rate_gate_state.json"
+    try:
+        payload = {
+            "updated_at": time.time(),
+            "window_sec": 0.2,
+            "max_calls": 1,
+            "timestamps": [time.time()],
+        }
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        gate = _gate(max_calls=1, window_sec=0.2, label="merge", state_path=state_path)
+
+        started = time.monotonic()
+        waited = gate.acquire()
+        elapsed = time.monotonic() - started
+
+        assert waited >= 0.15
+        assert elapsed >= 0.15
+    finally:
+        state_path.unlink(missing_ok=True)
+
+
+def test_opend_rate_gate_does_not_remerge_own_file_timestamps(tmp_path: Path) -> None:
+    state_path = tmp_path / "opend_rate_gate.json"
+    gate = _gate(max_calls=60, window_sec=30.0, max_wait_sec=0.01, label="dedupe", state_path=state_path)
+
+    for _ in range(10):
+        gate.acquire()
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    assert len(payload["timestamps"]) == 10
+
+
+def test_opend_rate_gate_file_backing_serializes_independent_instances(tmp_path: Path) -> None:
+    state_path = tmp_path / "shared_opend_rate_gate.json"
+    gates = [
+        _gate(max_calls=1, window_sec=0.2, max_wait_sec=2.0, label="shared", state_path=state_path)
+        for _ in range(2)
+    ]
+    start = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def _worker(gate) -> None:  # noqa: ANN001
+        try:
+            start.wait()
+            gate.acquire()
+        except BaseException as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=_worker, args=(gate,)) for gate in gates]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    elapsed = time.monotonic() - started
+
+    assert not errors
+    assert elapsed >= 0.15
+    assert state_path.with_suffix(state_path.suffix + ".lock").exists()
+
+
+def test_file_rate_limiter_shim_preserves_api_and_exception_type(tmp_path: Path) -> None:
+    limiter = _limiter(tmp_path / "limiter.json")
+
+    waited = limiter.acquire()
+    assert waited >= 0.0
+
+    with pytest.raises(Exception) as _caught:
+        limiter.acquire()
+    exc = _caught.value
+    assert exc.__class__.__name__ == "OptionChainRateLimitExceeded"
+    assert "rate limit wait budget exceeded" in str(exc)
+
+
+def test_file_rate_limiter_records_server_rate_limit_cooldown(tmp_path: Path) -> None:
+    state_path = tmp_path / "limiter.json"
+    first = _limiter(state_path, max_calls=10, window_sec=0.2, max_wait_sec=1.0)
+    second = _limiter(state_path, max_calls=10, window_sec=0.2, max_wait_sec=1.0)
+
+    first.record_rate_limit()
+    started = time.monotonic()
+    second.acquire()
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.15

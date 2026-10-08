@@ -1,0 +1,615 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import src.application.ledger.repository as ledger_repository
+
+from domain.domain.ledger.position_fields import parse_exp_to_ms
+from src.application.trades.normalizer import NormalizedTradeDeal
+from src.application.trades.resolver import resolve_trade_deal
+
+
+class FakeRepo:
+    def __init__(self, records: list[dict] | None = None) -> None:
+        self.records = list(records or [])
+        self.created: list[dict] = []
+
+    def list_records(self, *, page_size: int = 500) -> list[dict]:
+        return list(self.records)
+
+    def list_position_lots(self) -> list[dict]:
+        return list(self.records)
+
+    def list_trade_events(self) -> list[dict]:
+        return []
+
+    def get_record_fields(self, lot_id: str) -> dict:
+        raise KeyError(lot_id)
+
+    def create_record(self, fields: dict) -> dict:
+        self.created.append(fields)
+        return {"record": {"record_id": "rec_open_1"}}
+
+
+def _deal(**overrides: object) -> NormalizedTradeDeal:
+    base = {
+        "broker": "富途",
+        "futu_account_id": "REAL_1",
+        "internal_account": "lx",
+        "deal_id": "deal-open-1",
+        "order_id": "order-1",
+        "symbol": "0700.HK",
+        "option_type": "put",
+        "side": "sell",
+        "position_effect": "open",
+        "contracts": 2,
+        "price": 3.93,
+        "strike": 480.0,
+        "multiplier": 100,
+        "multiplier_source": "cache",
+        "expiration_ymd": "2026-04-29",
+        "currency": "HKD",
+        "trade_time_ms": 1000,
+        "raw_payload": {},
+    }
+    base.update(overrides)
+    return NormalizedTradeDeal(**base)
+
+
+def _position_record(
+    lot_id: str,
+    *,
+    symbol: str = "PDD",
+    option_type: str = "put",
+    side: str = "short",
+    strike: float = 80.0,
+    expiration_ymd: str = "2026-07-17",
+    contracts_open: int = 1,
+) -> dict:
+    expiration = parse_exp_to_ms(expiration_ymd)
+    assert expiration is not None
+    return {
+        "record_id": lot_id,
+        "fields": {
+            "broker": "富途",
+            "account": "lx",
+            "symbol": symbol,
+            "option_type": option_type,
+            "side": side,
+            "status": "open",
+            "contracts": contracts_open,
+            "contracts_open": contracts_open,
+            "contracts_closed": 0,
+            "strike": strike,
+            "currency": "USD",
+            "multiplier": 100,
+            "expiration": expiration,
+            "opened_at": 100,
+        },
+    }
+
+
+def _long_call_deal(**overrides: object) -> NormalizedTradeDeal:
+    """The unpaired PDD long call this module repeats.
+
+    Call sites name only the fields that differ from that deal.
+    """
+    base: dict[str, object] = {
+        "deal_id": "deal-pdd-long-call",
+        "symbol": "PDD",
+        "option_type": "call",
+        "side": "buy",
+        "position_effect": None,
+        "contracts": 1,
+        "price": 0.73,
+        "strike": 100.0,
+        "expiration_ymd": "2026-07-17",
+        "currency": "USD",
+        "raw_payload": {"deal_id": "deal-pdd-long-call", "code": "US.PDD260717C100000"},
+    }
+    base.update(overrides)
+    return _deal(**base)
+
+
+def _short_put_deal(**overrides: object) -> NormalizedTradeDeal:
+    """The PDD short put this module opens, in the shapes it repeats."""
+    base: dict[str, object] = {
+        "deal_id": "deal-pdd-short-put",
+        "symbol": "PDD",
+        "option_type": "put",
+        "side": "sell",
+        "position_effect": "open",
+        "contracts": 1,
+        "price": 1.5,
+        "strike": 80.0,
+        "expiration_ymd": "2026-07-17",
+        "currency": "USD",
+    }
+    base.update(overrides)
+    return _deal(**base)
+
+
+def test_resolve_trade_open_dry_run_returns_fields_preview() -> None:
+    result = resolve_trade_deal(_deal(), repo=FakeRepo(), state={}, apply_changes=False)
+
+    assert result.status == "dry_run"
+    assert result.action == "open"
+    assert result.operations[0].to_payload()["fields"]["account"] == "lx"
+    assert result.operations[0].to_payload()["fields"]["side"] == "short"
+    assert "multiplier_source=cache" in result.operations[0].to_payload()["fields"]["note"]
+
+
+def test_resolve_trade_long_open_dry_run_returns_long_fields_preview() -> None:
+    result = resolve_trade_deal(_deal(side="buy"), repo=FakeRepo(), state={}, apply_changes=False)
+
+    assert result.status == "dry_run"
+    assert result.action == "open"
+    assert result.operations[0].to_payload()["fields"]["account"] == "lx"
+    assert result.operations[0].to_payload()["fields"]["side"] == "long"
+
+
+def test_explicit_buy_call_with_companion_put_is_independent_open() -> None:
+    repo = FakeRepo([_position_record("lot_pdd_short_put")])
+    deal = _long_call_deal(position_effect="open")
+
+    result = resolve_trade_deal(deal, repo=repo, state={}, apply_changes=False)
+
+    assert result.status == "dry_run"
+    assert result.action == "open"
+    fields = result.operations[0].to_payload()["fields"]
+    assert fields["side"] == "long"
+    assert "strategy" not in fields
+    assert "leg_role" not in fields
+    assert "strategy_group_id" not in fields
+    assert result.diagnostics["combo_yield_enrichment"]["decision"] == "defer_to_post_trade_reconciliation"
+
+
+def test_independent_hk_call_open_still_canonicalizes_symbol_alias() -> None:
+    repo = FakeRepo(
+        [
+            _position_record(
+                "lot_tch_short_put",
+                symbol="0700.HK",
+                strike=440.0,
+                expiration_ymd="2026-06-05",
+            )
+        ]
+    )
+    deal = _long_call_deal(
+        position_effect="open",
+        deal_id="deal-tch-long-call",
+        symbol="TCH",
+        strike=520.0,
+        expiration_ymd="2026-06-05",
+        currency="HKD",
+        raw_payload={"deal_id": "deal-tch-long-call", "code": "HK.TCH260605C520000"},
+    )
+
+    result = resolve_trade_deal(deal, repo=repo, state={}, apply_changes=False)
+
+    assert result.status == "dry_run"
+    fields = result.operations[0].to_payload()["fields"]
+    assert fields["symbol"] == "0700.HK"
+    assert "strategy" not in fields
+    assert "strategy_group_id" not in fields
+
+
+def test_unknown_buy_call_without_history_creates_open(tmp_path: Path) -> None:
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    result = resolve_trade_deal(_long_call_deal(), repo=repo, state={}, apply_changes=True)
+    assert result.status == "applied"
+    assert result.reason == "applied_open"
+    assert len(result.operations) == 1
+    assert len(repo.list_trade_events()) == 1
+
+
+def test_resolve_trade_open_apply_creates_record() -> None:
+    repo = FakeRepo()
+    result = resolve_trade_deal(
+        _deal(),
+        repo=repo,
+        state={},
+        apply_changes=True,
+        persist_trade_event_fn=lambda repo, deal: {"event_id": deal.deal_id, "created": True},
+    )
+
+    assert result.status == "applied"
+    assert result.operations[0].to_payload()["event_id"] == "deal-open-1"
+    assert repo.created == []
+
+
+def test_resolve_trade_open_rejects_missing_trade_time_before_write() -> None:
+    result = resolve_trade_deal(_deal(trade_time_ms=None), repo=FakeRepo(), state={}, apply_changes=True)
+
+    assert result.status == "unresolved"
+    assert result.reason == "missing_required_fields:trade_time_ms"
+
+
+def test_resolve_trade_open_apply_uses_ledger_preflight_with_sqlite(tmp_path: Path) -> None:
+
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+
+    result = resolve_trade_deal(_deal(), repo=repo, state={}, apply_changes=True)
+
+    assert result.status == "applied"
+    operation = result.operations[0].to_payload()
+    assert operation["action"] == "open"
+    assert operation["event_id"] == "futu:lx:REAL_1:deal-open-1"
+    assert operation["ledger_preflight"]["status"] == "ok"
+    assert operation["ledger_preflight"]["event_type"] == "open"
+    assert operation["ledger_preflight"]["target_lot_id"] == operation["result"]["record_id"]
+    lots = repo.list_position_lots()
+    assert len(lots) == 1
+    assert lots[0]["record_id"] == operation["ledger_preflight"]["target_lot_id"]
+    assert lots[0]["fields"]["contracts_open"] == 2
+
+
+def test_explicit_long_call_apply_preserves_independent_open(tmp_path: Path) -> None:
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+
+    put_result = resolve_trade_deal(
+        _short_put_deal(),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+    assert put_result.status == "applied"
+
+    call_result = resolve_trade_deal(
+        _long_call_deal(position_effect="open"),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+
+    assert call_result.status == "applied"
+    lots = repo.list_position_lots()
+    call_lot = next(item for item in lots if item["fields"]["contract_key"]["option_type"] == "call")
+    assert call_lot["fields"]["position_side"] == "long"
+    assert "strategy" not in call_lot["fields"]
+    assert "leg_role" not in call_lot["fields"]
+    assert "strategy_group_id" not in call_lot["fields"]
+
+
+def test_resolve_sell_put_open_after_long_call_keeps_both_lots_independent(tmp_path: Path) -> None:
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+
+    call_result = resolve_trade_deal(
+        _long_call_deal(position_effect="open"),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+    assert call_result.status == "applied"
+
+    put_result = resolve_trade_deal(
+        _short_put_deal(),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+
+    assert put_result.status == "applied"
+    lots = repo.list_position_lots()
+    call_lot = next(item for item in lots if item["fields"]["contract_key"]["option_type"] == "call")
+    put_lot = next(item for item in lots if item["fields"]["contract_key"]["option_type"] == "put")
+    assert "strategy_group_id" not in call_lot["fields"]
+    assert "leg_role" not in call_lot["fields"]
+    assert "strategy_group_id" not in put_lot["fields"]
+    assert "leg_role" not in put_lot["fields"]
+
+
+def test_resolve_trade_open_rejects_duplicate_deal_id() -> None:
+    result = resolve_trade_deal(
+        _deal(),
+        repo=FakeRepo(),
+        state={
+            "processed_deal_ids": {
+                "futu:lx:REAL_1:deal-open-1": {"status": "applied"}
+            }
+        },
+        apply_changes=False,
+    )
+
+    assert result.status == "skipped"
+    assert result.reason == "duplicate_deal_id"
+
+
+def test_resolve_trade_skips_non_option_deal(tmp_path: Path) -> None:
+    repo = ledger_repository.SQLiteOptionPositionsRepository(
+        tmp_path / "option_positions.sqlite3"
+    )
+    result = resolve_trade_deal(
+        _deal(symbol="TIGR", option_type=None, strike=None, expiration_ymd=None, multiplier=None),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+
+    assert result.status == "skipped"
+    assert result.action is None
+    assert result.reason == "not_option_deal"
+    assert result.operations == []
+    assert repo.list_trade_events() == []
+    assert repo.list_assigned_stock_events() == []
+    assert repo.list_position_lots() == []
+
+
+def test_resolve_trade_skips_non_option_deal_before_account_mapping() -> None:
+    result = resolve_trade_deal(
+        _deal(
+            internal_account=None,
+            futu_account_id="REAL_2",
+            symbol="TIGR",
+            option_type=None,
+            strike=None,
+            expiration_ymd=None,
+            multiplier=None,
+        ),
+        repo=FakeRepo(),
+        state={},
+        apply_changes=True,
+    )
+
+    assert result.status == "skipped"
+    assert result.reason == "not_option_deal"
+
+
+def test_resolve_trade_open_retries_retryable_unresolved_deal_id() -> None:
+    result = resolve_trade_deal(
+        _deal(),
+        repo=FakeRepo(),
+        state={"unresolved_deal_ids": {"deal-open-1": {"status": "unresolved", "retryable": True}}},
+        apply_changes=False,
+    )
+
+    assert result.status == "dry_run"
+    assert result.reason == "preview_open"
+
+
+def test_resolve_trade_open_rejects_unknown_side() -> None:
+    result = resolve_trade_deal(_deal(side="hold"), repo=FakeRepo(), state={}, apply_changes=False)
+
+    assert result.status == "unresolved"
+    assert result.reason == "unsupported_open_side"
+
+
+def test_resolve_trade_open_missing_multiplier_is_retryable_with_diagnostics() -> None:
+    result = resolve_trade_deal(
+        _deal(
+            multiplier=None,
+            multiplier_source=None,
+            normalization_diagnostics={
+                "symbol": {"canonical": "9992.HK", "raw_fields": {"code": "HK.POP260528P150000"}},
+                "multiplier_resolution": {
+                    "canonical_symbol": "9992.HK",
+                    "selected_source": None,
+                    "attempted_sources": [
+                        {"source": "payload", "status": "missing"},
+                        {"source": "cache", "status": "miss"},
+                        {"source": "opend", "status": "error", "error": "multiplier_not_found"},
+                    ],
+                    "message": "recognized 9992.HK but multiplier could not be resolved",
+                },
+            },
+        ),
+        repo=FakeRepo(),
+        state={},
+        apply_changes=False,
+    )
+
+    assert result.status == "unresolved"
+    assert result.reason == "missing_required_fields:multiplier"
+    assert result.diagnostics["retryable"] is True
+    assert result.diagnostics["missing_fields"] == ["multiplier"]
+    assert result.diagnostics["multiplier_resolution"]["canonical_symbol"] == "9992.HK"
+    assert result.diagnostics["raw_symbol_fields"] == {"code": "HK.POP260528P150000"}
+
+
+def test_resolve_trade_open_rejects_zero_contracts_as_unresolved() -> None:
+    result = resolve_trade_deal(_deal(contracts=0), repo=FakeRepo(), state={}, apply_changes=False)
+
+    assert result.status == "unresolved"
+    assert result.reason == "invalid_required_fields:contracts"
+    assert result.diagnostics["invalid_fields"] == ["contracts"]
+
+
+def test_resolve_trade_open_missing_account_mapping_exposes_diagnostics() -> None:
+    result = resolve_trade_deal(
+        _deal(
+            internal_account=None,
+            futu_account_id="999000000000000001",
+            raw_payload={"deal_id": "deal-open-1", "trade_acc_id": "999000000000000001"},
+            visible_account_fields={"trade_acc_id": "999000000000000001"},
+            account_mapping_keys=["999999999999999999"],
+        ),
+        repo=FakeRepo(),
+        state={},
+        apply_changes=False,
+    )
+
+    assert result.status == "unresolved"
+    assert result.reason == "missing_account_mapping:futu_account_id=999000000000000001"
+    assert result.diagnostics["futu_account_id"] == "999000000000000001"
+    assert result.diagnostics["visible_account_fields"] == {"trade_acc_id": "999000000000000001"}
+    assert result.diagnostics["account_mapping_keys"] == ["999999999999999999"]
+
+
+def test_combo_yield_without_pair_intent_records_independent_long_call() -> None:
+    deal = _long_call_deal(
+        position_effect="open",
+        deal_id="deal-combo-call-unpaired",
+        expiration_ymd="2026-10-16",
+        raw_payload={
+            "deal_id": "deal-combo-call-unpaired",
+            "code": "US.PDD261016C100000",
+            "structure_mode": "same_expiry_pair",
+        },
+    )
+
+    result = resolve_trade_deal(deal, repo=FakeRepo(), state={}, apply_changes=False)
+
+    assert result.status == "dry_run"
+    fields = result.operations[0].to_payload()["fields"]
+    assert fields["side"] == "long"
+    assert "strategy_group_id" not in fields
+    assert "strategy" not in fields
+    assert result.diagnostics["combo_yield_enrichment"]["decision"] == "defer_to_post_trade_reconciliation"
+    assert result.diagnostics["combo_yield_enrichment"]["combination_relation_pending"] is True
+
+
+def test_combo_yield_explicit_pair_intent_records_independent_lots(tmp_path: Path) -> None:
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+    pair_payload = {
+        "structure_mode": "same_expiry_pair",
+        "pair_intent_id": "intent-pdd-20260717-1",
+        "yield_enhancement_mode": "vol_convexity_enhancement",
+        "fields": {
+            "strategy": "yield_enhancement",
+            "yield_enhancement_mode": "vol_convexity_enhancement",
+        },
+        "strategy_snapshot": {
+            "structure_mode": "same_expiry_pair",
+            "pair_intent_id": "intent-pdd-20260717-1",
+            "yield_enhancement_mode": "vol_convexity_enhancement",
+        },
+    }
+
+    put_result = resolve_trade_deal(
+        _short_put_deal(
+            deal_id="deal-pdd-combo-put",
+            expiration_ymd="2026-08-21",
+            raw_payload={**pair_payload, "deal_id": "deal-pdd-combo-put"},
+        ),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+    call_result = resolve_trade_deal(
+        _long_call_deal(
+            position_effect="open",
+            deal_id="deal-pdd-combo-call",
+            expiration_ymd="2026-10-16",
+            raw_payload={
+                **pair_payload,
+                "deal_id": "deal-pdd-combo-call",
+                "code": "US.PDD261016C100000",
+            },
+        ),
+        repo=repo,
+        state={},
+        apply_changes=True,
+    )
+
+    assert put_result.status == "applied"
+    assert call_result.status == "applied"
+    lots = repo.list_position_lots()
+    put_lot = next(item for item in lots if item["fields"]["contract_key"]["option_type"] == "put")
+    call_lot = next(item for item in lots if item["fields"]["contract_key"]["option_type"] == "call")
+    assert "strategy" not in put_lot["fields"]
+    assert "leg_role" not in put_lot["fields"]
+    assert "strategy_group_id" not in put_lot["fields"]
+    assert "strategy" not in call_lot["fields"]
+    assert "leg_role" not in call_lot["fields"]
+    assert "strategy_group_id" not in call_lot["fields"]
+    for event in repo.list_trade_events():
+        assert "yield_enhancement_mode" not in event["raw_payload"]
+        assert "fields" not in event["raw_payload"]
+        assert "yield_enhancement_mode" not in event["raw_payload"]["strategy_snapshot"]
+    put_enrichment = put_result.diagnostics["combo_yield_enrichment"]
+    assert put_enrichment["decision"] == "explicit_pair_intent_structure_unsupported"
+    assert put_enrichment["pair_intent_id"] == "intent-pdd-20260717-1"
+    assert put_enrichment["combination_relation_pending"] is True
+    call_enrichment = call_result.diagnostics["combo_yield_enrichment"]
+    assert call_enrichment["decision"] == "explicit_pair_intent_structure_unsupported"
+    assert call_enrichment["pair_intent_id"] == "intent-pdd-20260717-1"
+    assert call_enrichment["combination_relation_pending"] is True
+
+
+def test_combo_yield_pair_intent_from_strategy_snapshot_records_independent_open() -> None:
+    snapshot = {
+        "structure_mode": "same_expiry_pair",
+        "pair_intent_id": "intent-from-snapshot",
+    }
+    result = resolve_trade_deal(
+        _deal(
+            symbol="PDD",
+            option_type="put",
+            side="sell",
+            position_effect="open",
+            contracts=1,
+            expiration_ymd="2026-08-21",
+            currency="USD",
+            raw_payload={"strategy_snapshot": snapshot},
+        ),
+        repo=FakeRepo(),
+        state={},
+        apply_changes=False,
+    )
+
+    assert result.status == "dry_run"
+    fields = result.operations[0].to_payload()["fields"]
+    assert "strategy" not in fields
+    assert "leg_role" not in fields
+    assert "strategy_group_id" not in fields
+    assert fields["strategy_snapshot"] == snapshot
+    enrichment = result.diagnostics["combo_yield_enrichment"]
+    assert enrichment["decision"] == "explicit_pair_intent_structure_unsupported"
+    assert enrichment["pair_intent_id"] == "intent-from-snapshot"
+    assert enrichment["combination_relation_pending"] is True
+
+
+def test_combo_yield_explicit_pair_intent_preserves_incoming_relation_metadata() -> None:
+    snapshot = {
+        "strategy": "yield_enhancement",
+        "strategy_family": "sell_put",
+        "strategy_source": "attacker-source",
+        "leg_role": "participation_call",
+        "yield_enhancement_mode": "attacker-mode",
+        "structure_mode": "same_expiry_pair",
+        "pair_intent_id": "attacker-intent",
+        "strategy_group_id": "attacker-group",
+    }
+    result = resolve_trade_deal(
+        _deal(
+            symbol="PDD",
+            option_type="put",
+            side="sell",
+            position_effect="open",
+            contracts=1,
+            expiration_ymd="2026-08-21",
+            currency="USD",
+            raw_payload={
+                "structure_mode": "same_expiry_pair",
+                "pair_intent_id": "intent-authoritative",
+                "strategy": "yield_enhancement",
+                "leg_role": "participation_call",
+                "yield_enhancement_mode": "attacker-mode",
+                "strategy_group_id": "attacker-group",
+                "strategy_snapshot": snapshot,
+            },
+        ),
+        repo=FakeRepo(),
+        state={},
+        apply_changes=False,
+    )
+
+    assert result.status == "dry_run"
+    fields = result.operations[0].to_payload()["fields"]
+    assert fields["strategy"] == "combo_yield"
+    assert fields["leg_role"] == "participation_call"
+    assert "yield_enhancement_mode" not in fields
+    assert "yield_enhancement_mode" not in fields["strategy_snapshot"]
+    assert fields["strategy_group_id"] == "attacker-group"
+    assert fields["strategy_snapshot"] == {
+        **{
+            key: value
+            for key, value in snapshot.items()
+            if key not in {"strategy", "yield_enhancement_mode"}
+        },
+        "strategy": "combo_yield",
+    }
+    enrichment = result.diagnostics["combo_yield_enrichment"]
+    assert enrichment["decision"] == "explicit_pair_intent_structure_unsupported"
+    assert enrichment["pair_intent_id"] == "intent-authoritative"
+    assert enrichment["combination_relation_pending"] is True

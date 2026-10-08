@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+import yaml
+
+from src.application.agent_tool_config import load_runtime_config
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.config_yaml import build_yaml_runtime_config_file
+from src.application.runtime_config_freshness import GENERATED_KEY, check_runtime_config_freshness
+from src.application.runtime_config_readiness import evaluate_runtime_config_readiness, require_runtime_config_readiness
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _inline_runtime_config(*, market: str = "us", source_format: str = "yaml") -> dict:
+    return {
+        GENERATED_KEY: {
+            "schema_version": "1.0",
+            "generator": "options-monitor",
+            "source_format": source_format,
+            "market": market,
+            "sources": [
+                {"role": "system", "loaded": True, "inline": True, "sha256": "system"},
+                {"role": "common_user", "loaded": False, "optional": True, "enabled": False},
+                {"role": "market_user", "loaded": True, "inline": True, "sha256": "market"},
+            ],
+        },
+        "_resolved": {
+            "source_format": source_format,
+            "market": market,
+            "runtime_schema": "config-json-v1",
+        },
+        "portfolio": {},
+        "symbols": [],
+    }
+
+
+def _write_json(path: Path, payload: dict) -> Path:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def _build_us_yaml_runtime(tmp_path: Path) -> Path:
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+        encoding="utf-8",
+    )
+    runtime_path = tmp_path / "config.us.json"
+    build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT,
+        market="us",
+        config_path=config_yaml,
+        output_config_path=runtime_path,
+    )
+    return runtime_path
+
+
+def test_load_runtime_config_accepts_yaml_generated_runtime(tmp_path: Path) -> None:
+    path = _write_json(tmp_path / "config.us.json", _inline_runtime_config(market="us"))
+
+    loaded_path, cfg = load_runtime_config(config_path=path)
+
+    assert loaded_path == path
+    assert cfg[GENERATED_KEY]["source_format"] == "yaml"
+    assert cfg["config_source_path"] == str(path)
+
+
+def test_load_runtime_config_rejects_key_path_market_mismatch(tmp_path: Path) -> None:
+    path = _write_json(tmp_path / "config.us.json", _inline_runtime_config(market="us"))
+
+    with pytest.raises(AgentToolError) as exc:
+        load_runtime_config(config_key="hk", config_path=path)
+
+    assert exc.value.code == "CONFIG_ERROR"
+    assert "runtime config market does not match requested market" in exc.value.message
+    assert exc.value.details["errors"][0]["code"] == "path_market_mismatch"
+
+
+def test_load_runtime_config_rejects_generated_market_mismatch(tmp_path: Path) -> None:
+    path = _write_json(tmp_path / "config.hk.json", _inline_runtime_config(market="us"))
+
+    with pytest.raises(AgentToolError) as exc:
+        load_runtime_config(config_path=path)
+
+    assert exc.value.code == "CONFIG_ERROR"
+    assert exc.value.details["errors"][0]["code"] == "market_mismatch"
+
+
+def test_load_runtime_config_rejects_missing_generated_metadata(tmp_path: Path) -> None:
+    path = _write_json(tmp_path / "config.us.json", {"portfolio": {}, "symbols": []})
+
+    with pytest.raises(AgentToolError) as exc:
+        load_runtime_config(config_path=path)
+
+    assert exc.value.code == "CONFIG_ERROR"
+    assert "missing generation metadata" in exc.value.message
+
+
+def test_config_validate_infers_market_from_yaml_runtime_path(tmp_path: Path, capsys) -> None:
+    from src.interfaces.cli.main import main
+
+    runtime_path = _build_us_yaml_runtime(tmp_path)
+
+    rc = main(["config", "validate", "--config-path", str(runtime_path)])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["market"] == "us"
+    assert payload["source_format"] == "yaml"
+    assert payload["schedule_contract"]["validated"] is True
+    assert payload["freshness"]["ok"] is True
+
+
+def test_runtime_freshness_rejects_changed_inline_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_path = _build_us_yaml_runtime(tmp_path)
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(
+        "src.application.runtime_config_freshness.default_config_sha256",
+        lambda: "changed-defaults-sha256",
+    )
+    result = check_runtime_config_freshness(
+        payload,
+        repo_root=REPO_ROOT,
+        market="us",
+        runtime_config_path=runtime_path,
+    )
+
+    assert result["ok"] is False
+    assert any(item["code"] == "inline_source_changed" for item in result["errors"])
+
+
+def test_old_runtime_with_retired_output_mode_requires_rebuild(tmp_path: Path) -> None:
+    runtime_path = _build_us_yaml_runtime(tmp_path)
+    payload = json.loads(runtime_path.read_text(encoding="utf-8"))
+    payload["symbols"][0]["combo_yield"]["output_mode"] = "separate"
+    system_source = next(
+        item
+        for item in payload[GENERATED_KEY]["sources"]
+        if item.get("role") == "system"
+    )
+    system_source["sha256"] = "old-defaults-before-candidate-csv-retirement"
+
+    result = check_runtime_config_freshness(
+        payload,
+        repo_root=REPO_ROOT,
+        market="us",
+        runtime_config_path=runtime_path,
+    )
+
+    assert result["ok"] is False
+    assert any(item["code"] == "inline_source_changed" for item in result["errors"])
+    assert "./om config build" in str(result["rebuild_command"])
+
+
+@pytest.mark.parametrize("market,symbol", [("us", "NVDA"), ("hk", "0700.HK")])
+def test_readiness_accepts_bot_only_edit_without_writes(
+    tmp_path: Path, market: str, symbol: str,
+) -> None:
+    source = tmp_path / "config.yaml"
+    doc = {
+        "accounts": {"lx": {"type": "futu", "futu_account_id": "12345678"}},
+        "markets": {market: {"accounts": ["lx"], "symbols": [symbol]}},
+        "bot": {'enabled': False, 'context_window_messages': 6},
+    }
+    source.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    runtime = tmp_path / f"config.{market}.json"
+    build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT, market=market, config_path=source, output_config_path=runtime,
+    )
+    doc["bot"] = {"enabled": False, "context_window_messages": 8}
+    source.write_text(yaml.safe_dump(doc), encoding="utf-8")
+    before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tmp_path.rglob("*") if p.is_file()}
+
+    path, config = load_runtime_config(config_key=market, config_path=runtime)
+    result = require_runtime_config_readiness(
+        config, repo_root=REPO_ROOT, runtime_config_path=path, explicit_market=market,
+    )
+
+    assert result["ok"] is True
+    assert result["freshness"]["ok"] is True
+    after = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in tmp_path.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_readiness_reports_invalid_yaml_source_without_leaking_content(tmp_path: Path) -> None:
+    source = tmp_path / "config.yaml"
+    source.write_text(
+        "accounts:\n  lx:\n    type: futu\n    futu_account_id: '12345678'\n"
+        "markets:\n  us:\n    accounts: [lx]\n    symbols: [NVDA]\n",
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "config.us.json"
+    build_yaml_runtime_config_file(
+        repo_root=REPO_ROOT, market="us", config_path=source, output_config_path=runtime,
+    )
+    source.write_text("markets: [PRIVATE_CONFIG_VALUE\n", encoding="utf-8")
+    config = json.loads(runtime.read_text(encoding="utf-8"))
+
+    result = evaluate_runtime_config_readiness(
+        config, repo_root=REPO_ROOT, runtime_config_path=runtime, explicit_market="us",
+    )
+
+    assert result["ok"] is False
+    assert result["validation"]["ok"] is True
+    assert result["identity"]["ok"] is True
+    assert result["schedule"]["ok"] is True
+    assert result["freshness"]["ok"] is False
+    assert result["errors"]
+    assert all(error["component"] == "freshness" for error in result["errors"])
+    error = result["errors"][0]
+    assert error["code"] != "source_changed"
+    assert error["role"] == "market_user"
+    assert error["path"] == str(source)
+    assert "./om config build" in result["freshness"]["rebuild_command"]
+    assert "PRIVATE_CONFIG_VALUE" not in json.dumps(result)
+    with pytest.raises(AgentToolError) as exc:
+        require_runtime_config_readiness(
+            config, repo_root=REPO_ROOT, runtime_config_path=runtime, explicit_market="us",
+        )
+    assert exc.value.code == "CONFIG_ERROR"
+    assert exc.value.details == result

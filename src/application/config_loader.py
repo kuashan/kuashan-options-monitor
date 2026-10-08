@@ -1,0 +1,186 @@
+"""Runtime config loader + validation gating.
+
+Why:
+- Keep run_pipeline orchestration-only (Stage 3).
+- Centralize scheduled-mode validation caching (hash-based) to avoid repeated cost.
+
+Design:
+- No side effects beyond optional validation-cache file write (scheduled mode).
+- Validation function is injectable for unit tests.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping
+
+from src.application.runtime_config_paths import write_json_atomic
+from src.application.settings import build_effective_env
+from src.application.portfolio_management import (
+    normalize_portfolio_management_config,
+)
+
+
+SCHEDULED_CONFIG_VALIDATOR_VERSION = 'runtime-config-v3'
+
+
+def data_config_candidates(*, base: Path) -> list[Path]:
+    base = Path(base).resolve()
+    candidates = [
+        (base / "portfolio.runtime.json").resolve(),
+    ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for item in candidates:
+        key = str(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
+
+
+def default_data_config_path(*, base: Path) -> Path:
+    candidates = data_config_candidates(base=base)
+    for item in candidates:
+        if item.exists():
+            return item
+    return candidates[0]
+
+
+def resolve_data_config_path(*, base: Path, data_config: str | Path | None) -> Path:
+    if data_config is not None and str(data_config).strip():
+        path = Path(data_config)
+        if not path.is_absolute():
+            path = (Path(base).resolve() / path).resolve()
+        return path
+    env_ref = str(build_effective_env().get("OM_DATA_CONFIG") or "").strip()
+    if env_ref:
+        return Path(env_ref).expanduser().resolve()
+    return default_data_config_path(base=base)
+
+
+def normalize_portfolio_broker_config(cfg: dict | None) -> dict:
+    data = dict(cfg or {}) if isinstance(cfg, dict) else {}
+    portfolio = data.get('portfolio')
+    if not isinstance(portfolio, dict):
+        return data
+
+    normalized = {k: v for k, v in portfolio.items() if k != 'market'}
+
+    data_config = str(portfolio.get('data_config') or '').strip()
+    if data_config:
+        normalized['data_config'] = data_config
+
+    broker = str(portfolio.get('broker') or '').strip()
+    if not broker:
+        broker = str(portfolio.get('market') or '').strip()
+    if broker:
+        normalized['broker'] = broker
+
+    data['portfolio'] = normalized
+    return data
+
+
+def _scheduled_validation_cache_state(*, cfg: dict, state_dir: Path) -> tuple[bool, Path, str]:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = (state_dir / 'config_validation_cache.json').resolve()
+
+    payload = json.dumps(cfg, ensure_ascii=False, sort_keys=True)
+    sha256 = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+
+    prev_sha256 = None
+    prev_validator_version = None
+    try:
+        if cache_path.exists() and cache_path.stat().st_size > 0:
+            data = json.loads(cache_path.read_text(encoding='utf-8'))
+            if isinstance(data, dict):
+                prev_sha256 = data.get('sha256')
+                prev_validator_version = data.get('validator_version')
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        prev_sha256 = None
+        prev_validator_version = None
+
+    if prev_sha256 == sha256 and prev_validator_version == SCHEDULED_CONFIG_VALIDATOR_VERSION:
+        return False, cache_path, sha256
+
+    return True, cache_path, sha256
+
+
+def _mark_scheduled_validation_cached(*, cache_path: Path, sha256: str) -> None:
+    write_json_atomic(
+        cache_path,
+        {
+            'sha256': sha256,
+            'validator_version': SCHEDULED_CONFIG_VALIDATOR_VERSION,
+            'written_at_utc': datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def load_config(
+    *,
+    base: Path,
+    config_path: Path,
+    is_scheduled: bool,
+    log: Callable[[str], None],
+    validate_config_fn: Callable[[dict], None] | None = None,
+    state_dir: Path | None = None,
+    config_payload: Mapping[str, Any] | None = None,
+) -> dict:
+    cfg_path = config_path
+    if not cfg_path.is_absolute():
+        cfg_path = (base / cfg_path).resolve()
+
+    if cfg_path.suffix.lower() != '.json':
+        raise SystemExit('[CONFIG_ERROR] runtime config must be a .json file')
+
+    cfg = (
+        dict(config_payload)
+        if config_payload is not None
+        else json.loads(cfg_path.read_text(encoding='utf-8'))
+    )
+
+    if not isinstance(cfg, dict):
+        raise SystemExit('[CONFIG_ERROR] config must be a JSON object')
+
+    cfg = normalize_portfolio_broker_config(cfg)
+    try:
+        cfg = normalize_portfolio_management_config(
+            cfg,
+            warning_fn=lambda message: log(f"[WARN] {message}"),
+        )
+    except ValueError as exc:
+        raise SystemExit(f"[CONFIG_ERROR] {exc}") from exc
+
+    try:
+        if validate_config_fn is None:
+            from src.application.config_validator import validate_config as validate_config_fn  # type: ignore
+
+        should_validate = True
+        validation_cache: tuple[Path, str] | None = None
+        if is_scheduled:
+            sd = state_dir if state_dir is not None else (base / 'output_shared' / 'state').resolve()
+            should_validate, cache_path, cfg_hash = _scheduled_validation_cache_state(cfg=cfg, state_dir=sd)
+            if should_validate:
+                validation_cache = (cache_path, cfg_hash)
+
+        if should_validate:
+            validate_config_fn(cfg)
+            if validation_cache is not None:
+                cache_path, cfg_hash = validation_cache
+                _mark_scheduled_validation_cached(cache_path=cache_path, sha256=cfg_hash)
+    except SystemExit:
+        raise
+    except ImportError as e:
+        # Do not block the pipeline if validator module is not available.
+        log(f"[WARN] config validation skipped (import failed): {e}")
+    except Exception as e:
+        # Validation logic itself raised — surface this as an error, don't swallow.
+        log(f"[ERR] config validation failed: {e}")
+        raise SystemExit(f"[CONFIG_ERROR] validation failed: {e}") from e
+
+    return cfg

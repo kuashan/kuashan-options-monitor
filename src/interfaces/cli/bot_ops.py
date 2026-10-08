@@ -1,0 +1,350 @@
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from src.application.bot.contracts import AppResult, BotRequest, BotScope, new_id, to_payload
+from src.application.bot.channel_facade import (
+    BotConfigScopeError,
+    config_scope_error_message,
+    resolve_trusted_config_scope,
+)
+from src.application.bot.host_store import BotHostStore
+from src.application.bot.local_harness import run_local_request
+
+
+def add_bot_commands(subparsers: Any) -> argparse.ArgumentParser:
+    bot = subparsers.add_parser("bot", help="run Bot v2 local read-only tasks")
+    bot_sub = bot.add_subparsers(dest="bot_command", required=True)
+    from src.interfaces.cli.bot_control_ops import register_bot_control_subcommands
+    from src.interfaces.cli.feature_ops import add_feature_configure_parser
+    register_bot_control_subcommands(bot_sub)
+    add_feature_configure_parser(bot_sub, "bot")
+
+    run = bot_sub.add_parser("run", help="run one local read-only Bot question")
+    run.add_argument("--text", required=True)
+    run_scope = run.add_mutually_exclusive_group()
+    run_scope.add_argument("--config-key", default=None, choices=("us", "hk"))
+    run_scope.add_argument("--config-path", default=None)
+    run.add_argument("--symbol", default=None)
+    run.add_argument("--month", default=None)
+    run.add_argument("--include-events", action="store_true")
+    run.add_argument("--host-db", default=None, help="optional Bot Host SQLite path for durable runs")
+    run.add_argument("--session-key", default=None, help="optional durable conversation session key")
+    run_model = run.add_mutually_exclusive_group()
+    run_model.add_argument(
+        "--model-config-json",
+        default=None,
+        help=(
+            "local model override JSON (requires enabled Bot runtime config); sends model-visible "
+            "read-only observations to the configured provider"
+        ),
+    )
+    run_model.add_argument(
+        "--bot-config",
+        default=None,
+        help="optional Bot runtime config path used to load the local Bot model",
+    )
+
+    eval_cmd = bot_sub.add_parser("eval", help="run one deterministic Bot eval fixture")
+    eval_cmd.add_argument("--fixture", required=True)
+    eval_cmd.add_argument("--text", default="请根据 eval fixture 回答这个只读问题")
+    eval_cmd.add_argument("--config-key", default="us", choices=("us", "hk"))
+    eval_cmd.add_argument("--symbol", default=None)
+    eval_cmd.add_argument("--month", default=None)
+    eval_cmd.add_argument("--include-events", action="store_true")
+    eval_model = eval_cmd.add_mutually_exclusive_group()
+    eval_model.add_argument(
+        "--model-config-json",
+        default=None,
+        help="explicit model config JSON for eval-only fixture synthesis; sends fixture facts to provider",
+    )
+    eval_model.add_argument(
+        "--bot-config",
+        default=None,
+        help="optional Bot runtime config path for eval-only fixture synthesis",
+    )
+    eval_model.add_argument(
+        "--model-turn-json",
+        default=None,
+        help="explicit eval-only model turn JSON or JSON array; does not call a provider",
+    )
+    eval_model.add_argument(
+        "--model-turn-json-file",
+        default=None,
+        help="path to explicit eval-only model turn JSON or JSON array; does not call a provider",
+    )
+
+    runs = bot_sub.add_parser("runs", help="list durable Bot runs")
+    runs.add_argument("--host-db", required=True)
+    runs.add_argument("--limit", type=int, default=20)
+
+    cancel = bot_sub.add_parser("cancel", help="request cancellation of a running Bot run")
+    cancel.add_argument("--host-db", required=True)
+    cancel.add_argument("--run-id", required=True)
+
+    events = bot_sub.add_parser("events", help="poll durable Bot run events")
+    events.add_argument("--host-db", required=True)
+    events.add_argument("--run-id", required=True)
+    events.add_argument("--after-event-id", default=None)
+
+    replies = bot_sub.add_parser("replies", help="list durable Bot reply outbox entries")
+    replies.add_argument("--host-db", required=True)
+    replies.add_argument("--limit", type=int, default=50)
+    migrate = bot_sub.add_parser("migrate", help="inspect or apply one-time Bot migration while all writers are stopped")
+    migrate.add_argument("--host-db", required=True)
+    migrate.add_argument("--config", action="append", default=[])
+    migrate.add_argument("--pi-db", action="append", default=[])
+    mode = migrate.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    migrate.add_argument("--writers-stopped", action="store_true")
+    migrate_pi = bot_sub.add_parser("migrate-pi", help="inspect or convert the bounded Pi Session store")
+    migrate_pi.add_argument("--pi-db", required=True)
+    migrate_pi.add_argument("--source-runtime", required=True)
+    migrate_pi.add_argument("--target-runtime", required=True)
+    pi_mode = migrate_pi.add_mutually_exclusive_group(required=True)
+    pi_mode.add_argument("--dry-run", action="store_true")
+    pi_mode.add_argument("--apply", action="store_true")
+    migrate_pi.add_argument("--writers-stopped", action="store_true")
+    return bot
+
+
+def handle_bot_command(args: argparse.Namespace) -> dict[str, Any] | int:
+    if getattr(args, "bot_control_command", None):
+        from src.interfaces.cli.bot_control_ops import handle_bot_control_command
+        return handle_bot_control_command(args)
+    if args.bot_command == "configure":
+        from src.interfaces.cli.feature_ops import run_feature_configure
+        return run_feature_configure(args)
+    received_monotonic = time.monotonic()
+    if args.bot_command == "migrate":
+        from src.application.bot.migration import migrate_bot
+        return migrate_bot(host_db=args.host_db, config_paths=args.config, pi_paths=args.pi_db, apply=args.apply, writers_stopped=args.writers_stopped)
+    if args.bot_command == "migrate-pi":
+        from src.application.bot.pi_migration import migrate_pi
+        return migrate_pi(
+            pi_db=args.pi_db,
+            source_runtime=args.source_runtime,
+            target_runtime=args.target_runtime,
+            apply=args.apply,
+            writers_stopped=args.writers_stopped,
+        )
+    if args.bot_command == "run":
+        request_id = new_id("req")
+        config_key = args.config_key
+        config_path = args.config_path
+        authority_scope = None
+        if config_key or config_path:
+            try:
+                config_key, config_path, authority_scope = resolve_trusted_config_scope(
+                    config_key=config_key,
+                    config_path=config_path,
+                )
+            except BotConfigScopeError as exc:
+                return to_payload(
+                    AppResult(
+                        status="not_ready",
+                        ok=False,
+                        error={"code": "CONFIG_ERROR", "reason": exc.reason},
+                        user_response=f"{config_scope_error_message(exc.reason)}；本次没有调用工具。",
+                        request_id=request_id,
+                    ),
+                    include_events=bool(args.include_events),
+                )
+        request = BotRequest(
+            request_id=request_id,
+            source_entry="cli",
+            received_monotonic=received_monotonic,
+            deadline_monotonic=received_monotonic + 180,
+            user_message=args.text,
+            explicit_scope=BotScope(
+                config_key=config_key,
+                config_path=config_path,
+                symbol=args.symbol,
+                month=args.month,
+            ),
+            execution_environment="local",
+            trusted_tool_scope=(
+                {"authority_scope": authority_scope} if authority_scope else {}
+            ),
+        )
+        host_store = BotHostStore(args.host_db) if args.host_db else None
+        session_key = args.session_key
+        return to_payload(
+            _run_local_request(
+                request,
+                model_config_json=args.model_config_json,
+                bot_config_path=args.bot_config,
+                model_turn_json=None,
+                host_store=host_store,
+                session_key=session_key,
+            ),
+            include_events=bool(args.include_events),
+        )
+
+    if args.bot_command == "runs":
+        store = BotHostStore(args.host_db)
+        store.mark_stale_runs_interrupted()
+        return {
+            "ok": True,
+            "status": "answered",
+            "runs": [_run_summary(item) for item in store.list_runs(limit=args.limit)],
+        }
+
+    if args.bot_command == "cancel":
+        cancelled = BotHostStore(args.host_db).request_cancel(args.run_id)
+        return {
+            "ok": cancelled,
+            "status": "cancel_requested" if cancelled else "not_ready",
+            "run_id": args.run_id,
+            "user_response": (
+                "已请求取消 Bot 运行。"
+                if cancelled
+                else "该运行不存在、已作出准入决定或已进入终态。"
+            ),
+        }
+
+    if args.bot_command == "events":
+        store = BotHostStore(args.host_db)
+        events = store.run_events(args.run_id, after_event_id=args.after_event_id)
+        return {
+            "ok": True,
+            "status": "answered",
+            "run_id": args.run_id,
+            "events": list(events),
+        }
+
+    if args.bot_command == "replies":
+        return {
+            "ok": True,
+            "status": "answered",
+            "replies": [_reply_summary(item) for item in BotHostStore(args.host_db).list_replies(limit=args.limit)],
+        }
+
+    if args.bot_command == "eval":
+        request = BotRequest(
+            request_id=new_id("req"),
+            source_entry="cli",
+            received_monotonic=received_monotonic,
+            deadline_monotonic=received_monotonic + 180,
+            user_message=args.text,
+            explicit_scope=BotScope(
+                config_key=args.config_key,
+                symbol=args.symbol,
+                month=args.month,
+            ),
+            execution_environment="eval",
+            debug_overrides={"fixture_id": args.fixture},
+        )
+        model_turn_json, file_error = _model_turn_json_from_file(args.model_turn_json_file)
+        if file_error:
+            return to_payload(
+                _failed_model_turn_file_result(request, file_error),
+                include_events=bool(args.include_events),
+            )
+        if model_turn_json is None:
+            model_turn_json = args.model_turn_json
+        return to_payload(
+            _run_local_request(
+                request,
+                model_config_json=args.model_config_json,
+                bot_config_path=args.bot_config,
+                model_turn_json=model_turn_json,
+            ),
+            include_events=bool(args.include_events),
+        )
+
+    return {
+        "ok": False,
+        "status": "failed",
+        "user_response": f"unsupported bot command: {getattr(args, 'bot_command', None)}",
+    }
+
+
+def _run_local_request(
+    request: BotRequest,
+    *,
+    model_config_json: str | None = None,
+    bot_config_path: str | None = None,
+    model_turn_json: str | None = None,
+    host_store: BotHostStore | None = None,
+    session_key: str | None = None,
+) -> AppResult:
+    return run_local_request(
+        request,
+        reference_year=_reference_year(),
+        model_config_json=model_config_json,
+        bot_config_path=bot_config_path,
+        model_turn_json=model_turn_json,
+        host_store=host_store,
+        session_key=session_key,
+    )
+
+
+def _run_summary(record: dict[str, Any]) -> dict[str, Any]:
+    response: dict[str, Any] = {}
+    try:
+        parsed = json.loads(str(record.get("response_json") or "{}"))
+        response = dict(parsed) if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    return {
+        "run_id": record.get("run_id"),
+        "session_key": record.get("session_key"),
+        "status": record.get("status"),
+        "started_at": record.get("started_at"),
+        "finished_at": record.get("finished_at"),
+        "termination_reason": record.get("termination_reason"),
+        "metrics": _json_dict(record.get("metrics_json")),
+        "response_status": response.get("status"),
+    }
+
+
+def _reply_summary(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "delivery_key": record.get("delivery_key"),
+        "channel": record.get("channel"),
+        "session_key": record.get("session_key"),
+        "run_id": record.get("run_id"),
+        "status": record.get("status"),
+        "attempt_count": int(record.get("attempt_count") or 0),
+        "next_attempt_at": record.get("next_attempt_at"),
+        "last_error": record.get("last_error"),
+    }
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except Exception:
+        return {}
+    return dict(parsed) if isinstance(parsed, dict) else {}
+
+
+def _reference_year() -> int:
+    return date.today().year
+
+
+def _model_turn_json_from_file(path: str | None) -> tuple[str | None, str | None]:
+    if not path:
+        return None, None
+    try:
+        return Path(path).read_text(encoding="utf-8"), None
+    except OSError:
+        return None, "model_turn_file_read_failed"
+
+
+def _failed_model_turn_file_result(request: BotRequest, reason: str) -> AppResult:
+    return AppResult(
+        status="failed",
+        user_response="Bot eval 模型轮次文件不可读取。",
+        error={"code": "MODEL_TURN_FILE_READ_FAILED", "reason": reason},
+        request_id=request.request_id,
+        decision_trace={"model_turn_error": reason},
+        ok=False,
+    )

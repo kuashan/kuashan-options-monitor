@@ -1,0 +1,276 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+
+def _source_plan_cfg(account: str, settings: dict, source: str) -> dict:
+    return {
+        "accounts": [account],
+        "account_settings": {account: settings},
+        "portfolio": {"source": source},
+    }
+
+
+def _single_futu_cfg(futu: dict) -> dict:
+    return {"accounts": ["lx"], "account_settings": {"lx": {"type": "futu", "futu": futu}}}
+
+
+def test_accounts_from_config_normalizes_and_dedupes() -> None:
+    from src.application.account_config import accounts_from_config
+
+    assert accounts_from_config({"accounts": [" LX ", "sy", "lx"]}) == ["lx", "sy"]
+
+
+def test_accounts_from_config_keeps_legacy_fallback() -> None:
+    from src.application.account_config import accounts_from_config
+
+    assert accounts_from_config({}) == ["user1"]
+
+
+@pytest.mark.parametrize("accounts", [[], [""], [0], [False], None])
+def test_accounts_from_config_rejects_explicit_empty_or_non_string_scope(accounts) -> None:
+    from src.application.account_config import accounts_from_config
+
+    with pytest.raises(ValueError, match="accounts"):
+        accounts_from_config({"accounts": accounts})
+
+
+@pytest.mark.parametrize("account", ["../lx", "/lx", "lx/sy", "lx.sy", "lx sy"])
+def test_accounts_from_config_rejects_unsafe_labels(account: str) -> None:
+    from src.application.account_config import accounts_from_config
+
+    with pytest.raises(ValueError, match="account label"):
+        accounts_from_config({"accounts": [account]})
+
+
+@pytest.mark.parametrize("accounts", [["../lx"], "../lx"])
+def test_config_validator_rejects_unsafe_account_label(accounts) -> None:
+    from src.application.config_validator import validate_config
+
+    with pytest.raises(SystemExit, match="accounts contains invalid label"):
+        validate_config({"accounts": accounts})
+
+
+def test_cash_footer_accounts_prefers_notification_override_then_accounts() -> None:
+    from src.application.account_config import cash_footer_accounts_from_config
+
+    assert cash_footer_accounts_from_config({"accounts": ["alpha"]}) == ["alpha"]
+    assert cash_footer_accounts_from_config(
+        {
+            "accounts": ["alpha"],
+            "notifications": {"cash_footer_accounts": ["beta", "gamma"]},
+        }
+    ) == ["beta", "gamma"]
+
+
+def test_resolve_portfolio_source_uses_global_futu_or_auto_only() -> None:
+    from src.application.account_config import resolve_portfolio_source
+
+    cfg = {"portfolio": {"source": "futu"}}
+    assert resolve_portfolio_source(cfg, account="LX") == "futu"
+    assert resolve_portfolio_source({}, account="lx") == "auto"
+    with pytest.raises(ValueError, match="source_by_account is retired"):
+        resolve_portfolio_source({"portfolio": {"source_by_account": {"lx": "futu"}}}, account="lx")
+
+
+def test_resolve_account_type_rejects_retired_type() -> None:
+    from src.application.account_config import resolve_account_type
+
+    cfg = {"accounts": ["user1", "ext1"], "account_settings": {"user1": {"type": "futu"}, "ext1": {"type": "external_holdings"}}}
+    with pytest.raises(ValueError, match="account_settings.ext1.type"):
+        resolve_account_type(cfg, account="user1")
+
+
+def test_account_settings_rejects_retired_holdings_binding() -> None:
+    from src.application.account_config import account_settings_from_config
+
+    cfg = {"accounts": ["user1"], "account_settings": {"user1": {"type": "futu", "holdings_account": "LX"}}}
+    with pytest.raises(ValueError, match="holdings_account is retired"):
+        account_settings_from_config(cfg)
+
+
+@pytest.mark.parametrize("setting", [{"type": "external_holdings"}, {"type": "futu", "holdings_account": "LX"}, {"type": "futu", "bitable": {"app_token": "old"}}])
+def test_agent_config_rejects_retired_account_fields_without_portfolio_account(tmp_path, setting: dict) -> None:
+    from src.application.agent_tool_config import load_runtime_config
+    from src.application.agent_tool_contracts import AgentToolError
+
+    path = tmp_path / "config.us.json"
+    path.write_text(json.dumps({"accounts": ["lx"], "account_settings": {"lx": setting}}), encoding="utf-8")
+
+    with pytest.raises(AgentToolError) as caught:
+        load_runtime_config(config_path=path, require_identity=False)
+    assert caught.value.code == "CONFIG_ERROR"
+
+
+def test_resolve_portfolio_source_keeps_auto_for_futu_account() -> None:
+    from src.application.account_config import resolve_portfolio_source
+
+    cfg = {
+        "accounts": ["lx"],
+        "account_settings": {
+            "lx": {"type": "futu"},
+        },
+        "portfolio": {
+            "source": "auto",
+        },
+    }
+
+    assert resolve_portfolio_source(cfg, account="lx") == "auto"
+
+
+def test_build_account_portfolio_source_plan_for_auto_futu_account() -> None:
+    from src.application.account_config import build_account_portfolio_source_plan
+
+    cfg = _source_plan_cfg("lx", {"type": "futu"}, "auto")
+
+    out = build_account_portfolio_source_plan(cfg, account="lx")
+    assert out.account_type == "futu"
+    assert out.requested_source == "auto"
+    assert out.primary_source == "futu"
+
+
+def test_build_account_portfolio_source_plan_rejects_external_holdings_account() -> None:
+    from src.application.account_config import build_account_portfolio_source_plan
+
+    cfg = _source_plan_cfg("ext1", {"type": "external_holdings", "holdings_account": "Feishu EXT"}, "futu")
+    with pytest.raises(ValueError, match="account_settings.ext1.type"):
+        build_account_portfolio_source_plan(cfg, account="ext1")
+
+
+def test_build_account_config_view_exposes_futu_runtime_plan() -> None:
+    from src.application.account_config import build_account_config_view
+
+    cfg = {
+        "accounts": ["lx"],
+        "account_settings": {
+            "lx": {
+                "type": "futu",
+                "trade_intake_enabled": False,
+                "futu": {
+                    "account_id": "999000000000000001",
+                    "host": "127.0.0.1",
+                    "port": "11111",
+                    "telnet_port": "22222",
+                    "opend_root": "/home/om/apps/futu-opend-lx/current",
+                    "trd_env": "REAL",
+                },
+            }
+        },
+        "trade_intake": {
+            "account_mapping": {
+                "futu": {
+                    "legacy-id": "lx",
+                }
+            }
+        },
+    }
+
+    out = build_account_config_view(cfg, account="lx")
+
+    assert out.futu_acc_ids == ["999000000000000001"]
+    assert out.runtime_plan.portfolio_source == "futu"
+    assert out.runtime_plan.trade_source == "api"
+    assert out.runtime_plan.trade_intake_enabled is False
+    assert out.runtime_plan.futu_account_id == "999000000000000001"
+    assert out.runtime_plan.futu_host == "127.0.0.1"
+    assert out.runtime_plan.futu_port == 11111
+    assert out.runtime_plan.futu_telnet_port == 22222
+    assert out.runtime_plan.futu_opend_root == "/home/om/apps/futu-opend-lx/current"
+    assert out.runtime_plan.futu_trd_env == "REAL"
+
+
+def test_build_account_runtime_plan_does_not_truncate_non_integer_futu_ports() -> None:
+    from src.application.account_config import build_account_runtime_plan
+
+    for value in (11111.9, True, "11111.0", " 11111"):
+        cfg = _single_futu_cfg({"host": "127.0.0.1", "port": value})
+
+        assert build_account_runtime_plan(cfg, account="lx").futu_port is None
+
+
+def test_resolve_futu_account_ids_falls_back_to_legacy_trade_mapping() -> None:
+    from src.application.account_config import resolve_futu_account_ids
+
+    cfg = {
+        "accounts": ["lx"],
+        "trade_intake": {
+            "account_mapping": {
+                "futu": {
+                    "legacy-id": "lx",
+                }
+            }
+        },
+    }
+
+    assert resolve_futu_account_ids(cfg, account="lx") == ["legacy-id"]
+
+
+def test_broker_binding_set_unions_ids_across_markets() -> None:
+    from src.application.account_config import resolve_account_broker_binding_sets
+
+    def config(market: str, account_id: str) -> dict:
+        return {
+            "_generated": {"market": market},
+            "accounts": ["lx"],
+            "account_settings": {
+                "lx": {"type": "futu", "futu": {"host": "broker.local", "port": 11112, "account_id": account_id, "trd_env": "REAL"}}
+            },
+            "symbols": [{"symbol": "S", "fetch": {"source": "futu", "host": "quote", "port": 11111}}],
+        }
+
+    binding = resolve_account_broker_binding_sets(
+        [("us", config("us", "1001")), ("hk", config("hk", "1002"))]
+    )["lx"]
+
+    assert binding.ok is True
+    assert binding.required_account_ids == ("1001", "1002")
+    assert (binding.host, binding.port, binding.trd_env) == ("broker.local", 11112, "REAL")
+
+
+def test_broker_binding_set_rejects_shared_multi_account_endpoint() -> None:
+    from src.application.account_config import resolve_account_broker_binding_sets
+
+    cfg = {
+        "_generated": {"market": "us"},
+        "accounts": ["lx", "sy"],
+        "account_settings": {
+            account: {"type": "futu", "futu": {"host": "broker", "port": 11111, "account_id": account_id, "trd_env": "REAL"}}
+            for account, account_id in (("lx", "1001"), ("sy", "1002"))
+        },
+        "symbols": [{"symbol": "S", "fetch": {"source": "futu"}}],
+    }
+
+    bindings = resolve_account_broker_binding_sets([("us", cfg)])
+
+    assert bindings["lx"].status == "conflict"
+    assert bindings["sy"].status == "conflict"
+
+
+def test_sole_futu_account_can_use_legacy_projection_with_warning() -> None:
+    from src.application.account_config import resolve_account_broker_binding_sets
+
+    cfg = {
+        "_generated": {"market": "us"},
+        "accounts": ["lx"],
+        "account_settings": {
+            "lx": {"type": "futu", "futu": {"account_id": "1001"}},
+        },
+        "portfolio": {"futu": {"host": "broker", "port": 11112}},
+        "symbols": [{"symbol": "S", "fetch": {"source": "futu", "host": "quote", "port": 11111}}],
+    }
+
+    binding = resolve_account_broker_binding_sets([("us", cfg)])["lx"]
+
+    assert binding.ok is True
+    assert binding.trd_env == "REAL"
+    assert binding.members[0].authority_source == "legacy_single_futu_projection"
+    assert binding.compatibility_warnings
+
+
+def test_parse_option_message_accepts_configured_account_labels() -> None:
+    from src.application.parse_option_message import parse_account
+
+    assert parse_account("成交 accountA账户", accounts=["accountA"]) == "accounta"
+    assert parse_account("成交 lx", accounts=["accountA"]) is None

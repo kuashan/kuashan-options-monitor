@@ -1,0 +1,519 @@
+"""Regression: watchlist runner should honor --symbols whitelist."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+
+def _pipeline(cfg: dict, *, process_symbol_fn, symbols_arg: str | None = None, **overrides):
+    """Call ``run_watchlist_pipeline`` with this file's default call shape.
+
+    Every default below is copied verbatim from the inline literal the call
+    sites used before; ``overrides`` carries the per-test differences.
+    """
+    from src.application.pipeline_watchlist import run_watchlist_pipeline
+
+    kwargs = {
+        'py': 'python',
+        'base': Path('.'),
+        'cfg': cfg,
+        'report_dir': Path('.'),
+        'is_scheduled': True,
+        'top_n': 3,
+        'symbol_timeout_sec': 1,
+        'portfolio_timeout_sec': 1,
+        'want_scan': True,
+        'no_context': True,
+        'symbols_arg': symbols_arg,
+        'log': lambda _: None,
+        'want_fn': lambda _: True,
+        'apply_profiles_fn': lambda item, _profiles: dict(item),
+        'process_symbol_fn': process_symbol_fn,
+        'build_pipeline_context_fn': lambda **_: ({}, None, None, None),
+        'build_symbols_summary_fn': lambda *_args, **_kwargs: None,
+        'build_symbols_digest_fn': lambda *_args, **_kwargs: None,
+    }
+    kwargs.update(overrides)
+    return run_watchlist_pipeline(**kwargs)
+
+
+def test_watchlist_whitelist_filters_symbols() -> None:
+    calls: list[str] = []
+
+    def _process_symbol(*args, **kwargs):
+        item = args[2]
+        calls.append(str(item.get('symbol')))
+        return [{'symbol': str(item.get('symbol')), 'strategy': 'sell_put', 'candidate_count': 0}]
+
+    cfg = {
+        'symbols': [
+            {'symbol': '0700.HK', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': True}},
+            {'symbol': '3690.HK', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': True}},
+        ],
+        'templates': {},
+        'runtime': {},
+    }
+
+    out = _pipeline(cfg, symbols_arg='0700.HK', process_symbol_fn=_process_symbol)
+
+    assert calls == ['0700.HK']
+    assert len(out) == 1
+
+
+def test_watchlist_reuses_one_required_data_batch_for_all_symbols() -> None:
+    batch = object()
+    received: list[object] = []
+
+    def _process_symbol(*args, **kwargs):
+        received.append(kwargs["required_data_snapshot_batch"])
+        return [
+            {
+                "symbol": str(args[2]["symbol"]),
+                "strategy": "sell_put",
+                "candidate_count": 0,
+            }
+        ]
+
+    cfg = {
+        "symbols": [
+            {"symbol": "NVDA", "sell_put": {"enabled": True}},
+            {"symbol": "PDD", "sell_put": {"enabled": True}},
+        ],
+        "templates": {},
+        "runtime": {},
+    }
+    _pipeline(
+        cfg,
+        process_symbol_fn=_process_symbol,
+        required_data_snapshot_manifest=Path("manifest.json"),
+        required_data_snapshot_batch=batch,
+    )
+
+    assert received == [batch, batch]
+
+
+def test_watchlist_default_propagates_batch_initialization_failure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from src.application import pipeline_watchlist as mod
+    from src.application.required_data_snapshot import (
+        FrozenRequiredDataUnavailable,
+    )
+
+    attempts = 0
+
+    def _fail_batch(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise FrozenRequiredDataUnavailable(
+            symbol="UNKNOWN",
+            reason="manifest_invalid",
+            detail="content hash mismatch",
+        )
+
+    monkeypatch.setattr(
+        mod,
+        "resolve_frozen_required_data_csv_bytes_batch",
+        _fail_batch,
+    )
+    monkeypatch.setattr(
+        mod,
+        "run_watchlist_pipeline",
+        lambda **_kwargs: pytest.fail("invalid batch must stop before symbol loop"),
+    )
+
+    with pytest.raises(FrozenRequiredDataUnavailable) as failed:
+        mod.run_watchlist_pipeline_default(
+            py="python3",
+            base=tmp_path,
+            cfg={"symbols": []},
+            report_dir=tmp_path / "reports",
+            state_dir=tmp_path / "state",
+            shared_state_dir=tmp_path / "shared_state",
+            required_data_dir=tmp_path / "required_data",
+            is_scheduled=True,
+            top_n=3,
+            symbol_timeout_sec=120,
+            portfolio_timeout_sec=120,
+            want_scan=True,
+            no_context=False,
+            symbols_arg=None,
+            log=lambda _message: None,
+            want_fn=lambda name: name == "scan",
+            source_account_run_id="run-1",
+            required_data_snapshot_manifest=tmp_path / "manifest.json",
+        )
+
+    assert failed.value.reason == "manifest_invalid"
+    assert attempts == 1
+
+
+def test_watchlist_combo_sink_receives_typed_evidence(tmp_path: Path) -> None:
+    from src.application.strategy_scan_status import publish_strategy_scan_status
+
+    received: list[dict] = []
+
+    def _process_symbol(*args, **kwargs):
+        report_dir = tmp_path / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        publish_strategy_scan_status(
+            report_dir=report_dir,
+            run_id="run-1",
+            account="lx",
+            market="US",
+            symbol="NVDA",
+            strategy_family="sell_put",
+            status="completed",
+            candidate_count=0,
+            snapshot_id="quote-1",
+            receipt_relpath="quotes/quote-1/receipt.json",
+        )
+        sink = kwargs.get("combo_evidence_sink_fn")
+        if sink is not None:
+            sink(
+                {
+                    "schema_version": "combo_yield_scan_evidence.v1",
+                    "variant": "sp_lc",
+                    "symbol": "NVDA",
+                    "ranked_pairs": [],
+                }
+            )
+        return [{'symbol': 'NVDA', 'strategy': 'combo_yield', 'candidate_count': 1}]
+
+    def _combo_sink(payload: dict) -> None:
+        received.append(dict(payload))
+
+    cfg = {
+        'symbols': [
+            {'symbol': 'NVDA', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': False}},
+        ],
+        'templates': {},
+        'runtime': {},
+        'portfolio': {'account': 'lx'},
+    }
+
+    _pipeline(
+        cfg,
+        base=tmp_path,
+        report_dir=tmp_path / 'reports',
+        symbols_arg='NVDA',
+        process_symbol_fn=_process_symbol,
+        source_producer_run_id='run-1',
+        candidate_capture_status_sink_fn=lambda *_args, **_kwargs: None,
+        required_data_snapshot_manifest=tmp_path / 'required.json',
+        account_config_sha256='a' * 64,
+        combo_evidence_sink_fn=_combo_sink,
+    )
+
+    assert received == [
+        {
+            "schema_version": "combo_yield_scan_evidence.v1",
+            "variant": "sp_lc",
+            "symbol": "NVDA",
+            "ranked_pairs": [],
+        }
+    ]
+
+
+def test_watchlist_symbol_timeout_covers_the_whole_processor() -> None:
+    calls: list[str] = []
+
+    def _process_symbol(*args, **kwargs):
+        symbol = str(args[2]["symbol"])
+        calls.append(symbol)
+        if symbol == "AAPL":
+            time.sleep(5)
+        return [
+            {
+                "symbol": symbol,
+                "strategy": "sell_put",
+                "candidate_count": 0,
+            }
+        ]
+
+    started = time.monotonic()
+    out = _pipeline(
+        {
+            "symbols": [
+                {"symbol": "AAPL", "sell_put": {"enabled": True}},
+                {"symbol": "MSFT", "sell_put": {"enabled": True}},
+            ],
+            "templates": {},
+            "runtime": {},
+        },
+        process_symbol_fn=_process_symbol,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.5
+    assert calls == ["AAPL", "MSFT"]
+    aapl = [row for row in out if row["symbol"] == "AAPL"]
+    assert {row["strategy"] for row in aapl} == {"sell_put", "sell_call"}
+    assert all("deadline" in row["note"] for row in aapl)
+    assert any(row["symbol"] == "MSFT" for row in out)
+
+
+def test_watchlist_whitelist_is_case_insensitive_and_trimmed() -> None:
+    calls: list[str] = []
+
+    def _process_symbol(*args, **kwargs):
+        item = args[2]
+        calls.append(str(item.get('symbol')))
+        return [{'symbol': str(item.get('symbol')), 'strategy': 'sell_put', 'candidate_count': 0}]
+
+    cfg = {
+        'symbols': [
+            {'symbol': '0700.HK', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': True}},
+            {'symbol': '3690.HK', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': True}},
+        ],
+        'templates': {},
+        'runtime': {},
+    }
+
+    out = _pipeline(cfg, symbols_arg=' 0700.hk ', process_symbol_fn=_process_symbol)
+
+    assert calls == ['0700.HK']
+    assert len(out) == 1
+
+
+def test_watchlist_global_liquidity_excludes_underwriting_income_threshold() -> None:
+    seen: dict[str, dict] = {}
+
+    def _process_symbol(*args, **kwargs):
+        item = args[2]
+        seen['put'] = dict(item.get('_global_sell_put_liquidity') or {})
+        seen['call'] = dict(item.get('_global_sell_call_liquidity') or {})
+        return [{'symbol': str(item.get('symbol')), 'strategy': 'sell_put', 'candidate_count': 0}]
+
+    cfg = {
+        'symbols': [
+            {'symbol': '0700.HK', 'use': 'base_profile', 'sell_put': {'enabled': True}, 'sell_call': {'enabled': True}},
+        ],
+        'templates': {
+            'base_profile': {
+                'sell_put': {'min_net_income': 100, 'min_open_interest': 50},
+                'sell_call': {'min_net_income': 200, 'min_volume': 12},
+            }
+        },
+        'runtime': {},
+    }
+
+    _pipeline(cfg, process_symbol_fn=_process_symbol)
+
+    assert seen['put'] == {'min_open_interest': 50}
+    assert seen['call'] == {'min_volume': 12}
+
+
+def test_watchlist_passes_runtime_config_to_symbol_processor() -> None:
+    seen: list[dict] = []
+
+    def _process_symbol(*args, **kwargs):
+        seen.append(dict(kwargs.get("runtime_config") or {}))
+        item = args[2]
+        return [{"symbol": str(item.get("symbol")), "strategy": "sell_put", "candidate_count": 0}]
+
+    cfg = {
+        "symbols": [
+            {"symbol": "0700.HK", "sell_put": {"enabled": True}, "sell_call": {"enabled": False}},
+        ],
+        "templates": {},
+        "runtime": {"option_chain_fetch": {"max_calls": 7}},
+    }
+
+    _pipeline(cfg, process_symbol_fn=_process_symbol)
+
+    assert seen == [cfg]
+
+
+def test_watchlist_forwards_opening_candidate_decision_sink() -> None:
+    captured: list[dict] = []
+    observed_option_contexts: list[dict] = []
+    decision = {"opening_decision": {"accepted": False}}
+
+    def _process_symbol(*args, **kwargs):
+        observed_option_contexts.append(dict(kwargs["portfolio_ctx"]["option_ctx"]))
+        kwargs["candidate_decisions_sink_fn"]("put", [decision])
+        return [
+            {
+                "symbol": str(args[2]["symbol"]),
+                "strategy": "sell_put",
+                "candidate_count": 0,
+            }
+        ]
+
+    _pipeline(
+        {
+            "symbols": [
+                {
+                    "symbol": "NVDA",
+                    "sell_put": {"enabled": True},
+                    "sell_call": {"enabled": False},
+                }
+            ],
+            "templates": {},
+            "runtime": {},
+        },
+        process_symbol_fn=_process_symbol,
+        source_producer_run_id="run-1",
+        candidate_capture_status_sink_fn=lambda _row: None,
+        opening_candidate_decisions_sink_fn=(
+            lambda _mode, rows: captured.extend(rows)
+        ),
+    )
+
+    assert captured == [decision]
+    assert observed_option_contexts == [
+        {
+            "context_status": "unavailable",
+            "locked_shares_status": "unavailable",
+            "locked_shares_unavailable_reason": (
+                "option_positions_context_unavailable"
+            ),
+            "locked_shares_by_symbol": {},
+            "locked_shares_unavailable_by_symbol": {},
+            "cash_secured_by_symbol_by_ccy": {},
+            "cash_secured_total_by_ccy": {},
+            "cash_secured_unavailable_by_symbol": {},
+        }
+    ]
+
+
+def test_watchlist_fetch_stage_preserves_strategy_config_but_skips_scan_output() -> None:
+    seen: list[tuple[bool, bool, bool]] = []
+    summary_called: list[bool] = []
+
+    def _process_symbol(*args, **kwargs):
+        item = args[2]
+        seen.append(
+            (
+                bool((item.get("sell_put") or {}).get("enabled")),
+                bool((item.get("sell_call") or {}).get("enabled")),
+                bool(kwargs.get("fetch_only")),
+            )
+        )
+        return [{"symbol": str(item.get("symbol")), "strategy": "sell_put", "candidate_count": 1}]
+
+    def _build_ctx(**kwargs):
+        assert kwargs["want_scan"] is False
+        return ({}, None, None, None)
+
+    cfg = {
+        "symbols": [
+            {"symbol": "NVDA", "sell_put": {"enabled": True}, "sell_call": {"enabled": True}},
+        ],
+        "templates": {},
+        "runtime": {},
+    }
+
+    out = _pipeline(
+        cfg,
+        want_scan=False,
+        want_fn=lambda name: name == "fetch",
+        process_symbol_fn=_process_symbol,
+        build_pipeline_context_fn=_build_ctx,
+        build_symbols_summary_fn=lambda rows: summary_called.append(True),
+        build_symbols_digest_fn=lambda rows, n: summary_called.append(True),
+    )
+
+    assert out == []
+    assert seen == [(True, True, True)]
+    assert summary_called == []
+
+
+def test_resolve_watchlist_item_runtime_config_centralizes_template_expansion() -> None:
+    from src.application.pipeline_watchlist import resolve_watchlist_item_runtime_config
+
+    def _apply_profiles(item: dict, profiles: dict) -> dict:
+        out = dict(item)
+        for name in ([item.get('use')] if isinstance(item.get('use'), str) else item.get('use') or []):
+            prof = profiles.get(name) or {}
+            for key, value in prof.items():
+                if isinstance(value, dict) and isinstance(out.get(key), dict):
+                    merged = dict(value)
+                    merged.update(out.get(key) or {})
+                    out[key] = merged
+                else:
+                    out.setdefault(key, value)
+        return out
+
+    profiles = {
+        'put_base': {
+            'sell_put': {
+                'min_annualized_net_return': 0.12,
+                'min_net_income': 100,
+                'min_open_interest': 50,
+            }
+        },
+        'call_base': {
+            'sell_call': {
+                'min_annualized_net_return': 0.11,
+                'min_volume': 12,
+                'min_strike_cost_multiplier': 1.02,
+            }
+        },
+    }
+    item = {
+        'symbol': '0700.HK',
+        'use': ['put_base', 'call_base'],
+        'sell_put': {'enabled': True, 'min_dte': 20},
+        'sell_call': {'enabled': True},
+    }
+
+    resolved = resolve_watchlist_item_runtime_config(
+        item=item,
+        profiles=profiles,
+        apply_profiles_fn=_apply_profiles,
+    )
+
+    assert resolved['sell_put']['enabled'] is True
+    assert resolved['sell_put']['min_dte'] == 20
+    assert resolved['sell_put']['min_annualized_net_return'] == 0.12
+    assert resolved['sell_call']['enabled'] is True
+    assert resolved['sell_call']['min_annualized_net_premium_return'] == 0.11
+    assert resolved['sell_call']['min_strike_cost_multiplier'] == 1.02
+    assert 'min_annualized_net_return' not in resolved['sell_call']
+    assert resolved['_global_sell_put_liquidity'] == {'min_open_interest': 50}
+    assert resolved['_global_sell_call_liquidity'] == {'min_volume': 12}
+
+
+def test_resolve_watchlist_item_runtime_config_revalidates_merged_dte_window() -> None:
+    import pytest
+
+    from src.application.pipeline_watchlist import resolve_watchlist_item_runtime_config
+
+    def _apply_profiles(item: dict, profiles: dict) -> dict:
+        merged = dict(profiles["put_base"])
+        merged["sell_put"] = {**merged["sell_put"], **item["sell_put"]}
+        return {**item, **merged}
+
+    with pytest.raises(SystemExit, match="min_dte > .*max_dte"):
+        resolve_watchlist_item_runtime_config(
+            item={
+                "symbol": "NVDA",
+                "use": ["put_base"],
+                "sell_put": {"enabled": True, "max_dte": 30},
+            },
+            profiles={"put_base": {"sell_put": {"min_dte": 60}}},
+            apply_profiles_fn=_apply_profiles,
+        )
+
+
+def test_resolve_watchlist_item_runtime_config_rejects_retired_combo_yield_key() -> None:
+    from src.application.pipeline_watchlist import resolve_watchlist_item_runtime_config
+
+    item = {
+        "symbol": "NVDA",
+        "combo_yield": {"enabled": False},
+        "yield_enhancement": {"enabled": True},
+    }
+
+    with pytest.raises(SystemExit, match="yield_enhancement has been removed"):
+        resolve_watchlist_item_runtime_config(
+            item=item,
+            profiles={},
+            apply_profiles_fn=lambda value, _profiles: dict(value),
+        )

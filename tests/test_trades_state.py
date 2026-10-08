@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import json
+import multiprocessing
+from pathlib import Path
+
+import pytest
+
+from src.application.ledger.api import build_lifecycle_attempt_run_seal
+from src.application.trades import state as state_module
+from src.application.trades.state import (
+    append_lifecycle_attempt_checkpoint_seal,
+    append_trade_intake_audit,
+    is_failed_deal,
+    is_retryable_unresolved_deal,
+    load_trade_intake_state,
+    lookup_deal_state_entry,
+    lookup_deal_state,
+    read_latest_lifecycle_attempt_run_seal,
+    upsert_deal_state,
+    write_trade_intake_state,
+)
+
+
+def _seal(**overrides: object) -> dict:
+    """Build the lifecycle attempt run seal literal this module repeats."""
+    base = {
+        "account": "lx",
+        "source_id": "source-a",
+        "completed_at_ms": 1,
+        "heads": [],
+        "seal_scope": "all_heads_checkpoint",
+        "reason": "process_startup",
+    }
+    base.update(overrides)
+    return build_lifecycle_attempt_run_seal(**base)
+
+
+_REPAIRED_AUDIT_LINES = ['{"phase":"complete"}', '{"phase": "sealed"}']
+
+
+def _applied_open_payload() -> dict:
+    """The processed 'applied' deal payload these cases repeat."""
+    return {"status": "applied", "action": "open", "account": "lx"}
+
+
+def _retryable_unresolved_payload() -> dict:
+    """The retryable 'unresolved' deal payload these cases repeat."""
+    return {"status": "unresolved", "retryable": True, "attempt_count": 1}
+
+
+def _append_audit_rows(path: str, *, durable: bool, count: int) -> None:
+    for index in range(count):
+        payload = (
+            _seal(completed_at_ms=index + 1)
+            if durable
+            else {"phase": "ordinary", "index": index}
+        )
+        append_trade_intake_audit(path, payload, durable=durable)
+
+
+def test_trade_intake_state_round_trip(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.json"
+    state = upsert_deal_state(
+        {}, bucket="processed_deal_ids", deal_id="deal-1",
+        payload=_applied_open_payload(),
+    )
+    write_trade_intake_state(state_path, state)
+
+    loaded = load_trade_intake_state(state_path)
+
+    assert lookup_deal_state(loaded, "deal-1")["status"] == "applied"
+    assert lookup_deal_state_entry(loaded, "deal-1")[0] == "processed_deal_ids"
+
+
+def test_reconciliation_preserves_same_key_changes_and_counts_only_applied(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    observed = state_module.empty_trade_intake_state()
+    for key in ("unchanged", "changed", "moved", "deleted"):
+        observed = upsert_deal_state(
+            observed, bucket="unresolved_deal_ids", deal_id=key,
+            payload={"status": "unresolved", "attempt_count": 1},
+        )
+    desired = observed
+    for key in ("unchanged", "changed", "moved", "deleted"):
+        desired = upsert_deal_state(
+            desired, bucket="processed_deal_ids", deal_id=key,
+            payload={"status": "reconciled"},
+        )
+    latest = upsert_deal_state(
+        observed, bucket="unresolved_deal_ids", deal_id="changed",
+        payload={"status": "unresolved", "attempt_count": 2},
+    )
+    latest = upsert_deal_state(
+        latest, bucket="failed_deal_ids", deal_id="moved",
+        payload=observed["unresolved_deal_ids"]["moved"],
+    )
+    latest["unresolved_deal_ids"].pop("deleted")
+    latest = upsert_deal_state(
+        latest, bucket="unresolved_deal_ids", deal_id="new",
+        payload={"status": "unresolved", "reason": "new_evidence"},
+    )
+    write_trade_intake_state(path, latest)
+
+    applied = state_module.compare_and_update_trade_intake_state_entries(
+        path, desired, deal_ids=("unchanged", "changed", "moved", "deleted"),
+        expected_state=observed,
+    )
+
+    assert applied == ("unchanged",)
+    actual = load_trade_intake_state(path)
+    assert actual == upsert_deal_state(
+        latest, bucket="processed_deal_ids", deal_id="unchanged",
+        payload=desired["processed_deal_ids"]["unchanged"],
+    )
+    before = path.read_bytes()
+    assert state_module.compare_and_update_trade_intake_state_entries(
+        path, desired, deal_ids=("unchanged", "changed"), expected_state=observed,
+    ) == ()
+    assert path.read_bytes() == before
+
+
+def test_trade_intake_audit_appends_jsonl(tmp_path: Path) -> None:
+    path = tmp_path / "audit.jsonl"
+    append_trade_intake_audit(path, {"phase": "received", "deal_id": "deal-1"})
+    append_trade_intake_audit(path, {"phase": "resolved", "deal_id": "deal-1"})
+
+    lines = path.read_text(encoding="utf-8").strip().splitlines()
+
+    assert len(lines) == 2
+    assert '"phase": "received"' in lines[0]
+
+
+def test_durable_trade_intake_audit_repairs_only_torn_tail_and_fsyncs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    complete = b'{"phase":"complete"}\n'
+    path.write_bytes(complete + b"x" * 1_000)
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(state_module.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+
+    append_trade_intake_audit(path, {"phase": "sealed"}, durable=True)
+
+    assert path.read_bytes().startswith(complete)
+    assert path.read_text(encoding="utf-8").splitlines() == _REPAIRED_AUDIT_LINES
+    assert len(fsync_calls) == 1
+
+
+def test_trade_intake_audit_repairs_large_torn_tail_and_refuses_non_durable_tail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    original = b'{"phase":"complete"}\n' + b"x" * 70_000
+    path.write_bytes(original)
+
+    append_trade_intake_audit(path, {"phase": "sealed"}, durable=True)
+    assert path.read_text(encoding="utf-8").splitlines() == _REPAIRED_AUDIT_LINES
+
+    path.write_bytes(b"x" * 70_000)
+    append_trade_intake_audit(path, {"phase": "sealed"}, durable=True)
+    assert path.read_text(encoding="utf-8") == '{"phase": "sealed"}\n'
+
+    path.write_bytes(b'{"phase":"torn"}')
+    with pytest.raises(OSError, match="unterminated tail"):
+        append_trade_intake_audit(path, {"phase": "ordinary"})
+    assert path.read_bytes() == b'{"phase":"torn"}'
+
+
+def test_ordinary_trade_intake_audit_does_not_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fsync_calls: list[int] = []
+    monkeypatch.setattr(state_module.os, "fsync", lambda descriptor: fsync_calls.append(descriptor))
+
+    append_trade_intake_audit(tmp_path / "audit.jsonl", {"phase": "ordinary"})
+
+    assert fsync_calls == []
+
+
+def test_trade_intake_seal_reader_is_strict_and_tolerates_only_torn_eof(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    seal = _seal()
+    append_trade_intake_audit(path, {"phase": "ordinary"})
+    append_trade_intake_audit(path, seal)
+    with path.open("ab") as handle:
+        handle.write(b'{"torn":')
+
+    result = read_latest_lifecycle_attempt_run_seal(
+        path,
+        account="lx",
+        source_id="source-a",
+    )
+
+    assert result == {
+        "schema_version": "trade_lifecycle_attempt_run_seal_reader.v1",
+        "seal_count": 1,
+        "last_seal": seal,
+        "torn_tail_ignored": True,
+    }
+
+    path.write_bytes(b"not-json\n")
+    with pytest.raises(ValueError, match="malformed trade intake audit line 1"):
+        read_latest_lifecycle_attempt_run_seal(path)
+
+    path.write_bytes(b'{}')
+    with pytest.raises(ValueError, match="unterminated trade intake audit line 1"):
+        read_latest_lifecycle_attempt_run_seal(path)
+
+    invalid_seal = {**seal, "seal_sha256": "0" * 64}
+    path.write_text(json.dumps(invalid_seal) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="run seal hash mismatch"):
+        read_latest_lifecycle_attempt_run_seal(path)
+
+
+def test_checkpoint_helper_reads_account_heads_and_appends_durably(
+    tmp_path: Path,
+) -> None:
+    class Repo:
+        def list_trade_lifecycle_attempt_audit_heads_for_account(
+            self,
+            *,
+            account: str,
+        ) -> list[dict]:
+            assert account == "lx"
+            return []
+
+    path = tmp_path / "audit.jsonl"
+    seal = append_lifecycle_attempt_checkpoint_seal(
+        path,
+        Repo(),
+        account="lx",
+        source_id="source-a",
+        completed_at_ms=1,
+        reason="cli_apply",
+    )
+
+    result = read_latest_lifecycle_attempt_run_seal(path)
+    assert result["last_seal"] == seal
+    assert seal["reason"] == "cli_apply"
+
+
+def test_concurrent_ordinary_and_durable_audit_appends_are_complete(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "audit.jsonl"
+    context = multiprocessing.get_context("fork")
+    processes = [
+        context.Process(
+            target=_append_audit_rows,
+            args=(str(path),),
+            kwargs={"durable": False, "count": 50},
+        ),
+        context.Process(
+            target=_append_audit_rows,
+            args=(str(path),),
+            kwargs={"durable": True, "count": 10},
+        ),
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(10)
+        assert process.exitcode == 0
+
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    assert len(raw.splitlines()) == 60
+    assert all(isinstance(json.loads(line), dict) for line in raw.splitlines())
+    result = read_latest_lifecycle_attempt_run_seal(path)
+    assert result["seal_count"] == 10
+    assert result["torn_tail_ignored"] is False
+
+
+def test_trade_audit_rotation_preserves_seal_history(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from domain.storage import json_io
+
+    path = tmp_path / "audit.jsonl"
+    first = _seal(completed_at_ms=1)
+    second = _seal(completed_at_ms=2)
+    monkeypatch.setattr(json_io, "AUDIT_SEGMENT_BYTES", max(
+        len((json.dumps(item, ensure_ascii=False) + "\n").encode("utf-8"))
+        for item in (first, second)
+    ) + 1)
+    append_trade_intake_audit(path, first, durable=True)
+    append_trade_intake_audit(path, second, durable=True)
+
+    segments = list(tmp_path.glob("audit.????????.??????.jsonl"))
+    assert len(segments) == 1
+    assert segments[0].stat().st_mode & 0o777 == 0o600
+    result = read_latest_lifecycle_attempt_run_seal(path)
+    assert result["seal_count"] == 2
+    assert result["last_seal"] == second
+
+
+def test_retryable_unresolved_state_is_distinguishable_from_terminal_state() -> None:
+    state = upsert_deal_state(
+        {}, bucket="unresolved_deal_ids", deal_id="deal-retry-1",
+        payload=_retryable_unresolved_payload(),
+    )
+    terminal = upsert_deal_state(
+        state, bucket="processed_deal_ids", deal_id="deal-done-1",
+        payload=_applied_open_payload(),
+    )
+
+    assert is_retryable_unresolved_deal(terminal, "deal-retry-1") is True
+    assert lookup_deal_state_entry(terminal, "deal-retry-1")[0] == "unresolved_deal_ids"
+    assert is_retryable_unresolved_deal(terminal, "deal-done-1") is False
+
+
+def test_failed_deal_state_is_distinguishable_from_processed_state() -> None:
+    state = upsert_deal_state(
+        {}, bucket="failed_deal_ids", deal_id="deal-failed-1",
+        payload={"status": "failed", "action": "close", "account": "lx"},
+    )
+    state = upsert_deal_state(
+        state, bucket="processed_deal_ids", deal_id="deal-done-1",
+        payload=_applied_open_payload(),
+    )
+
+    assert is_failed_deal(state, "deal-failed-1") is True
+    assert is_failed_deal(state, "deal-done-1") is False
+
+
+def test_upsert_deal_state_moves_deal_between_buckets() -> None:
+    state = upsert_deal_state(
+        {}, bucket="unresolved_deal_ids", deal_id="deal-retry-1",
+        payload=_retryable_unresolved_payload(),
+    )
+    state = upsert_deal_state(
+        state, bucket="processed_deal_ids", deal_id="deal-retry-1",
+        payload=_applied_open_payload(),
+    )
+
+    assert lookup_deal_state_entry(state, "deal-retry-1")[0] == "processed_deal_ids"
+    assert "deal-retry-1" not in state["unresolved_deal_ids"]
+    assert is_retryable_unresolved_deal(state, "deal-retry-1") is False

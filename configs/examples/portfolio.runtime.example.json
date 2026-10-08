@@ -1,0 +1,8 @@
+{
+  "feishu": {
+    "app_id_env": "OM_FEISHU_APP_ID",
+    "tables": {
+      "holdings_env": "OM_FEISHU_HOLDINGS_TABLE"
+    }
+  }
+}

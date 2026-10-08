@@ -1,0 +1,2751 @@
+from __future__ import annotations
+
+import json
+import os
+import plistlib
+import re
+import shlex
+import subprocess
+import time
+from dataclasses import dataclass
+from json import JSONDecodeError
+from pathlib import Path
+from typing import Any, Callable, Literal, cast
+
+from src.application.account_config import (
+    accounts_from_config,
+    build_account_runtime_plan,
+)
+from src.application.config_yaml import (
+    load_yaml_config_file,
+    resolve_yaml_bot_config,
+    resolve_yaml_runtime_config,
+)
+from src.application.bot.control.settings import BotSettings
+from src.application.platform_profile import default_runtime_root_for_service_target
+from src.application.secret_store import (
+    FEISHU_BOT_APP_SECRET,
+    FEISHU_HOLDINGS_APP_SECRET,
+    INBOUND_OPERATION_HMAC_KEY,
+    credential_spec,
+    legacy_secret_env_names,
+)
+from src.application.settings import build_effective_env
+from src.application.payload_helpers import first_text as _first_text
+
+
+ServiceTarget = Literal["systemd", "launchd"]
+ServiceProvider = Literal["systemd", "launchd", "manual"]
+SecretCredentialDelivery = Literal["load-credential-encrypted", "runtime-files"]
+
+_MARKET_TIMER_RE = re.compile(
+    r"^options-monitor-(?:tick|auto-close|quality-day-end)-(us|hk)\.timer$"
+)
+_SHARED_TIMER_NAMES = frozenset(
+    {
+        "options-monitor-projection-verify.timer",
+        "options-monitor-quality-recheck.timer",
+        "options-monitor-quality-refresh.timer",
+        "options-monitor-runtime-status.timer",
+        "options-monitor-trade-intake-heartbeat.timer",
+        "options-monitor-upgrade.timer",
+    }
+)
+
+DEFAULT_MARKETS: tuple[str, ...] = ("us", "hk")
+DEFAULT_ACCOUNTS: tuple[str, ...] = ("lx", "sy")
+DEFAULT_TIMEOUT_SECONDS = 600
+US_TICK_SYSTEMD_CALENDAR = "Mon..Fri *-*-* 09..16:00/10:00 America/New_York"
+HK_TICK_SYSTEMD_CALENDAR = "Mon..Fri *-*-* 09..16:00/10:00 Asia/Hong_Kong"
+AUTO_CLOSE_SYSTEMD_CALENDARS = {
+    "hk": "*-*-* 09:05:00 Asia/Shanghai",
+    "us": "*-*-* 09:07:00 Asia/Shanghai",
+}
+AUTO_CLOSE_LAUNCHD_CALENDARS = {
+    "hk": {"Hour": 9, "Minute": 5},
+    "us": {"Hour": 9, "Minute": 7},
+}
+PROJECTION_VERIFY_SYSTEMD_CALENDAR = "*-*-* 09:30:00 Asia/Shanghai"
+PROJECTION_VERIFY_LAUNCHD_CALENDAR = {"Hour": 9, "Minute": 30}
+AUTO_UPGRADE_SYSTEMD_CALENDAR = "*-*-* 06:10:00 Asia/Shanghai"
+AUTO_UPGRADE_LAUNCHD_CALENDAR = {"Hour": 6, "Minute": 10}
+DEFAULT_OPEND_EXECUTABLE = "FutuOpenD"
+QUALITY_REFRESH_INTERVAL_SYSTEMD = "15min"
+QUALITY_RECHECK_INTERVAL_SYSTEMD = "1min"
+QUALITY_DAY_END_SYSTEMD_CALENDARS = {
+    "us": "Mon..Fri *-*-* 16:30:00 America/New_York",
+    "hk": "Mon..Fri *-*-* 16:30:00 Asia/Hong_Kong",
+}
+FEISHU_AGENT_CREDENTIAL_SERVICE = "options-monitor-feishu-agent-credential.service"
+FEISHU_AGENT_CREDENTIAL_DROPIN = "zzzz-feishu-agent-credential.conf"
+SECRET_CREDENTIAL_DROPIN = "zzzz-secret-credentials.conf"
+DEFAULT_SECRET_CREDENTIAL_STORE_ROOT = Path("/etc/credstore.encrypted")
+DEFAULT_SECRET_CREDENTIAL_DELIVERY: SecretCredentialDelivery = "load-credential-encrypted"
+DEFAULT_SECRET_CREDENTIAL_HELPER = Path(
+    "/usr/local/libexec/options-monitor-materialize-service-credentials"
+)
+DEFAULT_SECRET_CREDENTIAL_RUNTIME_ROOT = Path("/run/options-monitor/credentials")
+_RUNTIME_CREDENTIAL_USER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+DEFAULT_FEISHU_AGENT_CREDENTIAL_HELPER = Path(
+    "/usr/local/libexec/options-monitor-materialize-feishu-agent-credential"
+)
+DEFAULT_FEISHU_AGENT_CREDENTIAL_STORE = Path(
+    "/etc/credstore.encrypted/pm-feishu-agent-app-secret"
+)
+DEFAULT_FEISHU_HOLDINGS_CREDENTIAL_STORE = Path(
+    "/etc/credstore.encrypted/om-feishu-holdings-app-secret"
+)
+DEFAULT_FEISHU_AGENT_CREDENTIAL_ENV_FILE = Path(
+    "/run/credentials/options-monitor-feishu-agent.env"
+)
+SYSTEMD_SERVICE_ASSET_ROOT = Path(__file__).resolve().parents[2] / "services" / "systemd"
+
+
+@dataclass(frozen=True)
+class RenderedServiceFile:
+    relative_path: str
+    content: str
+    install_path: str
+    kind: str
+    mode: int | None = None
+    owner_uid: int | None = None
+    owner_gid: int | None = None
+
+    def to_dict(self, *, include_content: bool = True) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "relative_path": self.relative_path,
+            "install_path": self.install_path,
+            "kind": self.kind,
+        }
+        if self.mode is not None:
+            out["mode"] = self.mode
+        if self.owner_uid is not None:
+            out["owner_uid"] = self.owner_uid
+        if self.owner_gid is not None:
+            out["owner_gid"] = self.owner_gid
+        if include_content:
+            out["content"] = self.content
+        return out
+
+
+@dataclass(frozen=True)
+class OpendServicePlan:
+    account: str | None
+    systemd_service_name: str
+    launchd_label: str
+    root: Path
+    executable: Path
+    host: str | None = None
+    port: int | None = None
+
+
+def normalize_target(value: str) -> ServiceTarget:
+    out = str(value or "").strip().lower()
+    if out not in {"systemd", "launchd"}:
+        raise ValueError(f"unsupported service target: {value}")
+    return cast(ServiceTarget, out)
+
+
+def normalize_secret_credential_delivery(value: str | None) -> SecretCredentialDelivery:
+    delivery = str(value or DEFAULT_SECRET_CREDENTIAL_DELIVERY).strip().lower()
+    if delivery not in {"load-credential-encrypted", "runtime-files"}:
+        raise ValueError(
+            "secret credential delivery must be load-credential-encrypted or runtime-files"
+        )
+    return cast(SecretCredentialDelivery, delivery)
+
+
+def _validate_secret_credential_store_root(store_root: Path) -> None:
+    if not store_root.is_absolute() or ".." in store_root.parts:
+        raise ValueError("secret credential store root must be an absolute normalized path")
+    store_text = str(store_root)
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in store_text):
+        raise ValueError("secret credential store root contains control characters")
+    if "$" in store_text or "%" in store_text:
+        raise ValueError("secret credential store root contains systemd expansion syntax")
+
+
+def _validate_runtime_credential_exec_inputs(
+    *,
+    deploy_user: str,
+    store_root: Path,
+) -> None:
+    if not _RUNTIME_CREDENTIAL_USER_PATTERN.fullmatch(deploy_user):
+        raise ValueError("runtime credential deploy user is not a safe system account name")
+    _validate_secret_credential_store_root(store_root)
+
+
+def normalize_markets(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    raw_values = values or DEFAULT_MARKETS
+    out: list[str] = []
+    for raw in raw_values:
+        market = str(raw or "").strip().lower()
+        if not market:
+            continue
+        if market not in {"us", "hk"}:
+            raise ValueError(f"unsupported market: {raw}")
+        if market not in out:
+            out.append(market)
+    return out or list(DEFAULT_MARKETS)
+
+
+def normalize_accounts(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    raw_values = values or DEFAULT_ACCOUNTS
+    out: list[str] = []
+    for raw in raw_values:
+        account = str(raw or "").strip()
+        if account and account not in out:
+            out.append(account)
+    return out or list(DEFAULT_ACCOUNTS)
+
+
+def _resolve_feishu_ws_config_key(
+    value: str | None,
+    *,
+    markets: list[str],
+    include_feishu_ws: bool,
+) -> str | None:
+    if not include_feishu_ws:
+        return None
+    key = str(value or "").strip().lower()
+    if key:
+        if key not in {"us", "hk"}:
+            raise ValueError("feishu_ws_config_key must be us or hk")
+        return key
+    market_values = [market for market in markets if market in {"us", "hk"}]
+    if len(market_values) == 1:
+        return market_values[0]
+    raise ValueError("feishu_ws_config_key is required when rendering Feishu WS for multiple markets")
+
+
+def _resolve_wechat_clawbot_config_key(
+    value: str | None,
+    *,
+    markets: list[str],
+    include_wechat_clawbot: bool,
+) -> str | None:
+    if not include_wechat_clawbot:
+        return None
+    key = str(value or "").strip().lower()
+    if key:
+        if key not in {"us", "hk"}:
+            raise ValueError("wechat_clawbot_config_key must be us or hk")
+        return key
+    market_values = [market for market in markets if market in {"us", "hk"}]
+    if len(market_values) == 1:
+        return market_values[0]
+    raise ValueError("wechat_clawbot_config_key is required when rendering WeChat ClawBot for multiple markets")
+
+
+def _wechat_clawbot_inbound_config_from_yaml(*, repo_root: Path, config_yaml_path: Path | None) -> dict[str, Any]:
+    if config_yaml_path is None:
+        return {}
+    bot_cfg, _meta = resolve_yaml_bot_config(repo_root=repo_root, config_path=config_yaml_path)
+    inbound = bot_cfg.get("inbound")
+    if not isinstance(inbound, dict):
+        return {}
+    wechat_clawbot = inbound.get("wechat_clawbot")
+    return dict(wechat_clawbot) if isinstance(wechat_clawbot, dict) else {}
+
+
+def default_runtime_root(target: ServiceTarget, *, home: Path | None = None) -> Path:
+    return default_runtime_root_for_service_target(target, home=home)
+
+
+def default_systemd_deploy_user() -> str:
+    env = build_effective_env().values
+    return str(env.get("OM_DEPLOY_USER") or env.get("DEPLOY_USER") or "").strip()
+
+
+def default_systemd_deploy_home(deploy_user: str) -> Path:
+    user = str(deploy_user or "").strip()
+    if user == "root":
+        return Path("/root")
+    return Path("/home") / user
+
+
+def default_opend_root(*, deploy_home: Path | None = None) -> Path:
+    return (deploy_home or Path.home()) / "apps" / "futu-opend" / "current"
+
+
+def _service_slug(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    slug = "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else "-" for ch in raw).strip("-")
+    return slug or "account"
+
+
+def _resolve_path(value: str | Path | None, *, base: Path, default: Path) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        return default.resolve()
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    return path
+
+
+def _absolute_path_preserve_symlink(value: str | Path, *, base: Path | None = None) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (base or Path.cwd()) / path
+
+
+def _read_json_config(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except JSONDecodeError as exc:
+        raise ValueError(f"failed to parse service config JSON: {path}:{exc.lineno}:{exc.colno}") from exc
+    except Exception as exc:
+        raise ValueError(f"failed to read service config JSON: {path}: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"service config JSON must be an object: {path}")
+    return data if isinstance(data, dict) else {}
+
+
+def _first_existing_config(config_by_market: dict[str, Path], market_values: list[str]) -> dict[str, Any]:
+    for market in market_values:
+        path = config_by_market.get(market)
+        if path is not None and path.exists():
+            cfg = _read_json_config(path)
+            if cfg:
+                return cfg
+    return {}
+
+
+def _first_yaml_runtime_config(*, repo_root: Path, config_yaml_path: Path, market_values: list[str]) -> dict[str, Any]:
+    for market in market_values:
+        cfg, _meta = resolve_yaml_runtime_config(
+            repo_root=repo_root,
+            market=market,
+            config_path=config_yaml_path,
+        )
+        if cfg:
+            return cfg
+    return {}
+
+
+def _opend_service_plans_from_authoring_config(
+    *,
+    repo_root: Path,
+    config_yaml_path: Path | None,
+    config_by_market: dict[str, Path],
+    market_values: list[str],
+    accounts: list[str],
+    executable: str | Path,
+) -> list[OpendServicePlan]:
+    config = (
+        _first_yaml_runtime_config(repo_root=repo_root, config_yaml_path=config_yaml_path, market_values=market_values)
+        if config_yaml_path is not None
+        else _first_existing_config(config_by_market, market_values)
+    )
+    return _opend_service_plans_from_config(
+        config=config,
+        repo_root=repo_root,
+        accounts=accounts,
+        executable=executable,
+    )
+
+
+def _opend_executable_path(root: Path, executable: str | Path) -> Path:
+    raw = Path(str(executable or DEFAULT_OPEND_EXECUTABLE).strip() or DEFAULT_OPEND_EXECUTABLE).expanduser()
+    return raw if raw.is_absolute() else root / raw
+
+
+def _opend_service_plans_from_config(
+    *,
+    config: dict[str, Any],
+    repo_root: Path,
+    accounts: list[str],
+    executable: str | Path,
+) -> list[OpendServicePlan]:
+    candidates: list[tuple[str, Path, str | None, int | None]] = []
+    for account in accounts:
+        runtime_plan = build_account_runtime_plan(config, account=account)
+        if runtime_plan.account_type != "futu":
+            continue
+        if not runtime_plan.futu_opend_root:
+            continue
+        candidates.append((runtime_plan.account, _absolute_path_preserve_symlink(runtime_plan.futu_opend_root, base=repo_root),
+                           runtime_plan.futu_host, runtime_plan.futu_port))
+
+    if not candidates:
+        return []
+
+    multi = len(candidates) > 1
+    plans: list[OpendServicePlan] = []
+    for account, root, host, port in candidates:
+        slug = _service_slug(account)
+        systemd_name = f"options-monitor-opend-{slug}.service" if multi else "options-monitor-opend.service"
+        launchd_label = f"com.options-monitor.opend.{slug}" if multi else "com.options-monitor.opend"
+        plans.append(
+            OpendServicePlan(
+                account=account,
+                systemd_service_name=systemd_name,
+                launchd_label=launchd_label,
+                root=root,
+                executable=_opend_executable_path(root, executable),
+                host=host,
+                port=port,
+            )
+        )
+    return plans
+
+
+def _legacy_opend_service_plan(*, root: Path, executable: str | Path) -> OpendServicePlan:
+    return OpendServicePlan(
+        account=None,
+        systemd_service_name="options-monitor-opend.service",
+        launchd_label="com.options-monitor.opend",
+        root=root,
+        executable=_opend_executable_path(root, executable),
+    )
+
+
+def _opend_profile(target: ServiceTarget, plans: list[OpendServicePlan]) -> dict[str, Any] | None:
+    if not plans:
+        return None
+    services = [
+        {
+            **({"account": item.account} if item.account else {}),
+            "root": str(item.root),
+            "executable": str(item.executable),
+            "service_name": item.systemd_service_name if target == "systemd" else item.launchd_label,
+            **({"host": item.host, "port": item.port} if item.host and item.port else {}),
+        }
+        for item in plans
+    ]
+    profile: dict[str, Any] = {
+        "enabled": True,
+        "services": services,
+    }
+    if len(services) == 1:
+        profile.update({
+            "root": services[0]["root"],
+            "executable": services[0]["executable"],
+            "service_name": services[0]["service_name"],
+        })
+    return profile
+
+
+def _runtime_configs_by_market(
+    *,
+    repo_root: Path,
+    config_yaml_path: Path | None,
+    config_by_market: dict[str, Path],
+    market_values: list[str],
+) -> dict[str, dict[str, Any]]:
+    configs: dict[str, dict[str, Any]] = {}
+    for market in market_values:
+        if config_yaml_path is not None:
+            config, _meta = resolve_yaml_runtime_config(
+                repo_root=repo_root,
+                market=market,
+                config_path=config_yaml_path,
+            )
+        else:
+            config_path = config_by_market.get(market)
+            if config_path is None or not config_path.exists():
+                raise ValueError(f"runtime config is missing for market: {market}")
+            config = _read_json_config(config_path)
+        configs[market] = config
+    return configs
+
+
+def _resolve_service_account_scopes(
+    *,
+    repo_root: Path,
+    config_yaml_path: Path | None,
+    config_by_market: dict[str, Path],
+    market_values: list[str],
+    accounts: list[str] | tuple[str, ...] | None,
+) -> tuple[list[str], dict[str, list[str]]]:
+    selected = normalize_accounts(accounts)
+    has_runtime_configs = all(config_by_market[market].exists() for market in market_values)
+    if config_yaml_path is not None:
+        if not config_yaml_path.exists():
+            return selected, {market: list(selected) for market in market_values}
+        raw_yaml = load_yaml_config_file(config_yaml_path)
+        raw_markets = raw_yaml.get("markets")
+        if not isinstance(raw_markets, dict) or any(market not in raw_markets for market in market_values):
+            return selected, {market: list(selected) for market in market_values}
+    if config_yaml_path is None and not has_runtime_configs:
+        return selected, {market: list(selected) for market in market_values}
+
+    configs = _runtime_configs_by_market(
+        repo_root=repo_root,
+        config_yaml_path=config_yaml_path,
+        config_by_market=config_by_market,
+        market_values=market_values,
+    )
+    configured = {
+        market: accounts_from_config(configs[market], fallback=())
+        for market in market_values
+    }
+
+    configured_union = list(dict.fromkeys(
+        account
+        for market in market_values
+        for account in configured[market]
+    ))
+    if accounts is None:
+        selected = configured_union
+
+    by_market = {
+        market: [account for account in selected if account in configured[market]]
+        for market in market_values
+    }
+    empty_markets = [market for market, values in by_market.items() if not values]
+    if empty_markets:
+        raise ValueError(f"selected account scope is empty for markets: {', '.join(empty_markets)}")
+    return selected, by_market
+
+
+def _config_path_for_market(
+    market: str,
+    *,
+    repo_root: Path,
+    runtime_root: Path | None = None,
+    config_paths: dict[str, str | Path] | None,
+) -> Path:
+    configured = (config_paths or {}).get(market)
+    default_root = runtime_root or repo_root
+    default = default_root / f"config.{market}.json"
+    if configured is None or str(configured).strip() == "":
+        return default
+    return _absolute_path_preserve_symlink(configured, base=repo_root)
+
+
+def _systemd_quote_arg(value: str | Path) -> str:
+    text = str(value)
+    if not text:
+        return '""'
+    if any(ch.isspace() for ch in text) or any(ch in text for ch in ('"', "'", "\\", ";")):
+        return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return text
+
+
+def _systemd_join_args(args: list[str]) -> str:
+    return " ".join(_systemd_quote_arg(arg) for arg in args)
+
+
+def _systemd_environment_assignment(name: str, value: str | Path) -> str:
+    escaped = f"{name}={value}".replace("\\", "\\\\").replace('"', '\\"')
+    return f'Environment="{escaped}"'
+
+
+def _systemd_environment_file(path: Path) -> str:
+    return f"EnvironmentFile={_systemd_quote_arg(path)}"
+
+
+def _read_systemd_service_asset(name: str) -> str:
+    path = SYSTEMD_SERVICE_ASSET_ROOT / name
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"systemd service asset is unavailable: {path}") from exc
+
+
+def _render_systemd_service_asset(name: str, replacements: dict[str, str]) -> str:
+    content = _read_systemd_service_asset(name)
+    for key, value in replacements.items():
+        token = "{{" + key + "}}"
+        if token not in content:
+            raise ValueError(f"systemd service asset token is missing: {name}:{key}")
+        content = content.replace(token, value)
+    if "{{" in content or "}}" in content:
+        raise ValueError(f"systemd service asset has unresolved tokens: {name}")
+    return content
+
+
+def _bot_credential_name(
+    *, repo_root: Path, config_yaml_path: Path | None
+) -> str | None:
+    if config_yaml_path is None:
+        return None
+    cfg, _meta = resolve_yaml_bot_config(
+        repo_root=repo_root,
+        config_path=config_yaml_path,
+    )
+    settings = BotSettings.from_runtime_config(cfg)
+    return settings.llm.credential_name or None
+
+
+def _systemd_secret_bindings(
+    *,
+    service_names: list[str],
+    bot_credential_name: str | None,
+    feature_configs: dict[str, dict[str, Any]] | None = None,
+    inbound_operations_enabled: bool = False,
+) -> dict[str, tuple[str, ...]]:
+    available = set(service_names)
+    bindings: dict[str, list[str]] = {}
+
+    def bind(service_name: str, *logical_names: str | None) -> None:
+        if service_name not in available:
+            return
+        bucket = bindings.setdefault(service_name, [])
+        for logical_name in logical_names:
+            if logical_name and logical_name not in bucket:
+                bucket.append(logical_name)
+
+    for service_name in sorted(available):
+        if service_name.startswith("options-monitor-tick-") and service_name.endswith(".service"):
+            bind(service_name, FEISHU_HOLDINGS_APP_SECRET, FEISHU_BOT_APP_SECRET)
+        elif service_name.startswith("options-monitor-auto-close-") and service_name.endswith(".service"):
+            bind(service_name, FEISHU_BOT_APP_SECRET)
+
+    bind("options-monitor-trade-intake.service", FEISHU_BOT_APP_SECRET)
+    bind("options-monitor-trade-intake-alert.service", FEISHU_BOT_APP_SECRET)
+    bind("options-monitor-trade-intake-heartbeat.service", FEISHU_BOT_APP_SECRET)
+    bind(
+        "options-monitor-feishu-ws.service",
+        FEISHU_BOT_APP_SECRET,
+        FEISHU_HOLDINGS_APP_SECRET,
+        INBOUND_OPERATION_HMAC_KEY,
+        bot_credential_name,
+    )
+    bind(
+        "options-monitor-wechat-clawbot.service",
+        FEISHU_HOLDINGS_APP_SECRET,
+        INBOUND_OPERATION_HMAC_KEY,
+        bot_credential_name,
+    )
+    if feature_configs is not None:
+        # New installations bind only credentials consumed by enabled features.
+        # PM Holdings uses the local PM service, not the retired Feishu table.
+        from src.application.notification_delivery_route import notifications_enabled
+
+        def feishu_notifications(market: str | None = None) -> bool:
+            configs = [feature_configs[market]] if market in feature_configs else feature_configs.values()
+            for config in configs:
+                notifications = config.get("notifications") or {}
+                if notifications_enabled(config) and (
+                    notifications.get("provider") or notifications.get("channel")
+                ) == "feishu_app":
+                    return True
+            return False
+
+        for service_name, values in bindings.items():
+            market_match = re.search(r"-(us|hk)\.service$", service_name)
+            market = market_match.group(1) if market_match else None
+            needed = set(values)
+            needed.discard(FEISHU_HOLDINGS_APP_SECRET)
+            if service_name != "options-monitor-feishu-ws.service" and not feishu_notifications(market):
+                needed.discard(FEISHU_BOT_APP_SECRET)
+            if not inbound_operations_enabled:
+                needed.discard(INBOUND_OPERATION_HMAC_KEY)
+            bindings[service_name] = [value for value in values if value in needed]
+    return {name: tuple(values) for name, values in sorted(bindings.items()) if values}
+
+
+def _render_systemd_secret_dropin(
+    logical_names: tuple[str, ...],
+    *,
+    store_root: Path,
+    delivery: SecretCredentialDelivery,
+    consumer: str,
+    deploy_user: str,
+) -> str:
+    credential_ids: list[str] = []
+    for logical_name in logical_names:
+        spec = credential_spec(logical_name)
+        if spec is None:
+            raise ValueError(f"unknown logical credential in service binding: {logical_name}")
+        credential_ids.append(spec.systemd_credential_id)
+    unset_legacy_secret_env = "UnsetEnvironment=" + " ".join(
+        sorted(legacy_secret_env_names())
+    )
+    if delivery == "load-credential-encrypted":
+        directives = [
+            f"LoadCredentialEncrypted={credential_id}:{_systemd_quote_arg(store_root / credential_id)}"
+            for credential_id in credential_ids
+        ]
+        return _render_systemd_service_asset(
+            "zzzz-secret-credentials.conf.in",
+            {
+                "LOAD_CREDENTIALS": "\n".join(directives),
+                "UNSET_LEGACY_SECRET_ENV": unset_legacy_secret_env,
+            },
+        )
+
+    _validate_runtime_credential_exec_inputs(
+        deploy_user=deploy_user,
+        store_root=store_root,
+    )
+    runtime_directory = DEFAULT_SECRET_CREDENTIAL_RUNTIME_ROOT / consumer
+    materialize_args = [
+        f"+{DEFAULT_SECRET_CREDENTIAL_HELPER}",
+        "materialize",
+        "--unit",
+        consumer,
+        "--deploy-user",
+        deploy_user,
+        "--store-root",
+        str(store_root),
+    ]
+    cleanup_args = [
+        f"+{DEFAULT_SECRET_CREDENTIAL_HELPER}",
+        "cleanup",
+        "--unit",
+        consumer,
+    ]
+    for credential_id in credential_ids:
+        materialize_args.extend(["--credential-id", credential_id])
+        cleanup_args.extend(["--credential-id", credential_id])
+    return _render_systemd_service_asset(
+        "zzzz-secret-runtime-files.conf.in",
+        {
+            "BACKEND_ENVIRONMENT": _systemd_environment_assignment(
+                "OM_SECRET_BACKEND",
+                "systemd",
+            ),
+            "DIRECTORY_ENVIRONMENT": _systemd_environment_assignment(
+                "CREDENTIALS_DIRECTORY",
+                runtime_directory,
+            ),
+            "EXEC_START": _systemd_join_args(materialize_args),
+            "EXEC_STOP": _systemd_join_args(cleanup_args),
+            "UNSET_LEGACY_SECRET_ENV": unset_legacy_secret_env,
+        },
+    )
+
+
+def _systemd_unit(
+    *,
+    description: str,
+    repo_root: Path,
+    runtime_root: Path,
+    exec_args: list[str],
+    env_file: Path | None = None,
+    deploy_user: str | None = None,
+    deploy_home: Path | None = None,
+    working_directory: Path | None = None,
+    service_type: str = "oneshot",
+    restart: str | None = None,
+    after: list[str] | None = None,
+    wants: list[str] | None = None,
+    before: list[str] | None = None,
+    timeout_start_sec: int | None = None,
+    timeout_stop_sec: int | None = None,
+    syslog_level_prefix: bool = False,
+    restart_prevent_exit_statuses: list[int] | None = None,
+    on_failure: str | None = None,
+) -> str:
+    after_units = _dedupe_unit_dependencies(["network-online.target", *(after or [])])
+    wants_units = _dedupe_unit_dependencies(["network-online.target", *(wants or [])])
+    lines = [
+        "[Unit]",
+        f"Description={description}",
+        f"After={' '.join(after_units)}",
+        f"Wants={' '.join(wants_units)}",
+    ]
+    before_units = _dedupe_unit_dependencies(before or [])
+    if before_units:
+        lines.append(f"Before={' '.join(before_units)}")
+    if on_failure:
+        lines.append(f"OnFailure={on_failure}")
+    lines.extend([
+        "",
+        "[Service]",
+        f"Type={service_type}",
+        "UMask=0077",
+        f"WorkingDirectory={_systemd_quote_arg(working_directory or repo_root)}",
+    ])
+    if deploy_user:
+        lines.append(f"User={deploy_user}")
+    if deploy_home is not None:
+        lines.append(_systemd_environment_assignment("HOME", deploy_home))
+    lines.extend(
+        [
+            _systemd_environment_assignment("PYTHONUNBUFFERED", "1"),
+            _systemd_environment_assignment("OM_RUNTIME_ROOT", runtime_root),
+        ]
+    )
+    if env_file is not None:
+        # The CLI bootstrap must retain this explicit selection instead of
+        # discovering a different runtime/options-monitor.env file.
+        lines.append(_systemd_environment_assignment("OM_ENV_FILE", env_file))
+        lines.append(_systemd_environment_file(env_file))
+    lines.append("ExecStart=" + _systemd_join_args(exec_args))
+    if timeout_start_sec is not None:
+        if int(timeout_start_sec) <= 0:
+            raise ValueError("timeout_start_sec must be positive")
+        lines.append(f"TimeoutStartSec={int(timeout_start_sec)}")
+    if timeout_stop_sec is not None:
+        if int(timeout_stop_sec) <= 0:
+            raise ValueError("timeout_stop_sec must be positive")
+        lines.append(f"TimeoutStopSec={int(timeout_stop_sec)}")
+    if syslog_level_prefix:
+        lines.append("SyslogLevelPrefix=yes")
+    if restart:
+        lines.append(f"Restart={restart}")
+        lines.append("RestartSec=10")
+        if restart_prevent_exit_statuses:
+            statuses = [int(status) for status in restart_prevent_exit_statuses]
+            if any(status < 0 or status > 255 for status in statuses):
+                raise ValueError("restart_prevent_exit_statuses must be between 0 and 255")
+            lines.append("RestartPreventExitStatus=" + " ".join(str(status) for status in statuses))
+    lines.extend(["StandardOutput=journal", "StandardError=journal", ""])
+    if restart:
+        lines.extend(["[Install]", "WantedBy=multi-user.target", ""])
+    return "\n".join(lines)
+
+
+def _dedupe_unit_dependencies(values: list[str]) -> list[str]:
+    out: list[str] = []
+    for raw in values:
+        value = str(raw or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _systemd_timer(
+    *,
+    description: str,
+    unit_name: str,
+    interval: str | None = None,
+    calendar: str | list[str] | tuple[str, ...] | None = None,
+    accuracy_sec: str | None = None,
+    randomized_delay_sec: int | None = None,
+    persistent: bool = True,
+) -> str:
+    timer_lines = [
+        "[Unit]",
+        f"Description={description}",
+        "",
+        "[Timer]",
+    ]
+    calendars = [calendar] if isinstance(calendar, str) else list(calendar or [])
+    if calendars:
+        timer_lines.extend(f"OnCalendar={value}" for value in calendars)
+    else:
+        timer_lines.extend(["OnBootSec=2min", f"OnUnitActiveSec={interval or '10min'}"])
+    if accuracy_sec is not None:
+        timer_lines.append(f"AccuracySec={accuracy_sec}")
+    if randomized_delay_sec is not None:
+        timer_lines.append(f"RandomizedDelaySec={int(randomized_delay_sec)}")
+    timer_lines.extend([
+        f"Persistent={'true' if persistent else 'false'}",
+        f"Unit={unit_name}",
+        "",
+        "[Install]",
+        "WantedBy=timers.target",
+        "",
+    ])
+    return "\n".join(timer_lines)
+
+
+def _systemd_tick_calendar(market: str) -> str | None:
+    if market == "us":
+        return US_TICK_SYSTEMD_CALENDAR
+    if market == "hk":
+        return HK_TICK_SYSTEMD_CALENDAR
+    return None
+
+
+def _launchd_plist(
+    *,
+    label: str,
+    repo_root: Path,
+    runtime_root: Path,
+    program_args: list[str],
+    log_root: Path,
+    env_file: Path | None = None,
+    working_directory: Path | None = None,
+    start_interval: int | None = None,
+    start_calendar_interval: dict[str, int] | None = None,
+    keep_alive: bool = False,
+) -> str:
+    environment = {
+        "OM_RUNTIME_ROOT": str(runtime_root),
+        "PYTHONUNBUFFERED": "1",
+    }
+    if env_file is not None:
+        environment["OM_ENV_FILE"] = str(env_file)
+    payload: dict[str, Any] = {
+        "Label": label,
+        "Umask": "077",
+        "ProgramArguments": program_args,
+        "WorkingDirectory": str(working_directory or repo_root),
+        "EnvironmentVariables": environment,
+        "StandardOutPath": str(log_root / f"{label}.out.log"),
+        "StandardErrorPath": str(log_root / f"{label}.err.log"),
+        "RunAtLoad": bool(keep_alive),
+    }
+    if keep_alive:
+        payload["KeepAlive"] = True
+    if start_interval is not None:
+        payload["StartInterval"] = int(start_interval)
+    if start_calendar_interval is not None:
+        payload["StartCalendarInterval"] = start_calendar_interval
+    return plistlib.dumps(payload, sort_keys=True).decode("utf-8")
+
+
+def build_service_profile(
+    *,
+    target: ServiceTarget,
+    repo_root: Path,
+    runtime_root: Path,
+    accounts: list[str],
+    markets: list[str],
+    service_names: list[str],
+    config_paths: dict[str, Path],
+    bot_config_path: Path | None = None,
+    config_authoring: dict[str, Any] | None = None,
+    env_file: Path | None = None,
+    deploy_user: str | None = None,
+    deploy_home: Path | None = None,
+    auto_upgrade_enabled: bool = False,
+    opend: dict[str, Any] | None = None,
+    feishu_ws: dict[str, Any] | None = None,
+    wechat_clawbot: dict[str, Any] | None = None,
+    quality_monitoring: dict[str, Any] | None = None,
+    feishu_agent_credential: dict[str, Any] | None = None,
+    secret_credentials: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    restartable_services = [
+        name
+        for name in service_names
+        if (
+            str(name).endswith(".service")
+            and not str(name).endswith("-alert.service")
+            and not str(name).endswith("-heartbeat.service")
+            and (
+                "opend" in str(name)
+                or "trade-intake" in str(name)
+                or "feishu-ws" in str(name)
+                or "wechat-clawbot" in str(name)
+            )
+        )
+    ]
+    profile: dict[str, Any] = {
+        "schema_version": 1,
+        "service_provider": target,
+        "repo_root": str(repo_root),
+        "runtime_root": str(runtime_root),
+        "accounts": accounts,
+        "markets": markets,
+        "paths": {
+            "report_dir": str(runtime_root / "output_shared" / "reports"),
+            "state_dir": str(runtime_root / "output_shared" / "state"),
+            "shared_state_dir": str(runtime_root / "output_shared" / "state"),
+            "accounts_root": str(runtime_root / "output_accounts"),
+            "runs_root": str(runtime_root / "output_runs"),
+        },
+        "config_paths": {key: str(value) for key, value in config_paths.items()},
+        "services": [{"name": name} for name in service_names],
+    }
+    if bot_config_path is not None:
+        profile["bot_config_path"] = str(bot_config_path)
+    if config_authoring is not None:
+        profile["config_authoring"] = dict(config_authoring)
+    if env_file is not None:
+        profile["env_file"] = str(env_file)
+    if deploy_user:
+        profile["deploy_user"] = str(deploy_user)
+    if deploy_home is not None:
+        profile["deploy_home"] = str(deploy_home)
+    if target == "systemd" and deploy_user and str(deploy_user).strip() != "root":
+        profile["restart"] = {
+            "requires_sudo": True,
+            "command_prefix": ["sudo", "-n", "systemctl"],
+            "services": restartable_services,
+            "sudoers": [
+                item
+                for service_name in restartable_services
+                for item in (
+                    f"{deploy_user} ALL=(root) NOPASSWD: /bin/systemctl restart {service_name}",
+                    f"{deploy_user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart {service_name}",
+                )
+            ],
+        }
+    elif target == "systemd" and restartable_services:
+        profile["restart"] = {
+            "requires_sudo": False,
+            "command_prefix": ["systemctl"],
+            "services": restartable_services,
+        }
+    if auto_upgrade_enabled:
+        profile["auto_upgrade"] = {
+            "enabled": True,
+            "schedule_beijing": "06:10",
+        }
+    if opend is not None:
+        profile["opend"] = dict(opend)
+    if feishu_ws is not None:
+        profile["feishu_ws"] = dict(feishu_ws)
+    if wechat_clawbot is not None:
+        profile["wechat_clawbot"] = dict(wechat_clawbot)
+    if quality_monitoring is not None:
+        profile["quality_monitoring"] = dict(quality_monitoring)
+    if feishu_agent_credential is not None:
+        profile["feishu_agent_credential"] = dict(feishu_agent_credential)
+    if secret_credentials is not None:
+        profile["secret_credentials"] = dict(secret_credentials)
+    return profile
+
+
+def render_service_bundle(
+    *,
+    target: str,
+    repo_root: str | Path | None = None,
+    runtime_root: str | Path | None = None,
+    accounts: list[str] | tuple[str, ...] | None = None,
+    markets: list[str] | tuple[str, ...] | None = None,
+    config_paths: dict[str, str | Path] | None = None,
+    config_yaml: str | Path | None = None,
+    env_file: str | Path | None = None,
+    deploy_user: str | None = None,
+    deploy_home: str | Path | None = None,
+    use_default_deploy_user: bool = True,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    include_auto_upgrade: bool = False,
+    include_opend: bool = False,
+    opend_root: str | Path | None = None,
+    opend_executable: str | Path | None = None,
+    include_feishu_ws: bool = False,
+    feishu_ws_config_key: str | None = None,
+    include_wechat_clawbot: bool = False,
+    wechat_clawbot_config_key: str | None = None,
+    wechat_clawbot_label: str | None = None,
+    wechat_clawbot_allowed_senders: str | None = None,
+    include_quality_monitoring: bool = False,
+    include_feishu_agent_credential: bool = False,
+    include_secret_credentials: bool = False,
+    feature_aware_credentials: bool = False,
+    secret_credential_delivery: str | None = DEFAULT_SECRET_CREDENTIAL_DELIVERY,
+    secret_credential_store_root: str | Path | None = None,
+    feishu_agent_credential_helper_path: str | Path | None = None,
+    feishu_agent_credential_store: str | Path | None = None,
+    feishu_holdings_credential_store: str | Path | None = None,
+    feishu_agent_credential_env_file: str | Path | None = None,
+    include_content: bool = True,
+) -> dict[str, Any]:
+    target_key = normalize_target(target)
+    secret_delivery = normalize_secret_credential_delivery(secret_credential_delivery)
+    if include_quality_monitoring and target_key != "systemd":
+        raise ValueError("quality monitoring service rendering is currently supported only for systemd")
+    if include_feishu_agent_credential and target_key != "systemd":
+        raise ValueError("Feishu Agent credential materialization is currently supported only for systemd")
+    if include_secret_credentials and target_key != "systemd":
+        raise ValueError("per-unit encrypted credentials are currently supported only for systemd")
+    if include_secret_credentials and include_feishu_agent_credential:
+        raise ValueError("per-unit encrypted credentials and the legacy Feishu env materializer are mutually exclusive")
+    repo = _absolute_path_preserve_symlink(repo_root or Path.cwd())
+    runtime = _resolve_path(runtime_root, base=repo, default=default_runtime_root(target_key))
+    env_file_path = (
+        _resolve_path(env_file, base=repo, default=Path())
+        if env_file is not None and str(env_file).strip()
+        else None
+    )
+    systemd_user = default_systemd_deploy_user() if target_key == "systemd" and use_default_deploy_user else None
+    if deploy_user is not None and str(deploy_user).strip():
+        systemd_user = str(deploy_user).strip()
+    systemd_home = default_systemd_deploy_home(systemd_user) if target_key == "systemd" and systemd_user else None
+    if deploy_home is not None and str(deploy_home).strip():
+        systemd_home = Path(deploy_home).expanduser()
+    credential_helper_path = _resolve_path(
+        feishu_agent_credential_helper_path,
+        base=repo,
+        default=DEFAULT_FEISHU_AGENT_CREDENTIAL_HELPER,
+    )
+    agent_credential_store = _resolve_path(
+        feishu_agent_credential_store,
+        base=repo,
+        default=DEFAULT_FEISHU_AGENT_CREDENTIAL_STORE,
+    )
+    holdings_credential_store = _resolve_path(
+        feishu_holdings_credential_store,
+        base=repo,
+        default=DEFAULT_FEISHU_HOLDINGS_CREDENTIAL_STORE,
+    )
+    credential_env_file = _resolve_path(
+        feishu_agent_credential_env_file,
+        base=repo,
+        default=DEFAULT_FEISHU_AGENT_CREDENTIAL_ENV_FILE,
+    )
+    secret_store_root = _resolve_path(
+        secret_credential_store_root,
+        base=repo,
+        default=DEFAULT_SECRET_CREDENTIAL_STORE_ROOT,
+    )
+    if include_secret_credentials:
+        _validate_secret_credential_store_root(secret_store_root)
+    opend_executable_value = str(opend_executable or DEFAULT_OPEND_EXECUTABLE).strip() or DEFAULT_OPEND_EXECUTABLE
+    account_values = normalize_accounts(accounts)
+    market_values = normalize_markets(markets)
+    config_default_root = runtime if include_auto_upgrade else None
+    config_by_market = {
+        market: _config_path_for_market(
+            market,
+            repo_root=repo,
+            runtime_root=config_default_root,
+            config_paths=config_paths,
+        )
+        for market in market_values
+    }
+    config_yaml_path = (
+        _absolute_path_preserve_symlink(config_yaml, base=repo)
+        if config_yaml is not None and str(config_yaml).strip()
+        else None
+    )
+    account_values, accounts_by_market = _resolve_service_account_scopes(
+        repo_root=repo,
+        config_yaml_path=config_yaml_path,
+        config_by_market=config_by_market,
+        market_values=market_values,
+        accounts=accounts,
+    )
+    config_authoring = (
+        {
+            "source": "yaml",
+            "config_yaml": str(config_yaml_path),
+            "markets": market_values,
+        }
+        if config_yaml_path is not None
+        else None
+    )
+    bot_credential_name = (
+        _bot_credential_name(
+            repo_root=repo,
+            config_yaml_path=config_yaml_path,
+        )
+        if include_feishu_ws or include_wechat_clawbot
+        else None
+    )
+    explicit_opend_root = opend_root is not None and str(opend_root).strip() != ""
+    opend_service_plans: list[OpendServicePlan] = []
+    if include_opend and not explicit_opend_root:
+        opend_service_plans = _opend_service_plans_from_authoring_config(
+            repo_root=repo,
+            config_yaml_path=config_yaml_path,
+            config_by_market=config_by_market,
+            market_values=market_values,
+            accounts=account_values,
+            executable=opend_executable_value,
+        )
+    if include_opend and not opend_service_plans:
+        opend_root_path = _resolve_path(
+            opend_root,
+            base=repo,
+            default=default_opend_root(deploy_home=systemd_home),
+        )
+        opend_service_plans = [_legacy_opend_service_plan(root=opend_root_path, executable=opend_executable_value)]
+    om = str(repo / "om")
+    lock_root = runtime / "locks"
+    log_root = runtime / "logs"
+    runtime_data_config = runtime / "portfolio.runtime.json"
+    inbound_audit_db = runtime / "output_shared" / "state" / "inbound_control.sqlite3"
+    bot_config_path = runtime / "resolved" / "config.bot.json" if config_yaml_path is not None else None
+    feishu_ws_config_key_value = _resolve_feishu_ws_config_key(
+        feishu_ws_config_key,
+        markets=market_values,
+        include_feishu_ws=include_feishu_ws,
+    )
+    wechat_clawbot_config_key_value = _resolve_wechat_clawbot_config_key(
+        wechat_clawbot_config_key,
+        markets=market_values,
+        include_wechat_clawbot=include_wechat_clawbot,
+    )
+    wechat_clawbot_cfg = (
+        _wechat_clawbot_inbound_config_from_yaml(repo_root=repo, config_yaml_path=config_yaml_path)
+        if include_wechat_clawbot
+        else {}
+    )
+    wechat_clawbot_label_value = _first_text(wechat_clawbot_label, wechat_clawbot_cfg.get("label")) or "default"
+    wechat_clawbot_state_dir_configured = _first_text(wechat_clawbot_cfg.get("state_dir"))
+    wechat_clawbot_allowed_senders_explicit = bool(_first_text(wechat_clawbot_allowed_senders))
+    wechat_clawbot_allowed_senders_value = _first_text(
+        wechat_clawbot_allowed_senders,
+        wechat_clawbot_cfg.get("allowed_senders"),
+    ) or ""
+    if include_wechat_clawbot and not wechat_clawbot_allowed_senders_value:
+        raise ValueError(
+            "wechat_clawbot_allowed_senders or inbound.wechat_clawbot.allowed_senders is required "
+            "when rendering WeChat ClawBot"
+        )
+    wechat_clawbot_state_dir = (
+        _absolute_path_preserve_symlink(wechat_clawbot_state_dir_configured, base=repo)
+        if wechat_clawbot_state_dir_configured
+        else runtime / "output_shared" / "state" / "channels" / "wechat_clawbot" / wechat_clawbot_label_value
+    )
+
+    files: list[RenderedServiceFile] = []
+    service_names: list[str] = []
+    credential_consumers: list[str] = []
+    secret_credential_bindings: dict[str, tuple[str, ...]] = {}
+
+    def add(
+        relative_path: str,
+        content: str,
+        *,
+        install_path: str,
+        kind: str,
+        service_name: str | None = None,
+        mode: int | None = None,
+        owner_uid: int | None = None,
+        owner_gid: int | None = None,
+    ) -> None:
+        if kind == "systemd_service" and include_secret_credentials:
+            content = content.replace(
+                "[Service]\n",
+                "[Service]\nUnsetEnvironment=" + " ".join(sorted(legacy_secret_env_names())) + "\n",
+                1,
+            )
+        files.append(
+            RenderedServiceFile(
+                relative_path=relative_path,
+                content=content,
+                install_path=install_path,
+                kind=kind,
+                mode=mode,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+            )
+        )
+        if service_name:
+            service_names.append(service_name)
+
+    if target_key == "systemd":
+        for market in market_values:
+            market_accounts = accounts_by_market[market]
+            service_name = f"options-monitor-tick-{market}.service"
+            timer_name = f"options-monitor-tick-{market}.timer"
+            tick_args = [
+                om,
+                "run",
+                "tick-cron",
+                "--market",
+                market,
+                "--config",
+                str(config_by_market[market]),
+                "--accounts",
+                *market_accounts,
+                "--timeout",
+                str(int(timeout_seconds)),
+                "--lock-path",
+                str(lock_root / f"tick-{market}.lock"),
+                "--trigger-job-id",
+                service_name.removesuffix(".service"),
+                "--trigger-job-name",
+                f"options-monitor {market} tick",
+                "--trigger-schedule",
+                "systemd timer",
+            ]
+            add(
+                f"systemd/{service_name}",
+                _systemd_unit(
+                    description=f"Options Monitor {market.upper()} tick",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=tick_args,
+                    timeout_start_sec=int(timeout_seconds) + 300,
+                    timeout_stop_sec=30,
+                    syslog_level_prefix=True,
+                ),
+                install_path=f"/etc/systemd/system/{service_name}",
+                kind="systemd_service",
+                service_name=service_name,
+            )
+            add(
+                f"systemd/{timer_name}",
+                _systemd_timer(
+                    description=f"Options Monitor {market.upper()} tick timer",
+                    unit_name=service_name,
+                    calendar=_systemd_tick_calendar(market),
+                ),
+                install_path=f"/etc/systemd/system/{timer_name}",
+                kind="systemd_timer",
+                service_name=timer_name,
+            )
+
+            auto_close_service = f"options-monitor-auto-close-{market}.service"
+            auto_close_timer = f"options-monitor-auto-close-{market}.timer"
+            auto_close_args = [
+                om,
+                "option-positions",
+                "auto-close-expired",
+                "--config",
+                str(config_by_market[market]),
+                "--accounts",
+                *market_accounts,
+                "--apply",
+                "--yes",
+                "--quiet",
+            ]
+            add(
+                f"systemd/{auto_close_service}",
+                _systemd_unit(
+                    description=f"Options Monitor {market.upper()} expired option maintenance",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=auto_close_args,
+                    timeout_start_sec=600,
+                ),
+                install_path=f"/etc/systemd/system/{auto_close_service}",
+                kind="systemd_service",
+                service_name=auto_close_service,
+            )
+            add(
+                f"systemd/{auto_close_timer}",
+                _systemd_timer(
+                    description=f"Options Monitor {market.upper()} expired option maintenance timer",
+                    unit_name=auto_close_service,
+                    calendar=AUTO_CLOSE_SYSTEMD_CALENDARS[market],
+                ),
+                install_path=f"/etc/systemd/system/{auto_close_timer}",
+                kind="systemd_timer",
+                service_name=auto_close_timer,
+            )
+
+        verify_service = "options-monitor-projection-verify.service"
+        verify_timer = "options-monitor-projection-verify.timer"
+        verify_args = [
+            om,
+            "option-positions",
+            "--data-config",
+            str(runtime_data_config),
+            "verify-projection",
+            "--mode",
+            "auto",
+            "--publish-evidence",
+        ]
+        add(
+            f"systemd/{verify_service}",
+            _systemd_unit(
+                description="Options Monitor option-position projection verification",
+                repo_root=repo,
+                runtime_root=runtime,
+                env_file=env_file_path,
+                deploy_user=systemd_user,
+                deploy_home=systemd_home,
+                exec_args=verify_args,
+            ),
+            install_path=f"/etc/systemd/system/{verify_service}",
+            kind="systemd_service",
+            service_name=verify_service,
+        )
+        add(
+            f"systemd/{verify_timer}",
+            _systemd_timer(
+                description="Options Monitor option-position projection verification timer",
+                unit_name=verify_service,
+                calendar=PROJECTION_VERIFY_SYSTEMD_CALENDAR,
+            ),
+            install_path=f"/etc/systemd/system/{verify_timer}",
+            kind="systemd_timer",
+            service_name=verify_timer,
+        )
+
+        opend_dependency_units = [item.systemd_service_name for item in opend_service_plans]
+        for opend_plan in opend_service_plans:
+            add(
+                f"systemd/{opend_plan.systemd_service_name}",
+                _systemd_unit(
+                    description=(
+                        f"Futu OpenD gateway for Options Monitor ({opend_plan.account})"
+                        if opend_plan.account
+                        else "Futu OpenD gateway for Options Monitor"
+                    ),
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    working_directory=opend_plan.root,
+                    exec_args=[str(opend_plan.executable)],
+                    service_type="simple",
+                    restart="always",
+                    before=["options-monitor-trade-intake.service"],
+                ),
+                install_path=f"/etc/systemd/system/{opend_plan.systemd_service_name}",
+                kind="systemd_service",
+                service_name=opend_plan.systemd_service_name,
+            )
+
+        trade_market = "us" if "us" in config_by_market else market_values[0]
+        trade_service = "options-monitor-trade-intake.service"
+        trade_args = [
+            om,
+            "run",
+            "trade-intake",
+            "--config",
+            str(config_by_market[trade_market]),
+            "--mode",
+            "apply",
+            "--yes",
+        ]
+        add(
+            f"systemd/{trade_service}",
+            _systemd_unit(
+                description="Options Monitor trade intake listener",
+                repo_root=repo,
+                runtime_root=runtime,
+                env_file=env_file_path,
+                deploy_user=systemd_user,
+                deploy_home=systemd_home,
+                exec_args=trade_args,
+                service_type="simple",
+                restart="always",
+                restart_prevent_exit_statuses=[78],
+                on_failure="options-monitor-trade-intake-alert.service",
+                syslog_level_prefix=True,
+                after=opend_dependency_units or None,
+                wants=opend_dependency_units or None,
+            ),
+            install_path=f"/etc/systemd/system/{trade_service}",
+            kind="systemd_service",
+            service_name=trade_service,
+        )
+        alert_service = "options-monitor-trade-intake-alert.service"
+        add(
+            f"systemd/{alert_service}",
+            _systemd_unit(
+                description="Options Monitor trade intake terminal failure alert",
+                repo_root=repo,
+                runtime_root=runtime,
+                env_file=env_file_path,
+                deploy_user=systemd_user,
+                deploy_home=systemd_home,
+                exec_args=[
+                    str(repo / "om"), "run", "service-failure-alert",
+                    "--unit", trade_service,
+                    "--market", trade_market,
+                    "--config", str(config_by_market[trade_market]),
+                    "--runtime-root", str(runtime),
+                ],
+                timeout_start_sec=120,
+                syslog_level_prefix=True,
+            ),
+            install_path=f"/etc/systemd/system/{alert_service}",
+            kind="systemd_service",
+            service_name=alert_service,
+        )
+
+        heartbeat_service = "options-monitor-trade-intake-heartbeat.service"
+        heartbeat_timer = "options-monitor-trade-intake-heartbeat.timer"
+        add(
+            f"systemd/{heartbeat_service}",
+            _systemd_unit(
+                description="Options Monitor trade intake heartbeat alert",
+                repo_root=repo,
+                runtime_root=runtime,
+                env_file=env_file_path,
+                deploy_user=systemd_user,
+                deploy_home=systemd_home,
+                exec_args=[
+                    om, "run", "trade-intake-heartbeat-check",
+                    "--unit", trade_service,
+                    "--market", trade_market,
+                    "--config", str(config_by_market[trade_market]),
+                    "--runtime-root", str(runtime),
+                ],
+                timeout_start_sec=120,
+                syslog_level_prefix=True,
+            ),
+            install_path=f"/etc/systemd/system/{heartbeat_service}",
+            kind="systemd_service",
+            service_name=heartbeat_service,
+        )
+        add(
+            f"systemd/{heartbeat_timer}",
+            _systemd_timer(description="Options Monitor trade intake heartbeat timer",
+                           unit_name=heartbeat_service, interval="1min"),
+            install_path=f"/etc/systemd/system/{heartbeat_timer}",
+            kind="systemd_timer",
+            service_name=heartbeat_timer,
+        )
+
+        status_service = "options-monitor-runtime-status.service"
+        status_timer = "options-monitor-runtime-status.timer"
+        status_args = [
+            om,
+            "status",
+            "--profile-path",
+            str(runtime / "service.profile.json"),
+            "--journal-summary",
+        ]
+        add(
+            f"systemd/{status_service}",
+            _systemd_unit(
+                description="Options Monitor runtime status snapshot",
+                repo_root=repo,
+                runtime_root=runtime,
+                env_file=env_file_path,
+                deploy_user=systemd_user,
+                deploy_home=systemd_home,
+                exec_args=status_args,
+                syslog_level_prefix=True,
+            ),
+            install_path=f"/etc/systemd/system/{status_service}",
+            kind="systemd_service",
+            service_name=status_service,
+        )
+        add(
+            f"systemd/{status_timer}",
+            _systemd_timer(description="Options Monitor runtime status timer", unit_name=status_service, interval="15min"),
+            install_path=f"/etc/systemd/system/{status_timer}",
+            kind="systemd_timer",
+            service_name=status_timer,
+        )
+        if include_quality_monitoring:
+            quality_config_args = [
+                arg
+                for market in market_values
+                for arg in ("--config-key", market)
+            ]
+            quality_refresh_service = "options-monitor-quality-refresh.service"
+            quality_refresh_timer = "options-monitor-quality-refresh.timer"
+            add(
+                f"systemd/{quality_refresh_service}",
+                _systemd_unit(
+                    description="Options Monitor regular quality artifact refresh",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=[
+                        om,
+                        "quality",
+                        "refresh",
+                        *quality_config_args,
+                        "--no-deep",
+                    ],
+                    timeout_start_sec=600,
+                ),
+                install_path=f"/etc/systemd/system/{quality_refresh_service}",
+                kind="systemd_service",
+                service_name=quality_refresh_service,
+            )
+            add(
+                f"systemd/{quality_refresh_timer}",
+                _systemd_timer(
+                    description="Options Monitor regular quality artifact refresh timer",
+                    unit_name=quality_refresh_service,
+                    interval=QUALITY_REFRESH_INTERVAL_SYSTEMD,
+                ),
+                install_path=f"/etc/systemd/system/{quality_refresh_timer}",
+                kind="systemd_timer",
+                service_name=quality_refresh_timer,
+            )
+
+            quality_recheck_service = "options-monitor-quality-recheck.service"
+            quality_recheck_timer = "options-monitor-quality-recheck.timer"
+            add(
+                f"systemd/{quality_recheck_service}",
+                _systemd_unit(
+                    description="Options Monitor due quality reconciliation probe",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=[
+                        om,
+                        "quality",
+                        "recheck-due",
+                        *quality_config_args,
+                    ],
+                    after=opend_dependency_units or None,
+                    timeout_start_sec=300,
+                ),
+                install_path=f"/etc/systemd/system/{quality_recheck_service}",
+                kind="systemd_service",
+                service_name=quality_recheck_service,
+            )
+            add(
+                f"systemd/{quality_recheck_timer}",
+                _systemd_timer(
+                    description="Options Monitor due quality reconciliation probe timer",
+                    unit_name=quality_recheck_service,
+                    interval=QUALITY_RECHECK_INTERVAL_SYSTEMD,
+                ),
+                install_path=f"/etc/systemd/system/{quality_recheck_timer}",
+                kind="systemd_timer",
+                service_name=quality_recheck_timer,
+            )
+
+            for market in market_values:
+                quality_day_end_service = f"options-monitor-quality-day-end-{market}.service"
+                quality_day_end_timer = f"options-monitor-quality-day-end-{market}.timer"
+                add(
+                    f"systemd/{quality_day_end_service}",
+                    _systemd_unit(
+                        description=f"Options Monitor {market.upper()} day-end authoritative quality reconciliation",
+                        repo_root=repo,
+                        runtime_root=runtime,
+                        env_file=env_file_path,
+                        deploy_user=systemd_user,
+                        deploy_home=systemd_home,
+                        exec_args=[
+                            om,
+                            "quality",
+                            "refresh",
+                            "--config-key",
+                            market,
+                            "--day-end-strict",
+                        ],
+                        after=opend_dependency_units or None,
+                        timeout_start_sec=300,
+                    ),
+                    install_path=f"/etc/systemd/system/{quality_day_end_service}",
+                    kind="systemd_service",
+                    service_name=quality_day_end_service,
+                )
+                add(
+                    f"systemd/{quality_day_end_timer}",
+                    _systemd_timer(
+                        description=f"Options Monitor {market.upper()} day-end authoritative quality reconciliation timer",
+                        unit_name=quality_day_end_service,
+                        calendar=QUALITY_DAY_END_SYSTEMD_CALENDARS[market],
+                    ),
+                    install_path=f"/etc/systemd/system/{quality_day_end_timer}",
+                    kind="systemd_timer",
+                    service_name=quality_day_end_timer,
+                )
+        if include_auto_upgrade:
+            upgrade_service = "options-monitor-upgrade.service"
+            upgrade_timer = "options-monitor-upgrade.timer"
+            upgrade_args = [
+                om,
+                "update",
+                "apply",
+                "--repo-root",
+                str(repo),
+                "--runtime-root",
+                str(runtime),
+                "--auto",
+                "--confirm",
+                "--preserve-activation-state",
+            ]
+            add(
+                f"systemd/{upgrade_service}",
+                _systemd_unit(
+                    description="Options Monitor release upgrade",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=upgrade_args,
+                ),
+                install_path=f"/etc/systemd/system/{upgrade_service}",
+                kind="systemd_service",
+                service_name=upgrade_service,
+            )
+            add(
+                f"systemd/{upgrade_timer}",
+                _systemd_timer(
+                    description="Options Monitor release upgrade timer",
+                    unit_name=upgrade_service,
+                    calendar=AUTO_UPGRADE_SYSTEMD_CALENDAR,
+                ),
+                install_path=f"/etc/systemd/system/{upgrade_timer}",
+                kind="systemd_timer",
+                service_name=upgrade_timer,
+            )
+
+        if include_feishu_ws:
+            assert feishu_ws_config_key_value is not None
+            ws_service = "options-monitor-feishu-ws.service"
+            ws_args = [
+                om,
+                "inbound",
+                "feishu-ws",
+                "--config-path",
+                str(config_by_market.get(feishu_ws_config_key_value) or config_by_market[market_values[0]]),
+            ]
+            if bot_config_path is not None:
+                ws_args.extend(["--bot-config", str(bot_config_path)])
+            ws_args.extend([
+                "--audit-db",
+                str(inbound_audit_db),
+                "--lock-path",
+                str(lock_root / "feishu-ws.lock"),
+            ])
+            add(
+                f"systemd/{ws_service}",
+                _systemd_unit(
+                    description="Options Monitor Feishu long-connection inbound",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=ws_args,
+                    service_type="simple",
+                    restart="always",
+                ),
+                install_path=f"/etc/systemd/system/{ws_service}",
+                kind="systemd_service",
+                service_name=ws_service,
+            )
+
+        if include_wechat_clawbot:
+            assert wechat_clawbot_config_key_value is not None
+            wechat_service = "options-monitor-wechat-clawbot.service"
+            wechat_args = [
+                om,
+                "channel",
+                "wechat-clawbot",
+                "serve",
+                "--label",
+                wechat_clawbot_label_value,
+                "--state-dir",
+                str(wechat_clawbot_state_dir),
+                "--config-path",
+                str(config_by_market.get(wechat_clawbot_config_key_value) or config_by_market[market_values[0]]),
+            ]
+            if bot_config_path is not None:
+                wechat_args.extend(["--bot-config", str(bot_config_path)])
+            wechat_args.extend([
+                "--audit-db",
+                str(inbound_audit_db),
+                "--lock-path",
+                str(lock_root / "wechat-clawbot.lock"),
+            ])
+            if wechat_clawbot_allowed_senders_explicit:
+                wechat_args.extend(["--allowed-senders", wechat_clawbot_allowed_senders_value])
+            add(
+                f"systemd/{wechat_service}",
+                _systemd_unit(
+                    description="Options Monitor WeChat ClawBot inbound",
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    env_file=env_file_path,
+                    deploy_user=systemd_user,
+                    deploy_home=systemd_home,
+                    exec_args=wechat_args,
+                    service_type="simple",
+                    restart="always",
+                ),
+                install_path=f"/etc/systemd/system/{wechat_service}",
+                kind="systemd_service",
+                service_name=wechat_service,
+            )
+
+        if include_secret_credentials:
+            feature_configs = None
+            inbound_operations_enabled = False
+            if feature_aware_credentials:
+                if config_yaml_path is None:
+                    raise ValueError("feature-aware credentials require config_yaml")
+                feature_configs = {
+                    market: resolve_yaml_runtime_config(
+                        repo_root=repo, market=market, config_path=config_yaml_path
+                    )[0]
+                    for market in market_values
+                }
+                bot_config, _ = resolve_yaml_bot_config(repo_root=repo, config_path=config_yaml_path)
+                if not BotSettings.from_runtime_config(bot_config).llm.enabled:
+                    bot_credential_name = None
+                effective = build_effective_env(environ={}, env_file=env_file_path)
+                inbound_operations_enabled = str(effective.get("OM_INBOUND_OPERATIONS_ENABLED")).lower() in {"1", "true", "yes"}
+            secret_credential_bindings = _systemd_secret_bindings(
+                service_names=service_names,
+                bot_credential_name=bot_credential_name,
+                feature_configs=feature_configs,
+                inbound_operations_enabled=inbound_operations_enabled,
+            )
+            secret_deploy_user = str(systemd_user or "root")
+            for consumer, logical_names in secret_credential_bindings.items():
+                add(
+                    f"systemd/{consumer}.d/{SECRET_CREDENTIAL_DROPIN}",
+                    _render_systemd_secret_dropin(
+                        logical_names,
+                        store_root=secret_store_root,
+                        delivery=secret_delivery,
+                        consumer=consumer,
+                        deploy_user=secret_deploy_user,
+                    ),
+                    install_path=f"/etc/systemd/system/{consumer}.d/{SECRET_CREDENTIAL_DROPIN}",
+                    kind="systemd_secret_dropin",
+                )
+            if secret_delivery == "runtime-files" and secret_credential_bindings:
+                add(
+                    "systemd/libexec/options-monitor-materialize-service-credentials",
+                    _read_systemd_service_asset(
+                        "options-monitor-materialize-service-credentials"
+                    ),
+                    install_path=str(DEFAULT_SECRET_CREDENTIAL_HELPER),
+                    kind="systemd_executable",
+                    mode=0o755,
+                    owner_uid=0,
+                    owner_gid=0,
+                )
+
+        if include_feishu_agent_credential:
+            credential_consumers = sorted(
+                name
+                for name in service_names
+                if name.endswith(".service")
+                and name != FEISHU_AGENT_CREDENTIAL_SERVICE
+                and not name.startswith("options-monitor-opend")
+            )
+            deploy_group = str(systemd_user or "root")
+            credential_exec = _systemd_join_args(
+                [
+                    str(credential_helper_path),
+                    "--agent-store",
+                    str(agent_credential_store),
+                    "--holdings-store",
+                    str(holdings_credential_store),
+                    "--runtime-env-file",
+                    str(credential_env_file),
+                    "--deploy-group",
+                    deploy_group,
+                ]
+            )
+            add(
+                f"systemd/{FEISHU_AGENT_CREDENTIAL_SERVICE}",
+                _render_systemd_service_asset(
+                    "options-monitor-feishu-agent-credential.service.in",
+                    {
+                        "BEFORE": "\n".join(
+                            f"Before={consumer}"
+                            for consumer in credential_consumers
+                        ),
+                        "EXEC_START": credential_exec,
+                    },
+                ),
+                install_path=f"/etc/systemd/system/{FEISHU_AGENT_CREDENTIAL_SERVICE}",
+                kind="systemd_service",
+                service_name=FEISHU_AGENT_CREDENTIAL_SERVICE,
+            )
+            add(
+                "systemd/libexec/options-monitor-materialize-feishu-agent-credential",
+                _read_systemd_service_asset(
+                    "options-monitor-materialize-feishu-agent-credential"
+                ),
+                install_path=str(credential_helper_path),
+                kind="systemd_executable",
+                mode=0o755,
+            )
+            credential_dropin = _render_systemd_service_asset(
+                "zzzz-feishu-agent-credential.conf.in",
+                {"ENVIRONMENT_FILE": _systemd_environment_file(credential_env_file)},
+            )
+            for consumer in credential_consumers:
+                add(
+                    f"systemd/{consumer}.d/{FEISHU_AGENT_CREDENTIAL_DROPIN}",
+                    credential_dropin,
+                    install_path=(
+                        f"/etc/systemd/system/{consumer}.d/"
+                        f"{FEISHU_AGENT_CREDENTIAL_DROPIN}"
+                    ),
+                    kind="systemd_dropin",
+                )
+    else:
+        for market in market_values:
+            market_accounts = accounts_by_market[market]
+            label = f"com.options-monitor.tick-{market}"
+            tick_args = [
+                om,
+                "run",
+                "tick-cron",
+                "--market",
+                market,
+                "--config",
+                str(config_by_market[market]),
+                "--accounts",
+                *market_accounts,
+                "--timeout",
+                str(int(timeout_seconds)),
+                "--lock-path",
+                str(lock_root / f"tick-{market}.lock"),
+                "--trigger-job-id",
+                label,
+                "--trigger-job-name",
+                f"options-monitor {market} tick",
+                "--trigger-schedule",
+                "launchd StartInterval",
+            ]
+            add(
+                f"launchd/{label}.plist",
+                _launchd_plist(
+                    label=label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=tick_args,
+                    log_root=log_root,
+                    env_file=env_file_path,
+                    start_interval=600,
+                ),
+                install_path=f"~/Library/LaunchAgents/{label}.plist",
+                kind="launchd_plist",
+                service_name=label,
+            )
+
+            auto_label = f"com.options-monitor.auto-close-{market}"
+            auto_close_args = [
+                om,
+                "option-positions",
+                "auto-close-expired",
+                "--config",
+                str(config_by_market[market]),
+                "--accounts",
+                *market_accounts,
+                "--apply",
+                "--yes",
+                "--quiet",
+            ]
+            add(
+                f"launchd/{auto_label}.plist",
+                _launchd_plist(
+                    label=auto_label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=auto_close_args,
+                    log_root=log_root,
+                    env_file=env_file_path,
+                    start_calendar_interval=AUTO_CLOSE_LAUNCHD_CALENDARS[market],
+                ),
+                install_path=f"~/Library/LaunchAgents/{auto_label}.plist",
+                kind="launchd_plist",
+                service_name=auto_label,
+            )
+
+        verify_label = "com.options-monitor.projection-verify"
+        verify_args = [
+            om,
+            "option-positions",
+            "--data-config",
+            str(runtime_data_config),
+            "verify-projection",
+            "--mode",
+            "auto",
+            "--publish-evidence",
+        ]
+        add(
+            f"launchd/{verify_label}.plist",
+            _launchd_plist(
+                label=verify_label,
+                repo_root=repo,
+                runtime_root=runtime,
+                program_args=verify_args,
+                log_root=log_root,
+                env_file=env_file_path,
+                start_calendar_interval=PROJECTION_VERIFY_LAUNCHD_CALENDAR,
+            ),
+            install_path=f"~/Library/LaunchAgents/{verify_label}.plist",
+            kind="launchd_plist",
+            service_name=verify_label,
+        )
+
+        for opend_plan in opend_service_plans:
+            add(
+                f"launchd/{opend_plan.launchd_label}.plist",
+                _launchd_plist(
+                    label=opend_plan.launchd_label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=[str(opend_plan.executable)],
+                    log_root=log_root,
+                    working_directory=opend_plan.root,
+                    keep_alive=True,
+                ),
+                install_path=f"~/Library/LaunchAgents/{opend_plan.launchd_label}.plist",
+                kind="launchd_plist",
+                service_name=opend_plan.launchd_label,
+            )
+
+        trade_market = "us" if "us" in config_by_market else market_values[0]
+        trade_label = "com.options-monitor.trade-intake"
+        trade_args = [
+            om,
+            "run",
+            "trade-intake",
+            "--config",
+            str(config_by_market[trade_market]),
+            "--mode",
+            "apply",
+            "--yes",
+        ]
+        add(
+            f"launchd/{trade_label}.plist",
+            _launchd_plist(
+                label=trade_label,
+                repo_root=repo,
+                runtime_root=runtime,
+                program_args=trade_args,
+                log_root=log_root,
+                env_file=env_file_path,
+                keep_alive=True,
+            ),
+            install_path=f"~/Library/LaunchAgents/{trade_label}.plist",
+            kind="launchd_plist",
+            service_name=trade_label,
+        )
+
+        status_label = "com.options-monitor.runtime-status"
+        status_args = [
+            om,
+            "status",
+            "--profile-path",
+            str(runtime / "service.profile.json"),
+            "--journal-summary",
+        ]
+        add(
+            f"launchd/{status_label}.plist",
+            _launchd_plist(
+                label=status_label,
+                repo_root=repo,
+                runtime_root=runtime,
+                program_args=status_args,
+                log_root=log_root,
+                env_file=env_file_path,
+                start_interval=900,
+            ),
+            install_path=f"~/Library/LaunchAgents/{status_label}.plist",
+            kind="launchd_plist",
+            service_name=status_label,
+        )
+        if include_auto_upgrade:
+            upgrade_label = "com.options-monitor.upgrade"
+            upgrade_args = [
+                om,
+                "update",
+                "apply",
+                "--repo-root",
+                str(repo),
+                "--runtime-root",
+                str(runtime),
+                "--auto",
+                "--confirm",
+                "--preserve-activation-state",
+            ]
+            add(
+                f"launchd/{upgrade_label}.plist",
+                _launchd_plist(
+                    label=upgrade_label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=upgrade_args,
+                    log_root=log_root,
+                    env_file=env_file_path,
+                    start_calendar_interval=AUTO_UPGRADE_LAUNCHD_CALENDAR,
+                ),
+                install_path=f"~/Library/LaunchAgents/{upgrade_label}.plist",
+                kind="launchd_plist",
+                service_name=upgrade_label,
+            )
+
+        if include_feishu_ws:
+            assert feishu_ws_config_key_value is not None
+            ws_label = "com.options-monitor.feishu-ws"
+            ws_args = [
+                om,
+                "inbound",
+                "feishu-ws",
+                "--config-path",
+                str(config_by_market.get(feishu_ws_config_key_value) or config_by_market[market_values[0]]),
+            ]
+            if bot_config_path is not None:
+                ws_args.extend(["--bot-config", str(bot_config_path)])
+            ws_args.extend([
+                "--audit-db",
+                str(inbound_audit_db),
+                "--lock-path",
+                str(lock_root / "feishu-ws.lock"),
+            ])
+            add(
+                f"launchd/{ws_label}.plist",
+                _launchd_plist(
+                    label=ws_label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=ws_args,
+                    log_root=log_root,
+                    env_file=env_file_path,
+                    keep_alive=True,
+                ),
+                install_path=f"~/Library/LaunchAgents/{ws_label}.plist",
+                kind="launchd_plist",
+                service_name=ws_label,
+            )
+
+        if include_wechat_clawbot:
+            assert wechat_clawbot_config_key_value is not None
+            wechat_label = "com.options-monitor.wechat-clawbot"
+            wechat_args = [
+                om,
+                "channel",
+                "wechat-clawbot",
+                "serve",
+                "--label",
+                wechat_clawbot_label_value,
+                "--state-dir",
+                str(wechat_clawbot_state_dir),
+                "--config-path",
+                str(config_by_market.get(wechat_clawbot_config_key_value) or config_by_market[market_values[0]]),
+            ]
+            if bot_config_path is not None:
+                wechat_args.extend(["--bot-config", str(bot_config_path)])
+            wechat_args.extend([
+                "--audit-db",
+                str(inbound_audit_db),
+                "--lock-path",
+                str(lock_root / "wechat-clawbot.lock"),
+            ])
+            if wechat_clawbot_allowed_senders_explicit:
+                wechat_args.extend(["--allowed-senders", wechat_clawbot_allowed_senders_value])
+            add(
+                f"launchd/{wechat_label}.plist",
+                _launchd_plist(
+                    label=wechat_label,
+                    repo_root=repo,
+                    runtime_root=runtime,
+                    program_args=wechat_args,
+                    log_root=log_root,
+                    env_file=env_file_path,
+                    keep_alive=True,
+                ),
+                install_path=f"~/Library/LaunchAgents/{wechat_label}.plist",
+                kind="launchd_plist",
+                service_name=wechat_label,
+            )
+
+    profile = build_service_profile(
+        target=target_key,
+        repo_root=repo,
+        runtime_root=runtime,
+        accounts=account_values,
+        markets=market_values,
+        service_names=service_names,
+        config_paths=config_by_market,
+        bot_config_path=bot_config_path,
+        config_authoring=config_authoring,
+        env_file=env_file_path,
+        deploy_user=systemd_user,
+        deploy_home=systemd_home,
+        auto_upgrade_enabled=bool(include_auto_upgrade),
+        opend=_opend_profile(target_key, opend_service_plans),
+        feishu_ws={
+            "enabled": True,
+            "config_key": feishu_ws_config_key_value,
+            **({"bot_config_path": str(bot_config_path)} if bot_config_path is not None else {}),
+            "audit_db": str(inbound_audit_db),
+            "lock_path": str(lock_root / "feishu-ws.lock"),
+        } if include_feishu_ws else None,
+        wechat_clawbot={
+            "enabled": True,
+            "label": wechat_clawbot_label_value,
+            "config_key": wechat_clawbot_config_key_value,
+            "state_dir": str(wechat_clawbot_state_dir),
+            **({"bot_config_path": str(bot_config_path)} if bot_config_path is not None else {}),
+            "audit_db": str(inbound_audit_db),
+            "allowed_senders_configured": bool(wechat_clawbot_allowed_senders_value),
+            "allowed_senders_source": ("render_argument" if wechat_clawbot_allowed_senders_explicit else "config_yaml"),
+            **({"allowed_senders": wechat_clawbot_allowed_senders_value} if wechat_clawbot_allowed_senders_explicit else {}),
+            "lock_path": str(lock_root / "wechat-clawbot.lock"),
+        } if include_wechat_clawbot else None,
+        quality_monitoring={
+            "enabled": True,
+            "artifact_path": str(runtime / "output_shared" / "state" / "quality" / "status.v1.json"),
+            "regular_refresh_interval": QUALITY_REFRESH_INTERVAL_SYSTEMD,
+            "recheck_interval": QUALITY_RECHECK_INTERVAL_SYSTEMD,
+            "day_end_calendars": {
+                market: QUALITY_DAY_END_SYSTEMD_CALENDARS[market]
+                for market in market_values
+            },
+        } if include_quality_monitoring else None,
+        feishu_agent_credential={
+            "enabled": True,
+            "service_name": FEISHU_AGENT_CREDENTIAL_SERVICE,
+            "helper_path": str(credential_helper_path),
+            "agent_store": str(agent_credential_store),
+            "holdings_store": str(holdings_credential_store),
+            "runtime_env_file": str(credential_env_file),
+            "consumer_services": credential_consumers,
+        } if include_feishu_agent_credential else None,
+        secret_credentials={
+            "enabled": True,
+            "backend": "systemd",
+            **({"binding_policy": "enabled-consumers-v1"} if feature_aware_credentials else {}),
+            "delivery": secret_delivery,
+            "store_root": str(secret_store_root),
+            **(
+                {
+                    "helper_path": str(DEFAULT_SECRET_CREDENTIAL_HELPER),
+                    "runtime_root": str(DEFAULT_SECRET_CREDENTIAL_RUNTIME_ROOT),
+                }
+                if secret_delivery == "runtime-files"
+                else {}
+            ),
+            "service_credentials": {
+                service_name: list(logical_names)
+                for service_name, logical_names in secret_credential_bindings.items()
+            },
+            "legacy_env_materializer_enabled": False,
+        } if include_secret_credentials else None,
+    )
+    profile_content = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
+    add(
+        "service.profile.json",
+        profile_content,
+        install_path=str(runtime / "service.profile.json"),
+        kind="service_profile",
+    )
+
+    commands = _install_commands(target_key, files=files, runtime_root=runtime)
+    return {
+        "target": target_key,
+        "repo_root": str(repo),
+        "runtime_root": str(runtime),
+        **({"env_file": str(env_file_path)} if env_file_path is not None else {}),
+        **({"deploy_user": str(systemd_user)} if systemd_user else {}),
+        **({"deploy_home": str(systemd_home)} if systemd_home is not None else {}),
+        **({"opend": _opend_profile(target_key, opend_service_plans)} if opend_service_plans else {}),
+        "accounts": account_values,
+        "markets": market_values,
+        "files": [item.to_dict(include_content=include_content) for item in files],
+        "commands": commands,
+        "summary": {
+            "file_count": len(files),
+            "service_count": len(service_names),
+            "service_provider": target_key,
+        },
+    }
+
+
+def _install_commands(target: ServiceTarget, *, files: list[RenderedServiceFile], runtime_root: Path) -> dict[str, list[str]]:
+    mkdirs = [
+        "mkdir -p "
+        + " ".join(shlex.quote(str(path)) for path in (runtime_root, runtime_root / "logs", runtime_root / "locks"))
+    ]
+    if target == "systemd":
+        timer_names = [
+            Path(item.install_path).name
+            for item in files
+            if item.kind == "systemd_timer"
+        ]
+        service_names = [
+            Path(item.install_path).name
+            for item in files
+            if item.kind == "systemd_service"
+            and not Path(item.install_path).name.endswith("-alert.service")
+            and (
+                "opend" in item.install_path
+                or "trade-intake" in item.install_path
+                or "feishu-ws" in item.install_path
+                or "wechat-clawbot" in item.install_path
+                or Path(item.install_path).name == FEISHU_AGENT_CREDENTIAL_SERVICE
+            )
+        ]
+        return {
+            "prepare": mkdirs,
+            "reload": ["systemctl daemon-reload"],
+            "enable": [*(f"systemctl enable --now {name}" for name in timer_names), *(f"systemctl enable --now {name}" for name in service_names)],
+            "status": [*(f"systemctl status {name}" for name in service_names), "systemctl list-timers 'options-monitor*'"],
+        }
+    labels = [
+        Path(item.install_path).name.removesuffix(".plist")
+        for item in files
+        if item.kind == "launchd_plist"
+    ]
+    return {
+        "prepare": mkdirs,
+        "enable": [*(f"launchctl bootstrap gui/$UID ~/Library/LaunchAgents/{label}.plist" for label in labels)],
+        "status": [*(f"launchctl print gui/$UID/{label}" for label in labels)],
+    }
+
+
+def write_service_bundle(bundle: dict[str, Any], output_dir: str | Path) -> list[str]:
+    root = Path(output_dir).expanduser().resolve()
+    written: list[str] = []
+    for item in bundle.get("files", []):
+        if not isinstance(item, dict):
+            continue
+        rel = str(item.get("relative_path") or "").strip()
+        content = str(item.get("content") or "")
+        if not rel:
+            continue
+        path = (root / rel).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        mode = item.get("mode")
+        if mode is not None:
+            path.chmod(int(mode))
+        written.append(str(path))
+    return written
+
+
+def _status_from_checks(checks: list[dict[str, Any]]) -> dict[str, Any]:
+    error_count = sum(1 for item in checks if item.get("status") == "error")
+    warn_count = sum(1 for item in checks if item.get("status") == "warn")
+    return {"ok": error_count == 0, "error_count": error_count, "warning_count": warn_count}
+
+
+def _check_env_file(path: Path) -> dict[str, Any]:
+    if path.exists() and path.is_file():
+        return {"name": "env_file", "status": "ok", "message": "environment file exists", "value": str(path)}
+    if path.exists() and path.is_dir():
+        return {
+            "name": "env_file",
+            "status": "error",
+            "message": "environment path is a directory; expected a file",
+            "value": str(path),
+        }
+    return {"name": "env_file", "status": "error", "message": "environment file is missing", "value": str(path)}
+
+
+def _check_writable_dir(path: Path, *, name: str) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "name": name,
+            "status": "error",
+            "message": "directory is missing",
+            "value": {"path": str(path), "repair": f"mkdir -p {shlex.quote(str(path))}"},
+        }
+    if not path.is_dir():
+        return {"name": name, "status": "error", "message": "path exists but is not a directory", "value": str(path)}
+    perms = {
+        "readable": os.access(path, os.R_OK),
+        "writable": os.access(path, os.W_OK),
+        "executable": os.access(path, os.X_OK),
+    }
+    ok = all(perms.values())
+    return {
+        "name": name,
+        "status": "ok" if ok else "error",
+        "message": "directory permissions ok" if ok else "directory is not readable/writable/executable by current user",
+        "value": {"path": str(path), **perms},
+    }
+
+
+def _json_parse_error_details(exc: JSONDecodeError) -> dict[str, Any]:
+    return {
+        "error": str(exc),
+        "line": int(exc.lineno),
+        "column": int(exc.colno),
+        "position": int(exc.pos),
+    }
+
+
+def _check_runtime_config(path: Path, *, market: str) -> dict[str, Any]:
+    if not path.exists():
+        return {"name": f"runtime_config_{market}", "status": "error", "message": "runtime config is missing", "value": str(path)}
+    if not path.is_file():
+        return {"name": f"runtime_config_{market}", "status": "error", "message": "runtime config path is not a file", "value": str(path)}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except JSONDecodeError as exc:
+        return {
+            "name": f"runtime_config_{market}",
+            "status": "error",
+            "message": "runtime config JSON parse failed",
+            "value": {"path": str(path), **_json_parse_error_details(exc)},
+        }
+    except Exception as exc:
+        return {
+            "name": f"runtime_config_{market}",
+            "status": "error",
+            "message": "runtime config read failed",
+            "value": {"path": str(path), "error": f"{type(exc).__name__}: {exc}"},
+        }
+    if not isinstance(payload, dict):
+        return {"name": f"runtime_config_{market}", "status": "error", "message": "runtime config must be a JSON object", "value": str(path)}
+    if not isinstance(payload.get("_generated"), dict):
+        return {
+            "name": f"runtime_config_{market}",
+            "status": "error",
+            "message": "runtime config is missing generation metadata",
+            "value": {
+                "path": str(path),
+                "repair": f"./om config build --source yaml --market {market} --output {shlex.quote(str(path))}",
+                "authoring": "create config.yaml, then rebuild the runtime config",
+            },
+        }
+    return {"name": f"runtime_config_{market}", "status": "ok", "message": "runtime config metadata exists", "value": str(path)}
+
+
+def service_preflight(
+    *,
+    runtime_root: str | Path,
+    env_file: str | Path | None = None,
+    accounts: list[str] | tuple[str, ...] | None = None,
+    config_paths: dict[str, str | Path] | None = None,
+) -> dict[str, Any]:
+    runtime = Path(runtime_root).expanduser().resolve()
+    account_values = normalize_accounts(accounts)
+    checks: list[dict[str, Any]] = []
+
+    if env_file is not None and str(env_file).strip():
+        checks.append(_check_env_file(Path(env_file).expanduser()))
+
+    for name, path in (
+        ("runtime_root", runtime),
+        ("locks", runtime / "locks"),
+        ("output_accounts", runtime / "output_accounts"),
+        ("output_shared", runtime / "output_shared"),
+    ):
+        checks.append(_check_writable_dir(path, name=name))
+
+    for market, raw_path in sorted((config_paths or {}).items()):
+        if raw_path is not None and str(raw_path).strip():
+            checks.append(_check_runtime_config(Path(raw_path).expanduser(), market=str(market)))
+
+    summary = _status_from_checks(checks)
+    return {
+        "runtime_root": str(runtime),
+        "accounts": account_values,
+        "checks": checks,
+        "repair_commands": [],
+        "summary": summary,
+    }
+
+
+def load_service_profile(path: str | Path) -> dict[str, Any]:
+    profile_path = Path(path).expanduser()
+    payload = json.loads(profile_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("service profile must be a JSON object")
+    return payload
+
+
+def service_status_from_profile(
+    profile: dict[str, Any],
+    *,
+    include_status: bool = False,
+    include_enabled: bool = False,
+    run_cmd: Callable[..., Any] = subprocess.run,
+    deadline_monotonic: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    per_probe_timeout_sec: float = 1.0,
+    query_timeout_sec: float = 10.0,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    provider = str(profile.get("service_provider") or profile.get("provider") or "manual").strip().lower()
+    services_raw = profile.get("services")
+    services = services_raw if isinstance(services_raw, list) else []
+    normalized_services: list[dict[str, Any]] = []
+    for item in services:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("label") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name:
+            normalized_services.append({"name": name})
+    out = {
+        "provider": provider,
+        "runtime_root": profile.get("runtime_root"),
+        "repo_root": profile.get("repo_root"),
+        "service_count": len(normalized_services),
+        "services": normalized_services,
+        "status_checked": bool(include_status),
+    }
+    if not include_status:
+        return out
+    local_deadline = monotonic() + max(0.0, min(float(query_timeout_sec), 10.0))
+    if deadline_monotonic is not None:
+        local_deadline = min(local_deadline, float(deadline_monotonic))
+    checked: list[dict[str, Any]] = []
+    for service in normalized_services:
+        name = str(service.get("name") or "")
+        stop_reason = _service_probe_stop_reason(
+            deadline_monotonic=local_deadline,
+            cancelled=cancelled,
+            monotonic=monotonic,
+        )
+        active = (
+            {"status": "unknown", "reason": stop_reason}
+            if stop_reason
+            else _check_one_service(
+                provider=provider,
+                name=name,
+                run_cmd=run_cmd,
+                timeout_sec=min(per_probe_timeout_sec, max(0.001, local_deadline - monotonic())),
+            )
+        )
+        checked_service = {**service, **active}
+        if include_enabled:
+            stop_reason = _service_probe_stop_reason(
+                deadline_monotonic=local_deadline,
+                cancelled=cancelled,
+                monotonic=monotonic,
+            )
+            enabled = (
+                {"status": "unknown", "reason": stop_reason}
+                if stop_reason
+                else _check_one_service_enabled(
+                    provider=provider,
+                    name=name,
+                    run_cmd=run_cmd,
+                    timeout_sec=min(per_probe_timeout_sec, max(0.001, local_deadline - monotonic())),
+                )
+            )
+            checked_service["active"] = active
+            checked_service["enabled"] = enabled
+        checked.append(checked_service)
+    out["services"] = checked
+    return out
+
+
+def _service_probe_stop_reason(
+    *,
+    deadline_monotonic: float,
+    cancelled: Callable[[], bool] | None,
+    monotonic: Callable[[], float],
+) -> str | None:
+    if cancelled is not None:
+        try:
+            if cancelled():
+                return "query_cancelled"
+        except Exception:
+            return "query_cancelled"
+    if monotonic() >= deadline_monotonic:
+        return "query_deadline_exceeded"
+    return None
+
+
+def _check_one_service(
+    *, provider: str, name: str, run_cmd: Callable[..., Any], timeout_sec: float = 1.0
+) -> dict[str, Any]:
+    if provider == "systemd":
+        return _run_status_command(
+            ["systemctl", "is-active", name], run_cmd=run_cmd, timeout_sec=timeout_sec
+        )
+    if provider == "launchd":
+        return _run_status_command(
+            ["launchctl", "print", f"gui/{os.getuid()}/{name}"],
+            run_cmd=run_cmd,
+            timeout_sec=timeout_sec,
+        )
+    return {"status": "skipped", "message": f"service provider does not support command checks: {provider}"}
+
+
+def _check_one_service_enabled(
+    *, provider: str, name: str, run_cmd: Callable[..., Any], timeout_sec: float = 1.0
+) -> dict[str, Any]:
+    if provider == "systemd":
+        return _run_status_command(
+            ["systemctl", "is-enabled", name], run_cmd=run_cmd, timeout_sec=timeout_sec
+        )
+    if provider == "launchd":
+        return {"status": "skipped", "message": "launchd enabled state is managed by installed plist presence"}
+    return {"status": "skipped", "message": f"service provider does not support enabled checks: {provider}"}
+
+
+def _run_status_command(
+    command: list[str], *, run_cmd: Callable[..., Any], timeout_sec: float = 1.0
+) -> dict[str, Any]:
+    try:
+        proc = run_cmd(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=max(0.001, min(float(timeout_sec), 1.0)),
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "status": "unknown",
+            "command": command,
+            "reason": "probe_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "probe_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    stdout = str(getattr(proc, "stdout", "") or "").strip()
+    stderr = str(getattr(proc, "stderr", "") or "").strip()
+    rc = int(getattr(proc, "returncode", 1))
+    return {
+        "status": "ok" if rc == 0 else "warn",
+        "command": command,
+        "returncode": rc,
+        "stdout": stdout[:1000],
+        "stderr": stderr[:1000],
+    }
+
+
+def scheduled_tasks_from_profile(
+    profile: dict[str, Any],
+    *,
+    market: str,
+    authorized_accounts: tuple[str, ...] | list[str] | None = None,
+    deadline_monotonic: float | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    run_cmd: Callable[..., Any] = subprocess.run,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> dict[str, Any]:
+    """Return the bounded, safe scheduled-task projection for one market."""
+
+    provider = str(profile.get("service_provider") or profile.get("provider") or "manual").strip().lower()
+    if provider != "systemd":
+        return {
+            "tasks": [],
+            "coverage": "unavailable",
+            "availability": "unavailable",
+            "reasons": ["provider_unsupported"],
+        }
+
+    services_raw = profile.get("services")
+    if not isinstance(services_raw, list):
+        return {
+            "tasks": [],
+            "coverage": "unavailable",
+            "availability": "unavailable",
+            "reasons": ["profile_services_invalid"],
+        }
+    invalid_service_entry = any(
+        not isinstance(item, dict) or not str(item.get("name") or "").strip()
+        for item in services_raw
+    )
+    configured = {
+        str(item.get("name") or "").strip()
+        for item in services_raw
+        if isinstance(item, dict) and str(item.get("name") or "").strip().endswith(".timer")
+    }
+    markets_raw = profile.get("markets")
+    invalid_market_scope = not isinstance(markets_raw, list) or not markets_raw
+    known_profile_markets: set[str] = set()
+    if isinstance(markets_raw, list):
+        for value in markets_raw:
+            if isinstance(value, str) and value in {"us", "hk"}:
+                known_profile_markets.add(value)
+            else:
+                invalid_market_scope = True
+    if not known_profile_markets:
+        invalid_market_scope = True
+    profile_markets = tuple(sorted(known_profile_markets))
+    try:
+        profile_accounts = frozenset(accounts_from_config(profile, fallback=()))
+    except ValueError:
+        profile_accounts = frozenset()
+    authorized_account_set = frozenset(authorized_accounts or ())
+    declared: dict[str, tuple[str, ...]] = {}
+    reasons: list[str] = []
+    if invalid_service_entry:
+        reasons.append("profile_service_entry_invalid")
+    if invalid_market_scope:
+        reasons.append("profile_market_scope_invalid")
+    for name in configured:
+        markets = _scheduled_task_markets(name, profile_markets=profile_markets)
+        if markets:
+            declared[name] = markets
+    if configured - set(declared):
+        reasons.append("task_scope_unknown")
+
+    selected: list[tuple[str, tuple[str, ...]]] = []
+    shared_excluded = False
+    for name, markets in declared.items():
+        if market not in markets:
+            continue
+        if name in _SHARED_TIMER_NAMES and (
+            invalid_market_scope
+            or len(markets) > 1
+            or not profile_accounts
+            or not profile_accounts.issubset(authorized_account_set)
+        ):
+            shared_excluded = True
+            continue
+        selected.append((name, markets))
+    if shared_excluded:
+        reasons.append("shared_scope_excluded")
+
+    status = service_status_from_profile(
+        {"service_provider": provider, "services": [{"name": name} for name, _ in selected]},
+        include_status=True,
+        include_enabled=True,
+        run_cmd=run_cmd,
+        deadline_monotonic=deadline_monotonic,
+        cancelled=cancelled,
+        monotonic=monotonic,
+    )
+    statuses = {
+        str(item.get("name") or ""): item
+        for item in status.get("services") or []
+        if isinstance(item, dict)
+    }
+    tasks: list[dict[str, Any]] = []
+    for name, markets in sorted(selected):
+        raw = statuses.get(name, {})
+        active, active_reason = _systemd_task_state(raw.get("active"), kind="active")
+        enabled, enabled_reason = _systemd_task_state(raw.get("enabled"), kind="enabled")
+        task_reasons = sorted({reason for reason in (active_reason, enabled_reason) if reason})
+        tasks.append(
+            {
+                "id": f"{provider}:{name}",
+                "name": name,
+                "markets": list(markets),
+                "configured": True,
+                "enabled": enabled,
+                "active": active,
+                "availability": "partial" if task_reasons else "available",
+                "reasons": task_reasons,
+            }
+        )
+    task_reasons = sorted({reason for task in tasks for reason in task["reasons"]})
+    reasons = sorted(set(reasons + task_reasons))
+    coverage = (
+        "partial"
+        if any(
+            reason in reasons
+            for reason in (
+                "profile_service_entry_invalid",
+                "profile_market_scope_invalid",
+                "shared_scope_excluded",
+                "task_scope_unknown",
+            )
+        )
+        else "complete"
+    )
+    availability = "partial" if coverage == "partial" or task_reasons else "available"
+    return {"tasks": tasks, "coverage": coverage, "availability": availability, "reasons": reasons}
+
+
+def _scheduled_task_markets(
+    name: str, *, profile_markets: tuple[str, ...]
+) -> tuple[str, ...]:
+    match = _MARKET_TIMER_RE.fullmatch(name)
+    if match:
+        return (match.group(1),)
+    if name in _SHARED_TIMER_NAMES and profile_markets:
+        return profile_markets
+    return ()
+
+
+def _systemd_task_state(raw: Any, *, kind: str) -> tuple[str, str | None]:
+    if not isinstance(raw, dict):
+        return "unknown", f"{kind}_not_queried"
+    reason = str(raw.get("reason") or "").strip()
+    if reason:
+        return "unknown", f"{kind}_{reason}"
+    stdout = str(raw.get("stdout") or "").strip().lower()
+    stderr = str(raw.get("stderr") or "").strip().lower()
+    if kind == "active" and stdout in {"active", "inactive"}:
+        return stdout, None
+    if kind == "enabled" and stdout in {"enabled", "disabled"}:
+        return stdout, None
+    if "permission denied" in stderr or "access denied" in stderr:
+        return "unknown", f"{kind}_permission_denied"
+    combined = f"{stdout} {stderr}"
+    if any(value in combined for value in ("not-found", "not found", "could not be found", "does not exist")):
+        return "unknown", f"{kind}_not_found"
+    known = next((value for value in ("masked", "static", "failed") if stdout == value), None)
+    return "unknown", f"{kind}_{known.replace('-', '_') if known else 'probe_failed'}"
+
+
+__all__ = [
+    "DEFAULT_SECRET_CREDENTIAL_DELIVERY",
+    "DEFAULT_SECRET_CREDENTIAL_HELPER",
+    "DEFAULT_SECRET_CREDENTIAL_RUNTIME_ROOT",
+    "build_service_profile",
+    "default_runtime_root",
+    "load_service_profile",
+    "normalize_accounts",
+    "normalize_markets",
+    "normalize_secret_credential_delivery",
+    "normalize_target",
+    "render_service_bundle",
+    "service_preflight",
+    "scheduled_tasks_from_profile",
+    "service_status_from_profile",
+    "write_service_bundle",
+]

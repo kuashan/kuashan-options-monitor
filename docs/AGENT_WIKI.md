@@ -1,0 +1,1035 @@
+# Agent Handbook - options-monitor
+
+> This is the task-driven manual for local agents working in `options-monitor`.
+> Keep `AGENTS.md` short enough for prompt prefix use; put detailed execution guidance here.
+
+## 1. Operating Model
+
+`options-monitor` is an operations-sensitive local monitoring system for options strategies.
+Local agents should treat it as production tooling:
+
+- Inspect before changing.
+- Prefer read-only tools before runtime commands.
+- Keep production config, notification sends, Feishu writes, and broker-facing state behind explicit user intent.
+- Use existing public facades before importing internals or calling scripts.
+- Preserve unrelated local edits.
+
+Primary entry points:
+
+| Need | Entry |
+|---|---|
+| Structured tool call / JSON response | `./om-agent` Tool Gateway |
+| Local or remote message handling | `./om bot handle` Inbound Bot |
+| Human/operator command | `./om` |
+| Runtime tick | `./om run tick ...` |
+| Guarded production tick wrapper | `./om run tick-cron ...` |
+| MacBook Codex online-evidence handoff | `./om research collect ...` |
+
+Entrypoint rule:
+
+- Use `./om-agent` for structured local JSON tool calls, manifest checks, and
+  read-first diagnostics.
+- Use `./om bot handle` for local or remote messages. This is the
+  Inbound Bot surface.
+- Explicit commands and pending-operation replies use deterministic Control.
+  Every other message enters the single read-only `om_chat` Bot Scene when
+  `bot.enabled` is true. There is no business router, per-Scene
+  channel allowlist, planner fallback, or write-capable model path.
+
+For the canonical entry and layer boundaries, see
+[ARCHITECTURE.md](ARCHITECTURE.md) and [INBOUND_CONTROL.md](INBOUND_CONTROL.md).
+For capability boundaries, risk classes, Inbound Bot exposure, and
+verification maps, see [OM_AGENT_CAPABILITY_MAP.md](OM_AGENT_CAPABILITY_MAP.md).
+
+## 2. First Five Minutes
+
+Start with the direct owner and enough evidence to answer the task; expand when a gap remains:
+
+```bash
+git status --short
+rg -n "<user keyword>" README.md docs AGENTS.md src domain tests
+```
+
+Read only the relevant sections of this handbook. Use `./om-agent spec` when tool discovery or a manifest contract is part of the question.
+
+For live quality or runtime questions, first bind the host, effective config/runtime root, market, account scope, and evidence time. Local artifacts do not establish remote production state. The `us` and `lx` values below are examples, not defaults; use the selected environment and inspect existing state before choosing additional readiness checks:
+
+```bash
+./om-agent run --tool runtime_status --input-json '{"config_key":"us"}'
+./om-agent run --tool healthcheck --input-json '{"config_key":"us"}'
+./om-agent run --tool scheduler_status --input-json '{"config_key":"us","account":"lx"}'
+```
+
+Do not run tick, send notifications, mutate positions, sync Feishu, or deploy unless the user explicitly asks for that side effect.
+
+### Futu quote and broker capability routing
+
+Generic market facts use the effective Futu bindings from `symbols[].fetch`; account facts use the selected account's broker binding. These are separate authorities even when both resolve to the same OpenD process. Quote-only code must not construct a trade context, and broker-only code must not construct a quote context.
+
+Before applying a multi-market or multi-account runtime configuration, validate all rendered configs together:
+
+```bash
+./om config validate \
+  --config-path /path/to/config.us.json \
+  --market us \
+  --related-config-path /path/to/config.hk.json
+```
+
+The additive `futu_routing_audit.v1` result is read-only and contains masked account identities. It fails when quote bindings do not converge, one account drifts across runtime configs, multiple Futu accounts share a broker endpoint, required account IDs are incomplete, or an enabled direct trade-intake source differs from its broker binding. This validates configured endpoints only; production rollout must still prove that distinct broker endpoints map to distinct OpenD PIDs.
+
+`healthcheck` reports typed `opend_quote_readiness_<endpoint>` and `opend_broker_readiness_<account>_<endpoint>` facts while preserving the legacy readiness summary projection. An account's primary Futu path depends on broker readiness, not quote readiness.
+
+For explicit Control operation diagnosis, read the durable operation timeline:
+
+```bash
+./om-agent run --tool operation_timeline --input-json '{"limit":10}'
+```
+
+Bot sessions, runs, and model/tool events are owned by the Bot Host
+store. Control audit rows must not be repackaged as synthetic Agent plans or
+evidence sessions.
+
+## 3. Tool Selection
+
+Use the lowest-risk tool that can answer the question.
+
+| Question | First tool or file | Why |
+|---|---|---|
+| Is the online run healthy? | `runtime_status` | Reads existing runtime artifacts without running pipelines |
+| Can this environment run? | `healthcheck` | Validates readiness and dependencies |
+| Did cron/tick decide to skip? | `scheduler_status`, `scheduler_decision.json` | Separates scheduler rules from cron execution |
+| Why did a symbol disappear? | `symbol_resolve` if identity is unclear, then `candidate_filter_explain` | Uses sealed snapshot and trace evidence instead of guessing from a terminal candidate list |
+| Why is candidate ranking odd? | `candidate_rank_explain` | Explains the sealed candidate snapshot ranking |
+| Is candidate evidence complete enough for scan diagnosis? | `healthcheck` / `doctor` with `candidate_evidence` inputs | Diagnostic row-count/readiness check, not a strategy recommendation |
+| Is Cash-Secured Put (CSP) cash constrained? | `query_cash_headroom` | Account-aware cash and collateral view |
+| Is ledger projection trustworthy? | `option_positions_read action=inspect`, Research `ledger` scope | Reads canonical event/projection state |
+| What does the current Close Advice report say? | `close_advice_read` | Reads the latest sealed scheduled report without refreshing inputs or generating advice |
+| What evidence should MacBook Codex analyze? | `research` | Builds a redacted evidence bundle and handoff |
+
+## 4. Research Workflow
+
+Research is an independent offline evidence module. It is not Inbound Bot
+core, not an `./om-agent` tool, and not an online AI product feature. The
+online/Linux side collects redacted evidence. MacBook Codex reads the handoff and
+helps diagnose quality issues, ledger problems, and candidate behavior.
+
+### Common Server Command
+
+```bash
+./om research collect \
+  --config-key us \
+  --scope full \
+  --output both \
+  --no-write-outputs
+```
+
+With scheduler evidence from the online job runner:
+
+```bash
+./om research collect \
+  --config-key us \
+  --scope full \
+  --output both \
+  --no-write-outputs \
+  --scheduler-evidence-json '{"provider":"cron","job_name":"us-tick","last_run_id":"20260518T095446Z-2e7d54","last_triggered_at":"2026-05-18T09:54:46Z","last_status":"success","last_exit_code":0}'
+```
+
+With a readiness snapshot:
+
+```bash
+./om research collect \
+  --config-key us \
+  --scope full \
+  --include-healthcheck \
+  --no-write-outputs
+```
+
+To collect a payload-free storage and capacity baseline for a selected runtime
+root:
+
+```bash
+./om research storage-baseline \
+  --runtime-root /var/lib/options-monitor
+```
+
+The command traverses only the fixed runtime subroots, does not follow
+symlinks, and never opens the source ledger. It copies the source SQLite
+`db/wal/shm` set to a temporary directory after a bounded stability check, then
+queries aggregate row/JSON-byte counts from that copy in `mode=ro` with
+`query_only=ON`. Research payload bodies are neither read nor hashed: declared
+manifest hashes and sizes are capacity metadata, while current content remains
+`not_verified`. The payload-free account baseline is the count of immediate,
+non-symlink directories under `output_accounts`; missing or unsafe roots remain
+explicitly unavailable instead of being inferred from file counts.
+
+Pass prior reports in chronological order to obtain a measured growth and
+90-day forecast; one observation remains `insufficient_history`:
+
+```bash
+./om research storage-baseline \
+  --runtime-root /var/lib/options-monitor \
+  --history-report ./baseline-2026-06.json \
+  --history-report ./baseline-2026-07.json \
+  --output ./baseline-2026-08.json
+```
+
+`--output` writes one atomic local JSON file and must point outside the
+inventoried runtime root. Existing output is refused unless `--overwrite` is
+explicit. Capacity warnings and cold-candidate rows are read-only decision
+previews; this command has no move, delete, compact, checkpoint, repair, or
+notification action.
+
+Canonical scan-blob garbage collection has a separate read-only preview:
+
+```bash
+./om research storage-gc-preview --runtime-root /var/lib/options-monitor
+```
+
+It keeps runs within 14 days or among the latest 200, verifies every blob
+reachable from protected manifests, and reports only unreachable blobs older
+than the 24-hour orphan grace period. Any invalid protected manifest or
+missing/corrupt referenced blob suppresses all candidates. There is no confirm
+or delete mode.
+
+Historical cleanup has a separate gated preview:
+
+```bash
+./om research storage-cleanup-preview \
+  --runtime-root /var/lib/options-monitor \
+  --lifecycle-inventory ./lifecycle-migration-inventory.json \
+  --quality-cutover-evidence ./quality-cutover-evidence.json \
+  --backup-proof ./historical-cleanup-backup-proof.json \
+  --history-report ./baseline-previous.json
+```
+
+The first run can omit `--backup-proof` to obtain
+`expected_backup_bindings`; it remains `not_ready` and emits no candidates.
+The proof must describe a standalone, integrity-checked SQLite backup whose
+logical contents and projection/lifecycle bindings match the live ledger.
+This command is preview-only: it never moves, deletes, vacuums, or rewrites
+data, and it has no `--confirm` or `--delete` mode. Even a ready result only
+authorizes a later operator decision. Legacy required-data CSV/base64 files,
+ledger history rows, and the local Research archive are explicitly excluded.
+Actual cleanup requires separate authorization and an implemented write path.
+
+Sealed required-data snapshots also publish one deterministic gzip payload per
+symbol at
+`output_shared/blobs/sha256/<first-two-hex>/<sha256>.json.gz`; the run's
+`state/required_data_snapshot_manifest.json` is the commit/root that retains the
+exact blob reference. New scheduled receipts contain the blob reference but no
+inline base64. After a terminal manifest is durable, OM best-effort retires the
+run-local raw JSON and CSV shadows; `required_data_shadow_cleanup` reports only
+the trigger and removed/absent/failed file and byte counts. Cleanup failure is
+degraded telemetry and cannot change the sealed snapshot, barrier, or account
+result. Legacy/manual receipts without a blob reference and historical
+dual-output receipts remain readable and are never rewritten. A sealed reader
+falls back only when the reference is absent and fails closed instead of hiding
+a bad reference with legacy data. Archive collection transfers only blob hashes
+reachable from selected run roots, never the whole shared blob store.
+
+The frozen consumer boundary is deliberate: ordinary scan/filter steps receive
+the single frame materialized by the sealed snapshot resolver; Close Advice and
+Daily Brief consume the same sealed bytes.
+Prefetch, multiplier enrichment, coverage checks, quote-cache validation, and
+request-local materialization tools operate before sealing and therefore still
+use their producer workspace. Research archive collection resolves the sealed
+manifest/blob even when run-local raw/CSV shadows are absent; parsed CSV remains
+a historical fallback only.
+
+The Phase 6 storage harness uses a checked-in metadata-only p99 descriptor and
+deterministic synthetic rows; it has no production-runtime input:
+
+```bash
+./.venv/bin/python scripts/benchmark_required_data_scan_blobs.py \
+  --profile canonical --output docs/gateflow/scan-blob-canonical-performance.json
+```
+
+The default 5 warmups and 30 repetitions are the formal labels. Lower counts
+are plumbing smoke only. Formal benchmark receipts remain gitignored process
+evidence and are not source-release artifacts. The only profile, `canonical`, executes
+compact receipt publication, seal, durability cleanup, and blob-only resolution.
+It gates deterministic fixture integrity, retained bytes, Python allocation,
+cleanup counts, and resolved bytes; timing is host-specific diagnostic evidence.
+
+To measure the current canonical position projector and the real SQLite full-
+replay writer on deterministic synthetic data:
+
+```bash
+./.venv/bin/python scripts/benchmark_data_storage_projection.py \
+  --baseline ./baseline-2026-08.json \
+  --scenario all \
+  --output-dir ./projection-benchmark-2026-08
+```
+
+The output directory must be absent or empty. The runner never opens a runtime
+ledger: it derives bounded dimensions from aggregate baseline metadata, creates
+fresh temporary SQLite ledgers, and atomically publishes `fixture-manifest.json`,
+`timing.json`, `cpu-profile.json`, `allocation-profile.json`, and
+`decision.json`, plus `phase-3a-acceptance.json`. Omit `--baseline` to use
+deterministic safe defaults. Synthetic fixture construction, distribution
+statistics, and the shared schema constants live in
+`scripts/benchmark_support.py`, which this runner and
+`scripts/benchmark_current_decision_projection_slice2.py` both import.
+
+Timing uses 5 warmups and 30 measured repetitions by default. Lower values are
+allowed for plumbing checks but are labeled `non_acceptance_smoke`. `cProfile`
+and `tracemalloc` run in separate child processes and therefore never influence
+the threshold timing. The `history_10x` result contains both a fixed-output
+history-cost case and a retained-closed-lot case, each with at least 10,000
+events. It also measures `research_storage_status.history_10x` against a
+deterministic 10,000-partition manifest fixture. Fixture construction and module
+imports are outside the storage timing/allocation scope; the decision freezes
+p95 wall at 5 seconds and Python peak allocation at 64 MiB while preserving
+zero payload-content reads and zero runtime mutations. Use
+`--scenario research_storage_status` to run only that component.
+
+Absolute p95 wall/CPU decisions require an exact host-profile match, including
+separate CPU and hardware-model fields. First run
+without a reference to record the `host_fingerprint`; only a deliberately
+designated reference run should repeat with:
+
+```bash
+./.venv/bin/python scripts/benchmark_data_storage_projection.py \
+  --scenario history_10x \
+  --reference-host-fingerprint <recorded-sha256> \
+  --output-dir ./projection-benchmark-reference
+```
+
+Without an exact match, timing is still reported but the writer gate is
+`not_comparable`. `projector_only` is diagnostic evidence, not a writer pass.
+For checkpoint/tail acceptance, first produce a passing read-only shadow
+manifest for the exact target store, then run:
+
+```bash
+./.venv/bin/python scripts/benchmark_data_storage_projection.py \
+  --scenario phase_3a \
+  --reference-host-fingerprint <recorded-sha256> \
+  --shadow-manifest ./projection-shadow.json \
+  --output-dir ./projection-benchmark-phase3a
+```
+
+Only the default 5 warmups / 30 repetitions on the exact reference host can
+produce `lot_diff_publication=pass`, `checkpoint_tail=pass`, combined
+`ready`, and a passing acceptance manifest. The benchmark uses synthetic
+ledgers and never applies a migration or enables a runtime store. The
+`retained_lots_10x` fingerprint result is a capacity diagnostic with
+`retained_lots_10x_guarantee=false`, not a hidden activation gate.
+
+### Scopes
+
+| Scope | Purpose |
+|---|---|
+| `ledger` | Trade intake, position maintenance, and ledger quality evidence |
+| `candidate` | Per-account candidate evidence, ranking samples, filter traces, and Combo Yield pair rejection funnel / nearest misses |
+| `quality` | Runtime freshness, latest run status, scheduler evidence, optional healthcheck |
+| `full` | Combined default |
+
+Research reads candidate facts only from manifest-bound opening/Combo/CC+LP snapshots. `candidate_filter_trace.jsonl` may supplement rejection evidence but cannot create a candidate universe. Historical CSV-only runs are reported as unsupported and their CSV bytes are never parsed.
+
+Default runs do not write files. Writing reports through `./om research collect`
+requires `--write-outputs --confirm`. Default output locations are:
+
+```text
+output_shared/research/
+output_shared/state/current/research.current.json
+```
+
+MacBook SSH pattern:
+
+```bash
+ssh prod 'cd /path/to/options-monitor && ./om research collect \
+  --config-key us \
+  --scope full \
+  --output handoff \
+  --no-write-outputs' \
+| ./.venv/bin/python -c 'import json,sys; print(json.load(sys.stdin)["data"]["handoff_markdown"])'
+```
+
+Recommended Codex prompt:
+
+```text
+你现在作为 OM research analyst。请基于下面的 Research Handoff 分析线上质量问题，
+重点看持仓/交易一致性、多账户对 CSP / Covered Call (CC) / YE 的影响，
+输出：问题判断、证据、优先级、本地修复建议和需要补充的证据。
+```
+
+## 5. Runtime Evidence Map
+
+Important runtime paths:
+
+| Artifact | Path |
+|---|---|
+| Shared state | `output_shared/state/` |
+| Current pointers | `output_shared/state/current/` |
+| Per-account output | `output_accounts/<account>/` |
+| Run snapshots | `output_runs/<run_id>/` |
+| Compact runtime shadow | `output_runs/<run_id>/accounts/<account>/state/runtime_portfolio_snapshot.v2.json`（旧 v1 产物仍可只读校验） |
+| Default reports | `output_shared/reports/` |
+| OpenD cache | `cache/opend_option_chain/`, `cache/opend_option_expirations/` |
+| Audit logs | `audit/run_logs/` |
+
+Compact runtime shadow 的 `ledger_shadow` 只记录当前决策 shadow 的状态；v2 不提供新旧五节对比结论。不可用的 current decision read 会让 ledger 和 cash occupation 明确标为不可用，并保留读取原因。历史 v1 的 `legacy_comparison` 五节相等结果来自自比，不能作为独立一致性证据。
+
+For runtime questions, prefer `runtime_status` because it already knows how to summarize these paths and distinguish latest run from latest scanned run.
+
+### 已退役的 AI Decision Advice
+
+AI Decision Advice 已从当前产品、配置、Tick、通知和服务渲染中删除。Daily Brief 只消费
+确定性的候选、持仓、资金、事件、拒绝原因和 Close Advice 事实。历史文件不会自动清理，
+旧 Collector unit 的生产移除也需要独立授权；完整边界见
+`docs/AI_DECISION_ADVICE_DESIGN.md` 的退役记录。
+
+## 6. Module Ownership
+
+### Candidate Scanning
+
+- Domain engine: `domain/domain/engine/candidate_engine.py`
+- Application adapters: `src/application/candidate_scanning.py`, `src/application/scan_sell_put.py`, `src/application/scan_sell_call.py`
+- Rule: do not add parallel ranking logic in application adapters.
+
+Core domain functions:
+
+```python
+def evaluate_candidate_input(row: dict[str, Any]) -> dict[str, Any]: ...
+def evaluate_candidate_hard_constraints(payload: dict[str, Any], constraints: dict[str, Any]) -> dict[str, Any]: ...
+def evaluate_candidate_return_floor(payload: dict[str, Any], constraints: dict[str, Any]) -> dict[str, Any]: ...
+def evaluate_candidate_risk_filter(payload: dict[str, Any], constraints: dict[str, Any]) -> dict[str, Any]: ...
+def rank_candidate_rows(rows: list[dict[str, Any]], *, mode: StrategyMode | str) -> list[dict[str, Any]]: ...
+```
+
+### Candidate Diagnostics
+
+- Candidate ranking explanation: `src/application/agent_tools/candidate_rank_impl.py`
+- Filter trace explanation: `src/application/agent_tools/candidate_filter_impl.py`
+- Candidate evidence readiness: `healthcheck` / `doctor` `candidate_evidence` check
+- Docs: `docs/candidate_strategy.md`
+
+For "why did this symbol/account not get a candidate", start from `candidate_filter_explain` and the manifest-bound snapshot/trace evidence. If the user gives a Chinese name or alias, resolve it with `symbol_resolve` or pass the raw alias to `candidate_filter_explain`; `account` is scan scope, not symbol identity. Both candidate explanation tools validate the terminal manifest before reading the opening owner. Current standard runs require `candidate_snapshot_manifest.v4`, `strategy_scan_status_index.v5`, and the current owner schemas. A missing manifest, mixed versions, or a latest run that has started but is not terminal fails closed; the tools never skip it to explain an older snapshot. Only pass an explicit `run_id` for manual forensics of a known terminal run. Explicit historical inspection routes v1/v3 formal bundles through `candidate_evidence_history`; those results are marked limited and cannot be used as current executable evidence.
+
+For offline candidate evidence review, collect a candidate-scoped Research bundle first:
+
+```bash
+./om research collect --config-key us --scope candidate --run-id <run-id> --output json --no-write-outputs
+```
+
+Candidate evidence remains advisory and must not mutate production scanner config,
+Feishu, trade state, or notifications. Missing sealed snapshots or trace coverage
+must stay explicit instead of being reconstructed from historical option chains.
+
+When remote storage is constrained, use the shared Research archive surfaces:
+
+```bash
+./om research archive inventory --remote prod
+./om research archive pull --remote prod --ssh-target <host>
+./om research archive verify --remote prod
+```
+
+The default local archive is `output_shared/research/remote_archive/prod/`.
+`pull` is a dry run unless `--write` is passed; inventory and verify do not
+authorize a remote cleanup.
+
+### Tick Runtime
+
+- Orchestration spine: `src/application/multi_account_tick.py`
+- Helper modules:
+  - `tick_run_context`: idempotency bucket/key and completion records
+  - `tick_guard_flow`: project guard, load shedding, market filter, OpenD phone-verify gate, watchdog admission
+  - `tick_run_workspace`: run directory, required-data workspace, shared state pointer, immutable per-run account config authority
+  - `tick_scheduler_context`: trading-day guard, scheduler state path, scheduler decision
+  - `tick_account_execution`: account defaults, worker limits, ordered concurrent execution, account metrics
+  - `tick_notification_flow`: notification prep, quiet-hour decision, delivery, metrics, finalization
+
+Tick flow:
+
+```text
+./om run tick --config <runtime-config.json>  # manual scan; no ordinary Tick auto-send
+-> src.application.multi_account_tick.run_tick
+   -> tick_guard_flow
+   -> tick_scheduler_context
+   -> tick_account_execution
+      -> canonical account config write-once/adopt under `output_runs/<run_id>/accounts/<account>/`
+      -> expired position maintenance
+      -> required_data prefetch
+      -> pipeline_runtime / pipeline_watchlist / pipeline_symbol
+      -> optional close advice
+      -> immutable compact runtime shadow after terminal candidate commit
+      -> per-account metrics and notification text
+   -> tick_notification_flow  # scheduled only: Daily Decision Brief ordinary delivery
+   -> run state and audit writes
+```
+
+For each account, Tick serializes the effective runtime config once before prepared workers or account execution. The
+authoritative input is the write-once/adopt
+`output_runs/<run_id>/accounts/<account>/state/config.override.json`, bound to its SHA-256. Before shared planning or
+provider I/O, Tick validates that file against the parent-retained canonical bytes; a mismatch makes that account
+terminal for the run. After this final barrier, all
+parent and scan-child consumers use the retained generation instead of reopening mutable paths, so a later path
+replacement cannot split one run across two configs. Account labels are canonical lowercase path components
+(`[a-z0-9][a-z0-9_-]{0,63}`); an explicit empty scope, unsafe label, or symlinked artifact ancestor fails closed before
+run artifacts or config publication.
+
+After a scanned account commits its terminal candidate manifest, Tick publishes the account-scoped compact runtime
+snapshot above with write-once/adopt semantics. It is diagnostic evidence and a comparison surface only: legacy
+files, `AccountResult`, ranking, notification, and delivery remain authoritative. Missing, malformed, or conflicting
+compact data is reported as account-scoped `data_unavailable` and never repaired or substituted into the legacy path;
+rollback is removal of the compact consumer/call, not a history rewrite or runtime-data deletion.
+
+Prepared portfolio payloads use content-addressed names and a write-once/adopt manifest. The parent retains the manifest
+SHA-256 and passes it to the final scan child; both consumers therefore load the same prepared generation. The loader
+anchors manifest and payload reads to the expected runtime root/run/account through a no-follow directory chain, checks
+the account-config SHA-256, and verifies that Futu portfolio context and `filters.account` match the OM account label.
+Global Holdings risk uses a separate all-accounts context with source and observation evidence. A config or prepared-authority failure is isolated to its account; healthy accounts remain eligible for
+shared planning and required-data prefetch.
+Historical `output_accounts/<account>/state/config.override.json` files are preserved for forensics but are not read or
+written as Tick input authority. Historical sibling files directly under a run account directory are also preserved but
+ignored; they are not a fallback or an additional trust input.
+
+Direct `run tick` calls, including `--force`, still produce scan/run artifacts but do not auto-send ordinary Tick notifications. Use the guarded `run tick-cron` entry for scheduled ordinary delivery. Ordinary scan and Tick runs no longer create `symbols_alerts.txt`, `symbols_changes.txt`, or `symbols_notification.txt`; persisted Daily Brief state is their notification-content owner. Public runtime reads can still expose historical files or files created by the explicit manual `--stage-only alert|notify` compatibility commands as `compatibility_notification` with `authority=compatibility_only` and `delivery_evidence=false`. Those files are never evidence that the current run prepared or sent a Daily Brief; the old `notification` fields remain deprecated Phase A/B aliases scheduled for removal in Phase C.
+
+The `scheduler` command is decision/mark-only. Its legacy `--run-if-due` flag remains parseable for compatibility but returns `UNSUPPORTED_OPERATION` without reading runtime config/state or starting a child process. Use `./om run tick ...` for explicit scans and `./om run tick-cron ...` for guarded scheduled execution.
+
+Entrypoint signature:
+
+```python
+def run_tick(argv: list[str] | None = None) -> int: ...
+```
+
+### Ledger, Positions, And Trades
+
+Canonical chain:
+
+```text
+trade_events
+-> domain.domain.ledger.projection
+-> position_lots
+-> SQLite projection
+```
+
+Ownership:
+
+| Area | Files |
+|---|---|
+| Domain projection | `domain/domain/ledger/projection.py` |
+| Public application boundary | `src/application/ledger/api.py` |
+| Use-case commands | `src/application/ledger/commands.py` |
+| Repository/config boundary | `src/application/ledger/repository.py` facade；实现位于 `repository_*.py` |
+| Stored event codec | `src/application/ledger/event_codec.py` |
+| Event write and projection publish | `src/application/ledger/writer.py` facade；实现位于 `writer_*.py` |
+| Current decision projection | `src/application/ledger/current_decision_projection.py` facade；实现位于 `current_decision_*.py` |
+| Manual trades | `src/application/ledger/manual_trades.py` |
+| Void/repair interventions | `src/application/ledger/interventions.py` |
+| Auto-close maintenance | `src/application/ledger/maintenance.py`, `src/application/positions/auto_close.py` |
+| Position-facing workflows | `src/application/positions/` |
+| Trade-facing workflows | `src/application/trades/` |
+
+Core projection functions:
+
+```python
+def project_trade_events(events: list[TradeEvent]) -> ProjectionResult: ...
+def build_risk_position_views(lots: list[PositionLot]) -> list[RiskPositionView]: ...
+```
+
+Rules:
+
+- Local SQLite `trade_events` is the source of truth.
+- Feishu `option_positions` is retired and must not be used for bootstrap, sync, or strategy reads.
+- Non-ledger runtime code must enter through `src/application/ledger/api.py`.
+- Do not patch projected state directly when the canonical event chain is wrong.
+
+#### Current projection authority and resumable checkpoints
+
+`trade_events` remains the canonical history and `position_lots` remains the
+authoritative current projection. A row in `position_projection_checkpoints`
+is only a bounded resumable cache: it stores active continuation state, never
+replaces event history, and cannot authorize a read unless source/head/schema/
+implementation generations match exactly.
+
+Ordinary append-safe writers may resume from the newest trusted checkpoint and
+apply only its ordered tail. Explicit rebuild, audit, historical allocation,
+offline research, void/repair, unsafe ordering, or any trust mismatch use
+the canonical full history. Therefore checkpoint activation does not reduce
+forensic fidelity and does not delete closed lots or events.
+
+Checkpoint cadence is fixed in code: rotate after 100 tail events or 1 MiB of
+canonical tail bytes, whichever comes first. Ordinary writes between rotations
+write no checkpoint payload. Retention keeps at most the newest two trusted
+checkpoints plus the newest distinct full-oracle seed (`K <= 3`).
+
+Read-only operator surfaces:
+
+```bash
+./om option-positions --data-config <data.json> projection-migration inventory
+./om option-positions --data-config <data.json> projection-migration verify --shadow
+./om option-positions --data-config <data.json> projection-migration status
+```
+
+`inventory` and `verify --shadow` open the selected SQLite store read-only.
+`status` reports checkpoint mode/K/bytes, source and lot generations, last full
+verification, loaded implementation fingerprint timing, fingerprint rows/
+bytes, and bounded process-local fast/full/fallback wall/CPU summaries.
+`source_generation_mismatch`, `lots_generation_mismatch`, schema-cookie or
+implementation mismatch, an untrusted/missing checkpoint, or parity failure
+means the trusted path is unavailable; use full `verify`/rebuild and generate
+fresh evidence rather than overriding the reason.
+
+Write transitions are deliberately separate and require both the normal local
+write guard and high-risk confirmation:
+
+```bash
+./om option-positions --data-config <data.json> projection-migration apply \
+  --manifest <inventory.json> --apply --confirm
+./om option-positions --data-config <data.json> projection-migration activate \
+  --acceptance-manifest <phase-3a-acceptance.json> \
+  --shadow-manifest <projection-shadow.json> --apply --confirm
+./om option-positions --data-config <data.json> projection-migration deactivate \
+  --apply --confirm
+```
+
+`apply` backfills/indexes and seeds a trusted checkpoint but leaves mode
+disabled. `activate` requires exact current-store, source-commit, schema,
+implementation, generation, reference-host, benchmark, and shadow bindings.
+`deactivate` disables checkpoint use without deleting events, lots, heads, or
+checkpoints. Merging this source does not authorize a live apply/activate,
+release, deployment, service change, notification, broker write, or deletion;
+each remains a separate explicit operator action.
+
+#### Lot Identity Migration (D1-D4)
+
+A separate parent group from `projection-migration` above, with its own
+`schema_version` on every payload. It is **read-only**: `inventory` and `verify`
+both open the store without writing. The group's destructive half (`apply`: the
+D1/D2 rebuild, the D3/D4 payload rewrite and the one-off production window) was
+retired in R2 after that window closed, so nothing here rewrites a store.
+
+```bash
+./om option-positions --data-config <data.json> lot-identity-migration inventory
+./om option-positions --data-config <data.json> lot-identity-migration verify
+```
+
+`inventory` reports the pending D1/D2 column work, the D3 drop-set
+classification (`carried`/`reconstructible`/`lost`) and the §13.5 R6
+contract-scalar carrier distribution; its fingerprint binds it to one store.
+`verify` replays the projection from `trade_events` and judges the drop set; it
+never reuses a projection-verify checkpoint. Its `readiness_reasons` separate
+the cases an operator must not conflate:
+
+- `trade_events_not_replayable` — the stored events are not canonical
+  (`non_canonical_trade_event_schema`), so no lot-level verdict exists. This is
+  the reported state on a store whose `trade_events` predate the canonical
+  payload, and it is not a lot-identity failure.
+- `projection_replay_mismatch` — the replay ran and the stored lots differ.
+- `dropped_payload_keys_would_lose_facts` — a non-empty payload key (or a
+  `note` KV pair) has no surviving home; `blocking_keys` names them.
+
+The production migration window is closed. This build has no lot-identity
+`apply` or preview command. Recovering a legacy store requires separately
+authorized use of the released historical migration code or an approved restore.
+Repositories now require the final `lot_id` schema and refuse legacy or partial
+`position_lots` / `wheel_events` before an ordinary open can mutate the store.
+Historical `trade_events` remain readable through their compatibility decoder;
+that event compatibility is not permission to reopen legacy database shapes.
+
+#### Option Performance And Portfolio Bridges
+
+Primary read entry points:
+
+```bash
+./om option-performance report --config-key us --account lx --period mtd
+./om option-performance report --config-key us --account lx --period ytd --as-of-date 2026-07-17
+./om option-performance cash-conversion backfill --config-key us --account lx --start-date 2026-04-01 --end-date 2026-07-24
+./om-agent run --tool option_performance_report --input-json '{"config_key":"us","account":"lx","period":"mtd"}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_pnl_bridge --input-json '{"period":"mtd","as_of_month":"2026-07","accounts":["lx","sy"]}'
+PORTFOLIO_SERVICE_URL=http://127.0.0.1:8765 ./om-agent run --tool portfolio_cash_bridge --input-json '{"period":"mtd","as_of_month":"2026-07","accounts":["lx","sy"]}'
+```
+
+The report has four metrics only: `option_net_cashflow`,
+`sell_option_win_rate`, `buy_option_win_rate`, and `option_return`. Amounts stay
+in native currency, plus one root CNY cash-flow total backed only by persisted
+event-time `cash_conversion.v1` evidence; report reads never fetch current FX.
+PnL, stock cash, and assignment settlement are outside this module. The two
+portfolio bridge routes therefore return explicit unavailable states until
+independent authoritative sources exist.
+
+Missing actual fee evidence remains explicit and must never become zero. A configured
+account scope with no events is an observed zero; an unconfigured account is rejected.
+
+Cash backfill reads persisted event-time FX evidence, defaults to dry-run, and
+requires `--apply` for the atomic ledger enrichment plus audit receipt. It
+never replaces an already observed `cash_conversion.v1`.
+
+`monthly_income_report`, `./om option-positions report monthly-income`, and
+`portfolio_capital_bridge` have been removed. Do not recreate their ambiguous
+`net_income_cny` or generic return fields. The migration note is historical
+mapping only, not a callable rollback path.
+
+#### Historical Trade Receipt Compensation
+
+Use the guarded compensation mode only when an already-recorded open trade has
+the legacy false `outbox_managed` receipt marker and current evidence proves
+there was no durable outbox ID or confirmed provider message. Preview is the
+default and neither sends nor writes:
+
+```bash
+./om run trade-intake --config /var/lib/options-monitor/config.us.json \
+  --runtime-root /var/lib/options-monitor --compensate-receipts \
+  --account lx \
+  --deal-id futu:lx:<futu_account_id>:<deal_id_1> \
+  --deal-id futu:lx:<futu_account_id>:<deal_id_2> \
+  --dry-run
+```
+
+After reviewing the frozen message, exact member list, route fingerprint,
+delivery key, and `payload_hash`, the high-risk form requires `--apply`,
+`--confirm` (or `--yes`), and the reviewed value as
+`--expected-payload-hash <sha256>`. Any change to the members, message, or route
+fails closed and requires a new preview. Apply sends one combined historical
+receipt, never replays trade events or edits `position_lots`, and writes an
+independent content-addressed record under the source account's
+`receipt_compensations/` directory plus an audit event. A confirmed rerun is
+duplicate-suppressed. A prepared, send-started, accepted, unknown, or otherwise
+unconfirmed record is also frozen and must not be automatically resent.
+
+### Close Advice
+
+- Domain policy: `domain/domain/close_advice.py`
+- Runner/I/O assembly: `src/application/close_advice_runner.py`
+- Recommended agent entry: `close_advice_read`
+- Contract: `docs/CLOSE_ADVICE_CONTRACT.md`
+
+Core domain functions:
+
+```python
+def evaluate_close_advice(inp: CloseAdviceInput) -> dict[str, Any]: ...
+```
+
+The domain has one fixed `remaining_yield_capture.v3` policy for short puts and
+short calls. It returns only `close`, `hold`, or `not_evaluable`. The runner
+loads sealed position/quote facts, preserves fail-closed rows, and formats the
+report; it does not pair opening candidates or make replacement decisions.
+
+Only scheduled Tick produces current Close Advice reports. Agent callers use
+`close_advice_read`; the retired `prepare_close_advice_inputs`, `close_advice`,
+and `get_close_advice` tools no longer provide a mutable generation path.
+
+Scheduled Tick runs use one immutable required-data barrier for Close Advice:
+
+- Coverage policy v2 evaluates each planned `request x option_type x expiration`
+  scope. A scope with no filtered contracts is complete only when the producer's
+  `option_chain_scope_coverage.v1` evidence binds an empty code set to a current
+  `cache` or `fetched` chain result. Scope and contract-code order are not
+  semantic identity; duplicate or mismatched request/type/expiration identities
+  remain invalid. A fully observed filtered-empty plan is `success_empty` unless
+  an exact current held strike is required. When the OM quality cutover is
+  active, OM-POS uses each non-zero OpenD position code as exact lineage to its
+  canonical lot and compares the code's current market snapshot terms. A
+  confirmed strike or multiplier drift blocks its consumers until the canonical
+  lot is explicitly adjusted; Scheduled Tick omits that account/market's old
+  strike from the Close Advice prefetch plan. The gate also requires exactly one
+  current `om.option_positions` dataset for that account/market; missing or
+  ambiguous scope evidence is blocking. OpenD contract-term snapshot calls are
+  filtered to the requested market before batching, so another market's missing
+  terms cannot invalidate a healthy scope. A same-quantity contract with a
+  different broker code remains ordinary divergence, never inferred corporate
+  action. Close Advice does not use fuzzy strike matching. Missing requested snapshots,
+  exact held strikes, and stale/error provider outcomes remain fail-closed.
+  Unexpected snapshot codes are quarantined outside consumer rows and reported
+  as warnings.
+  Artifacts without scope evidence retain the legacy strict numeric-boundary
+  coverage behavior.
+
+- Before the single cross-account prefetch, enabled accounts contribute exact active position requirements to `output_runs/<run_id>/state/close_advice_required_data_plan.json`. Disabled accounts are `not_applicable` and are not part of the readiness denominator.
+- Candidate demand owns an already-selected symbol fetch route. A position requirement may join that route only when its resolved source, host, and port match; conflicting or ambiguous requirements become typed `required_data_route_conflict` gaps and never create a second fetch.
+- `required_data_snapshot_manifest.json` binds the requirements-plan path and hashes for the current run.
+- Scheduled Close Advice receives `quote_mode=frozen_snapshot` and may only read sealed required-data bytes and receipts. It performs zero OpenD fallback calls, cache repairs, or required-data writes. Missing coverage is a per-position `not_evaluable` gap; manifest, plan, receipt, or payload integrity failure invalidates the account pipeline and suppresses its normal Daily Brief.
+- Each Close Advice CSV row carries the snapshot-plan, manifest, requirement-plan, route-binding, snapshot, receipt, payload, observation-time, and expiry identifiers needed to trace the decision to its frozen inputs.
+
+The legacy mutable runner mode remains available to direct compatibility
+callers, but it is not the scheduled Tick authority. There is no portfolio
+allocator, replacement/reallocation plan, v2 authority, promotion state, or
+notification token around Close Advice.
+
+### Notifications
+
+- Manual compatibility content: `src/application/notify_symbols.py`
+- Scheduled delivery flow: `src/application/tick_notification_flow.py`
+- Scheduled business renderer: `src/application/daily_decision_brief_renderer.py`
+- Shared System Notice / Receipt presentation shell: `src/application/notification_shells.py`
+- Preview tool: `preview_notification`
+- Perception audit card: `bot_perception` events written by
+  `src/application/tick_notification_flow.py`
+- Read tool: `notification_perception_read`
+
+Notification text should remain Markdown-friendly and operationally direct. The
+business renderer owns one canonical flat Markdown string. Scheduled Feishu App
+Daily Brief delivery also persists a digest-verified Card JSON 2.0 transport
+projection of that same decision view; retries must reuse the frozen envelope
+and logical idempotency key. WeChat ClawBot sends the canonical flat string
+unchanged through `text_item.text`. Channel adapters may select the persisted
+transport projection but must not independently recalculate business content.
+
+Scheduled ordinary delivery and `preview_notification` have one renderer authority: Daily Decision Brief. The read-only preview accepts `account`, `market`, `date`, and `revision`, reads persisted successful Daily Brief state through the same query owner as `daily_decision_brief_read`, and reports `authority=daily_decision_brief` with `delivery_evidence=false`. Preview never scans, sends, changes delivery state, or accepts legacy alert/change text and paths. Direct legacy renderer and manual stage-only output remain compatibility-only and cannot be used as a scheduled fallback.
+
+System notices use `# OM · 系统通知 · <component>` and receipts use `# OM · 回执 · <account>` plus `类型｜成交` or `类型｜持仓维护`. `notification_shells.py` owns only the flat Markdown H1/field/section layout. OpenD rate limits and recovery, delivery-failure aggregation/retry, trade receipt warnings, and maintenance receipt status/dedupe/persistence remain with their existing callers; the shell must not send, retry, inspect provider byte limits, or classify business state.
+
+Card delivery may fall back to the canonical Feishu `post` projection only
+after a definite permanent Card rejection and only when the complete Card
+attempt history proves that no transient or ambiguous send occurred. The
+fallback uses a distinct `<transport-key>:fallback` UUID and records both the
+logical and effective keys. Any timeout, transient response, unknown outcome,
+or duplicate risk freezes the original envelope and requires evidence-based
+resolution; it must never switch UUID or confirm the Daily Brief. Feishu post
+delivery measures the exact final outer JSON request body as UTF-8 before token
+acquisition or message HTTP. Requests over the fixed 28 KiB local budget fail
+closed as `FEISHU_POST_TOO_LARGE` and are not truncated, fragmented, retried, or
+automatically replayed.
+
+Notification perception events are compressed system evidence for Bot
+follow-ups. They record delivery action/reason, accounts, symbol summaries,
+message lengths and hashes, but not raw notification text or webhook secrets.
+They may enter ClawBot conversation context as `system_event` evidence; they
+must not be treated as user messages or as authorization to write config, send
+notifications, or mutate broker-facing state.
+
+### Configuration
+
+- YAML authoring: `src/application/config_yaml.py`, `src/application/config_yaml_init.py`
+- Runtime snapshot validation: `src/application/config_validator.py`
+- Runtime config resolution: `src/application/layered_config.py`
+- Example: `configs/examples/config.yaml.example`
+- Full config docs: `CONFIGS.md`, `CONFIGURATION_GUIDE.md`
+
+`config.yaml` is the human authoring surface. `config.us.json` and `config.hk.json` are generated runtime snapshots consumed by tick/agent tools. Legacy JSON authoring and its migration command are retired; production upgrade fails closed when the YAML authoring source is unavailable.
+
+Do not weaken production config validation to make local tests pass. Fix the config path, test fixture, or validation contract instead.
+
+### Tool Gateway Tools
+
+- Tool modules: `src/application/agent_tools/<domain>.py`
+- Manifest collector: `src/application/agent_tool_registry.py`
+- Write permission gate: `src/application/agent_tools/permissions.py`
+- Contracts: `src/application/agent_tool_contracts.py`
+- Config helpers: `src/application/agent_tool_config.py`, `src/application/config_yaml_init.py`, `src/application/config_yaml_accounts.py`
+- CLI: `src/interfaces/agent/cli.py` -> `./om-agent`
+
+When adding or changing a tool, put the implementation and manifest metadata in
+the owning `agent_tools` domain module, then update focused tests and docs
+together. Root-level `src/application/agent_tool_*.py` files, except shared
+config/contract/registry helpers, are compatibility re-export shims only. Do
+not reintroduce a central handler switchboard.
+
+## 7. Import Constraints
+
+```text
+domain/domain/        -> MUST NOT import src/ or scripts/
+src/application/      -> MUST NOT import scripts/
+src/infrastructure/   -> external adapters and persistence details
+src/interfaces/       -> CLI/agent adaptation
+scripts/              -> operational wrappers only; delegate to src/ or domain/
+```
+
+## 8. Common Investigation Playbooks
+
+### Online Quality Looks Bad
+
+1. Bind the target environment and read existing `runtime_status` evidence.
+2. Add scheduler evidence if the issue involves cron or online jobs.
+3. If evidence is missing, collect the relevant `research` scope; use `full` only for a cross-cutting question or when narrower evidence is insufficient.
+4. Trace the relevant findings, such as freshness, account failures, prefetch, notifications, maintenance, or trade intake.
+5. Once the evidence supports a diagnosis, choose the affected owner and focused checks. Production mutation still requires its explicit authorization.
+
+`runtime_status` exposes `notification_delivery.status` and `reason_codes` separately from overall health. A scheduled notification with no confirmed delivery is `degraded`; `./om status --journal-summary` emits a local `<3>NOTIFICATION_DELIVERY_DEGRADED` journal line for that state. This is a journal signal, so it does not establish external alert delivery when the notification route is missing.
+
+### A Symbol Is Missing
+
+1. Get run/account/symbol from the user or runtime artifact.
+2. Resolve natural-language or alias symbols with `symbol_resolve` when needed.
+3. Run `candidate_filter_explain`.
+4. Compare market-level candidate evidence with account-level filters.
+5. If account constraints are involved, inspect cash, holdings, and cost basis with `query_cash_headroom` and position tools.
+6. Add a focused regression test around the leaking boundary if behavior is wrong.
+
+### Multi-Account Strategy Behavior Looks Wrong
+
+1. Confirm accounts are lowercase and present in runtime config.
+2. Read `scheduler_status` per account.
+3. Inspect `tick_metrics` through `runtime_status`.
+4. Use `research` `candidate` or `full` scope for candidate/filter trace evidence.
+5. Separate expected account constraints from state contamination.
+
+### Ledger Or Trade Intake Looks Wrong
+
+1. Use `option_positions_read action=inspect` or `action=events`.
+2. Follow `trade_events -> projection -> position_lots`.
+3. Check trade intake summaries and unresolved/failed counts in `runtime_status`.
+4. Use semantic repair/void workflows; do not hand-edit projected rows.
+5. Verify with focused ledger tests.
+
+The systemd bundle includes `options-monitor-trade-intake-heartbeat.timer` (one-minute
+interval). Its `./om run trade-intake-heartbeat-check --unit
+options-monitor-trade-intake.service --market us --config <runtime-config>
+--runtime-root <runtime-root>` service checks unit activity, each source's
+`last_heartbeat_utc`, and whether that source's `status` is one of the values the
+listener reserves for a source that is not working (`blocked`, `error`,
+`reconnecting`, `stopped`). The stage labels it writes while working
+(`starting` during receipt/backfill work, `listening`, `once`) are not liveness
+signals and are reported as context only. A missing or stale heartbeat while the
+unit is active, an inactive unit, and a confirmed recovery use the configured
+system-alert notification route. This command can send a notification; use
+`runtime_status` for read-only inspection.
+
+### Release Request
+
+Development delivery and release publication are separate:
+
+- `commit and push` / `提交并推送` means validate, commit, and push the named development change. Update
+  `CHANGELOG.md / Unreleased` when the change belongs in user-facing release notes, but do not modify
+  `VERSION`, create a tag or Release, or upgrade production.
+- `merge main` / `合并 main` integrates a complete, green change into the next release candidate. It still
+  does not publish or deploy a version.
+- `release` / `发布` means prepare and publish the VERSION-driven GitHub Release. It does not upgrade
+  production unless the request explicitly includes the remote upgrade.
+- `release and upgrade` / `发布并升级远端` includes the controlled production upgrade and post-upgrade
+  runtime verification.
+
+When the user explicitly asks to publish a release, execute the full publication bundle:
+
+1. Confirm intended file set with `git status --short`.
+2. Review all commits since the latest release tag against `CHANGELOG.md / Unreleased`.
+3. Preview the automatic version recommendation.
+4. Generate `release/coverage/v<version>.json` with `scripts/release_delta.py`; map every release
+   note to commit SHA(s), give every truly non-user-visible commit an explicit reason, and attach
+   every commit to the tracked design or GitHub PR required by [Release Process](RELEASE_PROCESS.md).
+5. Move `Unreleased` items into the dated target-version section and update `VERSION`.
+6. Preview rendered release notes and run focused tests plus strict release checks with
+   `--require-delta-coverage`.
+7. Commit only `VERSION`, `CHANGELOG.md`, and the coverage manifest as
+   `chore: release <version>`.
+8. Push the release branch, open a Pull Request to protected `main`, and wait for required checks; do not attempt a direct `main` push.
+9. Merge the release Pull Request.
+10. Watch the `main` push `Guardrails` workflow and its downstream `release` job.
+11. Verify the GitHub Release, remote tag, target commit, and assets.
+12. Close the exact release worktree and local branch only after the release verification and ownership checks in
+    [Release Process](RELEASE_PROCESS.md#发布工作区收口) pass.
+
+The coverage gate uses the previous stable tag as the baseline. It requires every commit in the
+delta to map to an exact Changelog item or an explicit `no_release_note` reason, and rejects code
+commits added after the reviewed head. It records review disposition; it does not infer public
+semantics from commit messages.
+
+Use supported `gh release view --json` fields such as `tagName`, `name`, `url`, `publishedAt`, `targetCommitish`, `isDraft`, and `isPrerelease`.
+
+## 9. Verification Matrix
+
+| Change area | Suggested checks |
+|---|---|
+| Tool Gateway manifest/handler | `./.venv/bin/python -m pytest tests/test_agent_plugin_contract.py tests/test_agent_plugin_smoke.py` |
+| Research | `./.venv/bin/python -m pytest tests/test_research.py tests/test_research_archive.py` |
+| Candidate filter/rank | Candidate engine tests, candidate tool tests, and focused trace tests |
+| Tick orchestration | `./.venv/bin/python -m pytest tests/test_multi_tick_*.py tests/test_unified_tick_entrypoint.py` |
+| Close Advice frozen snapshot | `python3.12 -m pytest -q -p no:cacheprovider tests/test_close_advice_required_data.py tests/test_close_advice_runner.py tests/test_account_run.py tests/test_tick_account_execution_barrier.py` |
+| Notifications | `./.venv/bin/python -m pytest tests/test_notify_symbols_markdown.py tests/test_multi_tick_notify_format.py` |
+| Config / control plane | `./.venv/bin/python -m pytest tests/test_config_yaml.py tests/test_config_template_inheritance.py tests/test_config_authoring_transaction.py tests/test_runtime_config_identity.py tests/*/test_service_deploy_*.py tests/test_inbound_control.py tests/test_setup_check.py tests/test_cli_operator_commands.py`; YAML validate/build dry-runs |
+| Ledger/positions/trades | Focused ledger, positions, and trade workflow tests |
+| Docs only | `git diff --check`; verify referenced commands/tools exist when possible |
+
+This matrix lists candidate checks, not a mandatory whole-row suite. Select tests that would fail for the changed behavior, include affected consumers for shared contracts, and retain required CI gates. Domain unit tests can establish calculation and invariant evidence; entry-point, persistence, and external-effect changes also need relevant facade or integration coverage. Pure development-instruction edits need meaning, link, formatting, and guardrail checks; runtime prompts and user-visible output require owning behavior checks.
+
+For type checking, prefer the narrow touched path first. Reuse passing checks only while the relevant code, tests, config, dependencies, generated inputs, base, and validation environment remain valid.
+
+## 10. Documentation Rules
+
+- `AGENTS.md`: compact, stable, high-signal context for agents.
+- `docs/AGENT_WIKI.md`: this task manual and code ownership map.
+- `docs/ARCHITECTURE.md`: current system architecture and entry boundaries.
+- `docs/INBOUND_CONTROL.md`: controlled channel message entry boundary.
+- `docs/TOOL_REFERENCE.md`: public `om-agent` Tool Gateway contract and examples.
+- `docs/AGENT_INTEGRATION.md`: Tool Gateway JSON envelope and integration contract.
+- `README.md`: human-facing product overview plus common operator commands.
+- `RUNBOOK.md`: production cron, maintenance, and emergency operations.
+
+When a public command, payload field, output path, or safety boundary changes, update the docs in the same change.
+
+## 11. Archived Memory Reference
+
+The `memory/` tree is archived project reference material, not an active LLM wiki workflow.
+
+Use it only when a task needs historical context or prior decisions. Start from `memory/index.md`, open only relevant entries, and verify drift-prone facts against current source, tests, config, docs, or runtime artifacts before acting.
+
+Do not use memory as a standing ingest target. Normal work should not add entries, update `memory/index.md`, append to `memory/log.md`, or use archived templates. Prefer updating current docs, tests, or runtime read surfaces when behavior or boundaries change.
+
+## 12. Handoff Template
+
+Use this shape when handing work to another agent or future session:
+
+```markdown
+## Goal
+What the user wanted.
+
+## Current State
+Files changed, tests run, known dirty unrelated files.
+
+## Decisions
+Why the chosen path fits the repo boundaries.
+
+## Evidence
+Commands, outputs, runtime artifacts, or failing tests.
+
+## Next Steps
+Smallest remaining actions, with blockers called out.
+```
+
+## Option notification read and delivery model
+
+`daily_decision_brief.v1` is the immutable account+market+trading-date successful-scan model. Delivery v2 separately owns fixed-target confirmation, pending/alerted candidate identities, and exact retry envelopes.
+
+- Renderer authority: scheduled automatic ordinary notifications use Daily Brief only. Compact/Legacy has no scheduled sender authority. The retired `notifications.daily_brief.enabled` key is removed by explicit `om config migrate-switches` preview/apply; `notifications.enabled` owns outbound delivery.
+- Scheduler: keep the 10-minute wake-up. Canonical scans run only at `09:40`, eligible whole hours, eligible `HH:30`, and `15:50`; `09:30`, lunch breaks, and other wake-ups do not scan. A process failure relies on a later eligible scheduler slot; it does not invent an off-schedule retry scan.
+- Fixed reports: `09:40`, eligible whole hours, and `15:50` prepare a full user report even with no candidates. A fixed failure prepares an explicit failure report and never projects the previous successful current as this round's result.
+- Candidate alerts: eligible half-hour successful scans send immediately only when `current candidate identities - alerted identities` is non-empty. If fixed-report and new-candidate conditions coincide, the single complete fixed report wins.
+- Trigger safety: manual/force reliable scans may advance the successful current snapshot for later query and candidate recovery, but they do not create an ordinary delivery envelope, resolve a provider route, or send an ordinary notification. Scheduled display uses the structured target; manual/force never infer a batch from reason text.
+- Persistence order: durable successful outcome plus fixed-target recovery binding, or fixed-failure evidence -> exact scheduled-target watermark -> exact envelope -> provider send -> attempt/ambiguous/confirmed transition. A completed envelope supersedes its recovery binding at the Daily Brief repository boundary.
+- Retry: no-scan wake-ups replay an already persisted exact envelope, or rebuild one missing fixed envelope from its exact target/revision/digest binding. They must not run broker access, pipeline, assembler, candidate detection, or revision persistence; recovery rendering consumes only the bound immutable Brief.
+- Successful current: ready/degraded reliable scans advance current; failed/blocked/no-op scans do not. Query always reads the latest successful current, never the last delivered message.
+- Close Advice projection: structured positions retain every evaluated holding for the total count, but only priced `recommendation_state=close` rows enter Daily Brief actions, ordered deterministically and capped by `max_items_per_account`. `hold` rows stay silent; quote/evaluation gaps remain explicit data-quality evidence rather than recommendations.
+- Funds: render `cash_total_by_currency`, `option_opening_available_by_currency`, and candidate-scoped capacity. Never display total assets, NAV, securities market value, or `0` for unknown funds. CSP capacities share account cash and cannot be summed.
+- Time and identity: scheduled batch and actual data-as-of are separate renderer inputs. Transient display time does not enter the persisted brief digest, candidate identity, or delivery confirmation pointer.
+- Candidate event authority: user event facts come only from the same run's `output_runs/<run_id>/state/event_snapshot.json`. Missing, malformed, stale, partial, conflicting, or degraded evidence remains unable-to-confirm; it never falls back to candidate CSV compatibility fields and never changes candidate identity, ranking, eligibility, or capacity.
+- User projection: fixed report, candidate alert, fixed failure, and query share the Daily Brief human contract. Markdown hides revision, internal IDs, broker codes, raw enums, raw ISO timestamps, paths, and rejection dumps while structured artifacts retain them.
+- Query scope: latest accepts optional account and market. Missing filters are resolved from canonical `config.us.json` / `config.hk.json`, then rendered by account and market without combining funds. Day/revision reads require an explicit account and market; missing market is an input error.
+- Query safety: query is byte-for-byte read-only with respect to delivery state and does not refresh data, scan, send, confirm, or mutate candidate state.
+- Delivery ambiguity: ambiguous envelopes are frozen. Later attempts either replay the exact message/key/hash under the provider idempotency contract or wait for explicit confirmation.
+- Delivery state cutoff: only `daily_decision_brief_delivery.v2` is accepted. Retired v1 state fails closed; the current release has no converter.
+- Multi-market: an explicit combined-market tick is terminal fail-closed before Daily Brief assemble, revision/current persistence, delivery-envelope creation, or provider work. Production scheduled runs remain single-market.
+- Rollout safety: release, remote upgrade, real-send canary, and scheduler observation require separate operator authorization. Rollback stops the scheduler and rolls back code/version plus compatible state; it never restores Compact as a parallel scheduled sender.
+
+Read surfaces:
+
+```bash
+./om daily-brief latest [--account lx] [--market US|HK] [--json]
+./om daily-brief day --account lx --market US|HK --date YYYY-MM-DD [--revision N] [--json]
+./om-agent run --tool daily_decision_brief_read --input-json '{}'
+./om-agent run --tool daily_decision_brief_read --input-json '{"account":"lx","market":"US"}'
+```
+
+### Market identity and relative expiration
+
+Explicit US inputs override cross-market aliases. If the bare spelling is an HK
+alias, the canonical US identity retains `.US` (for example `US.MET` and its option
+root both become `MET.US`, routing to `US.MET`). Unqualified `MET` retains the supported
+HK alias. HK-prefixed equities accept numeric codes or exact supported HK aliases;
+letters are never removed to obtain a numeric code. Existing records are not rewritten.
+
+Position DTE and relative Close Advice expiration filters use each symbol's market date
+from one aware observation time (New York for US, Hong Kong for HK). Unknown market or
+expiration remains unknown and cannot satisfy a relative expiration filter. Timestamp
+storage and accounting/FX date conventions remain unchanged.
+
+Legacy CSP summaries preserve each selected candidate's canonical native cash evidence
+and `max_new_contracts`. Zero, unknown or nonfinite capacity cannot create a high-priority
+opening alert in either HKD or USD; canonical processor normalization retains the same evidence.
+Legacy and compact previews preserve abnormal CSP capacity comments; this read path does not recalculate capacity or FX.
+Futu option-field diagnostics expose `option_fields_ok` separately from
+`scan_prerequisites_ok` and the scanner-owned underlier observation. Both markets need
+attested, fresh, normal underlier evidence; unavailable or closed-market observation
+cannot be replaced by an unattested spot override. These checked prerequisites do not
+assert that every option contract or strategy rule is scan-ready.

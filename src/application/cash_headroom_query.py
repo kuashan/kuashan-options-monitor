@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""查询 CSP 担保占用与可用现金。"""
+
+from __future__ import annotations
+
+from src.application.runtime_paths import resolve_runtime_root
+from src.infrastructure.exchange_rates import shared_exchange_rate_cache_path
+
+import json
+from pathlib import Path
+from typing import Any, Mapping
+
+from domain.domain.cash_secured_utils import (
+    cash_secured_unavailable_for_cash_snapshot,
+    cash_secured_symbol_cny,
+    normalize_cash_secured_by_symbol_by_ccy,
+    normalize_cash_secured_total_by_ccy,
+    read_cash_secured_total_cny,
+)
+from domain.domain.portfolio_scope import portfolio_scope_id
+from src.application.cash_totals import sum_by_currency_to_cny as _sum_by_currency_to_cny
+from src.application.config_loader import normalize_portfolio_broker_config, resolve_data_config_path
+from src.infrastructure.exchange_rates import (
+    get_exchange_rates_or_fetch_latest,
+)
+from src.application.positions.context_builder import build_context as build_option_positions_context
+from src.application.futu_portfolio_context import fetch_futu_portfolio_context
+from src.application.ledger.api import decision_state_snapshot, list_position_lot_snapshots, open_position_ledger
+from src.application.portfolio_context_service import load_account_portfolio_context, cash_snapshot_is_usable
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists() or path.stat().st_size <= 0:
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def money(v: float | None, currency: str = "USD") -> str:
+    if v is None:
+        return "-"
+    if currency.upper() in ("USD",):
+        return f"${v:,.2f}"
+    if currency.upper() in ("CNY", "RMB"):
+        return f"¥{v:,.2f}"
+    return f"{v:,.2f} {currency.upper()}"
+
+
+def _resolve_runtime_config_path(*, base: Path, config: str | Path | None) -> Path | None:
+    if config is None or not str(config).strip():
+        return None
+    path = Path(config)
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    return path
+
+
+def _normalize_runtime_config(cfg: dict) -> dict:
+    out = dict(cfg or {})
+    if 'templates' in out and 'profiles' not in out:
+        out['profiles'] = out.get('templates')
+    if 'symbols' in out and 'watchlist' not in out:
+        out['watchlist'] = out.get('symbols')
+    return normalize_portfolio_broker_config(out)
+
+
+def _load_runtime_config(
+    *,
+    base: Path,
+    config: str | Path | None,
+    runtime_config: dict | None,
+) -> dict:
+    if isinstance(runtime_config, dict):
+        return _normalize_runtime_config(dict(runtime_config))
+
+    cfg_path = _resolve_runtime_config_path(base=base, config=config)
+    if cfg_path is None:
+        return {}
+
+    cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
+    if not isinstance(cfg, dict):
+        raise SystemExit('[CONFIG_ERROR] runtime config must be a JSON object')
+    return _normalize_runtime_config(cfg)
+
+
+def _load_option_position_records(data_config_path: Path) -> tuple[object, list[dict]]:
+    option_repo = open_position_ledger(data_config_path)
+    return option_repo, list(list_position_lot_snapshots(option_repo))
+
+
+def _cash_secured_unavailable_reason(
+    option_ctx: dict | None, portfolio_ctx: dict | None,
+) -> tuple[dict[str, str], str | None]:
+    unavailable = cash_secured_unavailable_for_cash_snapshot(option_ctx, portfolio_ctx)
+    if isinstance(unavailable, str):
+        return {}, unavailable
+    if unavailable is not None and not isinstance(unavailable, dict):
+        return {}, "option_cash_secured_context_invalid"
+    if not unavailable:
+        return {}, None
+
+    normalized: dict[str, str] = {}
+    for sym, reason in unavailable.items():
+        symbol = str(sym or "").strip().upper()
+        if not symbol:
+            continue
+        normalized[symbol] = str(reason or "cash_secured_basis_missing").strip() or "cash_secured_basis_missing"
+    if not normalized:
+        return {}, "option_cash_secured_context_invalid"
+    return normalized, ";".join(f"{sym}:{reason}" for sym, reason in sorted(normalized.items()))
+
+
+def _required_cny_rates(*balances: Mapping[str, Any]) -> set[str]:
+    required: set[str] = set()
+    for balance in balances:
+        for raw_currency, raw_amount in balance.items():
+            try:
+                amount = float(raw_amount)
+            except (TypeError, ValueError):
+                continue
+            if not amount:
+                continue
+            currency = str(raw_currency or "").strip().upper()
+            if currency in {"CNY", "RMB"}:
+                continue
+            if currency == "USD":
+                required.add("USDCNY")
+            elif currency == "HKD":
+                required.add("HKDCNY")
+            else:
+                required.add(f"UNSUPPORTED:{currency or 'UNKNOWN'}")
+    return required
+
+
+def query_sell_put_cash(
+    *,
+    config: str | Path | None = None,
+    data_config: str | Path | None = None,
+    market: str = '富途',
+    account: str | None = None,
+    output_format: str = 'text',
+    top: int = 10,
+    no_exchange_rates: bool = False,
+    out_dir: str | Path = 'output_shared/state',
+    base_dir: Path | None = None,
+    runtime_config: dict | None = None,
+    write_cache: bool = True,
+) -> dict:
+    """执行卖 put 现金占用查询并按指定格式输出。"""
+    base = (base_dir or Path(__file__).resolve().parents[2]).resolve()
+
+    runtime_cfg = _load_runtime_config(base=base, config=config, runtime_config=runtime_config)
+    data_config_path = resolve_data_config_path(base=base, data_config=data_config)
+
+    out_dir_path = Path(out_dir)
+    if not out_dir_path.is_absolute():
+        out_dir_path = (base / out_dir_path).resolve()
+    if write_cache:
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    fx_cache_path = shared_exchange_rate_cache_path(resolve_runtime_root(repo_root=base).runtime_root)
+    exchange_rate_payload: dict[str, Any] = {}
+    if not no_exchange_rates:
+        candidate = get_exchange_rates_or_fetch_latest(
+            cache_path=fx_cache_path,
+            max_age_hours=24,
+            write_cache=write_cache,
+        )
+        if isinstance(candidate, Mapping):
+            exchange_rate_payload = dict(candidate)
+
+    portfolio = load_account_portfolio_context(
+        market=market,
+        account=account,
+        state_dir=out_dir_path,
+        log=lambda _message: None,
+        runtime_config=runtime_cfg,
+        portfolio_source=None,
+        fetch_futu_portfolio_context_fn=fetch_futu_portfolio_context,
+        exchange_rate_observation=exchange_rate_payload,
+        exchange_rate_cache_path=fx_cache_path,
+        load_json_fn=load_json,
+        write_cache=write_cache,
+    )
+
+    option_repo, option_records = _load_option_position_records(data_config_path)
+    normalized_account = str(account or "").strip().lower()
+    decision_snapshot = (
+        decision_state_snapshot(
+            option_repo,
+            account=normalized_account,
+            portfolio_scope_id=portfolio_scope_id(normalized_account),
+        )
+        if normalized_account else None
+    )
+    opt = build_option_positions_context(
+        option_records,
+        broker=market,
+        account=account,
+        rates=exchange_rate_payload,
+        decision_snapshot=decision_snapshot,
+    )
+    portfolio_source_name = str(portfolio.get('portfolio_source_name') or 'futu')
+
+    cash_by_ccy = portfolio.get('cash_by_currency') or {}
+    cash_balance_unavailable_by_row = (
+        portfolio.get("cash_balance_unavailable_by_row")
+        if isinstance(portfolio.get("cash_balance_unavailable_by_row"), dict)
+        else {}
+    )
+    cash_balance_reliable = portfolio.get("cash_balance_reliable") is True
+    cash_components_by_ccy = portfolio.get('cash_components_by_currency') or {}
+    cash_power_by_ccy = portfolio.get('cash_power_by_currency') or {}
+    cash_source = str(portfolio.get('cash_source') or '').strip() or None
+    cash_power_source = str(portfolio.get('cash_power_source') or '').strip() or None
+    cash_avail_usd = cash_by_ccy.get('USD')
+    try:
+        cash_avail_usd = float(cash_avail_usd) if cash_avail_usd is not None else None
+    except Exception:
+        cash_avail_usd = None
+
+    norm_by_ccy = normalize_cash_secured_by_symbol_by_ccy(opt)
+    total_by_ccy_norm = normalize_cash_secured_total_by_ccy(opt, by_symbol_by_ccy=norm_by_ccy)
+    cash_secured_unavailable_by_symbol, cash_secured_unavailable_reason = _cash_secured_unavailable_reason(opt, portfolio)
+    cash_secured_reliable = cash_secured_unavailable_reason is None
+    cash_secured_total_cny = read_cash_secured_total_cny(opt) if cash_secured_reliable else None
+
+    cash_secured_total_usd = total_by_ccy_norm.get('USD') if cash_secured_reliable else None
+    cash_free_usd = None
+    if cash_avail_usd is not None and cash_secured_total_usd is not None:
+        cash_free_usd = cash_avail_usd - cash_secured_total_usd
+
+    usdcny_exchange_rate = None
+    cny_per_hkd_exchange_rate = None
+    cash_avail_cny = None
+    cash_free_cny = None
+
+    if not no_exchange_rates:
+        try:
+            rates = exchange_rate_payload.get('rates') or {}
+            if rates.get('USDCNY'):
+                usdcny_exchange_rate = float(rates['USDCNY'])
+            if rates.get('HKDCNY'):
+                cny_per_hkd_exchange_rate = float(rates['HKDCNY'])
+        except Exception:
+            usdcny_exchange_rate = None
+            cny_per_hkd_exchange_rate = None
+
+    try:
+        cash_avail_cny = float((cash_by_ccy.get('CNY') if isinstance(cash_by_ccy, dict) else None))
+    except Exception:
+        cash_avail_cny = None
+
+    if cash_avail_cny is not None and cash_secured_total_cny is not None:
+        cash_free_cny = cash_avail_cny - cash_secured_total_cny
+
+    cash_avail_total_cny = None
+    if isinstance(cash_by_ccy, dict):
+        cash_avail_total_cny = _sum_by_currency_to_cny(
+            cash_by_ccy,
+            usdcny_exchange_rate=usdcny_exchange_rate,
+            cny_per_hkd_exchange_rate=cny_per_hkd_exchange_rate,
+        )
+
+    cash_power_total_cny = None
+    if isinstance(cash_power_by_ccy, dict) and cash_power_by_ccy:
+        cash_power_total_cny = _sum_by_currency_to_cny(
+            cash_power_by_ccy,
+            usdcny_exchange_rate=usdcny_exchange_rate,
+            cny_per_hkd_exchange_rate=cny_per_hkd_exchange_rate,
+        )
+
+    cash_free_total_cny = None
+    if cash_avail_total_cny is not None and cash_secured_total_cny is not None:
+        cash_free_total_cny = cash_avail_total_cny - cash_secured_total_cny
+
+    required_cny_rates = _required_cny_rates(cash_by_ccy, total_by_ccy_norm)
+    available_cny_rates = {
+        name
+        for name, value in {
+            "USDCNY": usdcny_exchange_rate,
+            "HKDCNY": cny_per_hkd_exchange_rate,
+        }.items()
+        if value is not None
+    }
+    missing_cny_rates = sorted(required_cny_rates - available_cny_rates)
+    snapshot = portfolio["cash_snapshot"]
+    observed_at = snapshot["evaluated_at"]
+    freshness = {
+        "status": snapshot["status"], "as_of": snapshot["source_observed_at"],
+        "kind": "source_snapshot" if snapshot["source_observed_at"] else "source_unknown",
+        "reason_codes": snapshot["reason_codes"],
+    }
+    if not cash_snapshot_is_usable(portfolio):
+        cash_by_ccy = {}
+        cash_avail_usd = cash_avail_cny = cash_avail_total_cny = None
+        cash_free_usd = cash_free_cny = cash_free_total_cny = None
+    payload = {
+        'as_of_utc': observed_at,
+        'freshness': freshness,
+        'cash_snapshot': snapshot,
+        'cash_source_observed_at': portfolio.get('cash_source_observed_at'),
+        'cash_source_observation_status': portfolio.get('cash_source_observation_status'),
+        'market': market,
+        'account': account,
+        'portfolio_source_name': portfolio_source_name,
+        'cash_available_by_currency': cash_by_ccy,
+        'cash_balance_reliable': cash_balance_reliable,
+        'cash_balance_unavailable_by_row': cash_balance_unavailable_by_row,
+        'cash_available_usd': cash_avail_usd,
+        'cash_secured_used_usd': cash_secured_total_usd,
+        'cash_free_usd': cash_free_usd,
+        'cash_available_cny': cash_avail_cny,
+        'cash_secured_used_cny': cash_secured_total_cny,
+        'cash_free_cny': cash_free_cny,
+        'cash_available_total_cny': cash_avail_total_cny,
+        'cash_free_total_cny': cash_free_total_cny,
+        'cash_source': cash_source,
+        'cash_components_by_currency': cash_components_by_ccy,
+        'cash_power_by_currency': cash_power_by_ccy,
+        'cash_power_total_cny': cash_power_total_cny,
+        'cash_power_source': cash_power_source,
+        'exchange_rates': {'USDCNY': usdcny_exchange_rate, 'HKDCNY': cny_per_hkd_exchange_rate},
+        'cny_conversion_complete': not missing_cny_rates,
+        'cny_conversion_missing_rates': missing_cny_rates,
+        'cash_secured_total_by_ccy': (total_by_ccy_norm if cash_secured_reliable else {}),
+        'cash_secured_known_total_by_ccy': total_by_ccy_norm,
+        'cash_secured_by_symbol_by_ccy': norm_by_ccy,
+        'cash_secured_unavailable_by_symbol': cash_secured_unavailable_by_symbol,
+        'cash_secured_unavailable_reason': cash_secured_unavailable_reason,
+        'cash_secured_usage_reliable': cash_secured_reliable,
+    }
+
+    if output_format == 'json':
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return payload
+
+    lines = []
+    lines.append('# Cash-Secured Put (CSP) 担保现金占用 / 剩余现金')
+    lines.append(f"as_of_utc: {payload['as_of_utc']}")
+    lines.append(f"market: {market} | account: {account or '-'}")
+    lines.append(f"portfolio_source: {portfolio_source_name}")
+    if cash_secured_unavailable_reason:
+        lines.append(f"warning: short put 担保现金依据缺失，剩余现金不可计算: {cash_secured_unavailable_reason}")
+    lines.append('')
+
+    lines.append(f"- base(CNY) 现金（账户口径）: {money(cash_avail_cny, 'CNY')}")
+    lines.append(f"- CSP 已占用担保现金（折算CNY）: {money(cash_secured_total_cny, 'CNY')}")
+    lines.append(f"- 不在担保之内的剩余现金（base free, CNY）: {money(cash_free_cny, 'CNY')}")
+
+    lines.append(f"- 现金类资产（全币种折算CNY）: {money(payload.get('cash_available_total_cny'), 'CNY')}")
+    lines.append(f"- 扣担保后余量（cash-like free, 折算CNY）: {money(payload.get('cash_free_total_cny'), 'CNY')}")
+    if cash_power_by_ccy:
+        lines.append(f"- 券商现金购买力（折算CNY，仅诊断）: {money(payload.get('cash_power_total_cny'), 'CNY')}")
+
+    if usdcny_exchange_rate or cny_per_hkd_exchange_rate:
+        parts = []
+        if usdcny_exchange_rate:
+            parts.append(f'USDCNY={usdcny_exchange_rate:.4f}')
+        if cny_per_hkd_exchange_rate:
+            parts.append(f'HKDCNY={cny_per_hkd_exchange_rate:.4f}')
+        lines.append('- 汇率: ' + ', '.join(parts))
+
+    lines.append('')
+    lines.append('## USD 视角（仅当账户口径里有 USD 现金时可靠）')
+    lines.append(f"- USD 现金（账户口径）: {money(cash_avail_usd, 'USD')}")
+    lines.append(f"- CSP 占用（USD 项合计）: {money(cash_secured_total_usd, 'USD')}")
+    lines.append(f"- USD free（仅扣 USD 占用）: {money(cash_free_usd, 'USD')}")
+
+    lines.append('')
+    detail_title = '## 占用明细（Top {top}，按币种）'
+    if cash_secured_unavailable_reason:
+        detail_title = '## 已知占用明细（Top {top}，按币种；总占用不可靠）'
+    lines.append(detail_title.format(top=top))
+    if not norm_by_ccy:
+        lines.append('- (无记录：要么没有 open short puts，要么持仓 lot 视图缺少 cash_secured_amount/currency)')
+    else:
+        items = []
+        for sym, m in norm_by_ccy.items():
+            total = sum(m.values())
+            items.append((sym, total, m))
+        items.sort(key=lambda x: x[1], reverse=True)
+
+        for sym, _, m in items[: max(top, 1)]:
+            detail = ', '.join([f"{ccy} {money(v, ccy).replace('$', '').replace('¥', '')}" for ccy, v in sorted(m.items())])
+            cny_eq = cash_secured_symbol_cny(
+                opt,
+                sym,
+                by_symbol_by_ccy=norm_by_ccy,
+                native_to_cny=lambda amt, ccy: (
+                    float(amt)
+                    if ccy == 'CNY'
+                    else (
+                        float(amt) * float(usdcny_exchange_rate)
+                        if (ccy == 'USD' and usdcny_exchange_rate)
+                        else (
+                            float(amt) * float(cny_per_hkd_exchange_rate)
+                            if (ccy == 'HKD' and cny_per_hkd_exchange_rate)
+                            else None
+                        )
+                    )
+                ),
+            )
+            cny_part = f" | ≈ {money(cny_eq, 'CNY')}" if cny_eq is not None else ''
+            lines.append(f'- {sym}: {detail}{cny_part}')
+
+    if cash_secured_unavailable_by_symbol:
+        lines.append('')
+        lines.append('## 占用缺失诊断')
+        for sym, reason in sorted(cash_secured_unavailable_by_symbol.items()):
+            lines.append(f'- {sym}: {reason}')
+
+    print('\n'.join(lines) + '\n')
+    return payload

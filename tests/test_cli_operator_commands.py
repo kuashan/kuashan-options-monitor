@@ -1,0 +1,1546 @@
+from __future__ import annotations
+
+import os
+import json
+from pathlib import Path
+
+import pytest
+
+def _write_config(tmp_path: Path, text: str) -> Path:
+    """Write the `config.yaml` the operator commands read and return its path."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    return config_path
+
+
+def _read_json_output(capsys) -> dict:
+    return json.loads(capsys.readouterr().out)
+
+
+def test_close_advice_cli_requires_the_configure_subcommand(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["close-advice"])
+
+    assert exc_info.value.code == 2
+    assert "the following arguments are required" in capsys.readouterr().err
+
+def test_notify_preview_forwards_daily_brief_selectors(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _preview_notification(**kwargs):
+        calls.append(kwargs)
+        return {
+            "tool_name": "preview_notification",
+            "ok": True,
+            "data": {"notification_text": "# brief"},
+        }
+
+    monkeypatch.setattr(cli, "preview_notification", _preview_notification)
+
+    rc = cli.main(
+        [
+            "notify",
+            "preview",
+            "--account",
+            "lx",
+            "--market",
+            "us",
+            "--date",
+            "2026-10-05",
+            "--revision",
+            "2",
+        ]
+    )
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "preview_notification"
+    assert calls == [
+        {
+            "account": "lx",
+            "market": "us",
+            "date": "2026-10-05",
+            "revision": 2,
+        }
+    ]
+
+
+def test_notify_preview_rejects_removed_legacy_text_input(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["notify", "preview", "--alerts-text", "legacy"])
+
+    assert exc_info.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_top_level_doctor_wraps_healthcheck(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _healthcheck(**kwargs):
+        calls.append(kwargs)
+        return {"tool_name": "healthcheck", "ok": True, "data": {"status": "pass"}}
+
+    monkeypatch.setattr(cli, "run_healthcheck", _healthcheck)
+
+    rc = cli.main(["doctor", "--config-key", "us", "--accounts", "lx", "sy"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "doctor"
+    assert payload["ok"] is True
+    assert payload["data"]["healthcheck"]["tool_name"] == "healthcheck"
+    assert calls == [{
+        "config_key": "us",
+        "config_path": None,
+        "accounts": ["lx", "sy"],
+        "opend_telnet_host": None,
+        "opend_telnet_port": None,
+        "audit_db": None,
+        "profile_path": None,
+        "env_file": None,
+        "include_service_status": False,
+    }]
+
+
+@pytest.mark.parametrize("command", ("healthcheck", "doctor"))
+def test_healthcheck_commands_exit_nonzero_when_readiness_is_false(
+    monkeypatch,
+    capsys,
+    command: str,
+) -> None:
+    import src.interfaces.cli.main as cli
+
+    monkeypatch.setattr(
+        cli,
+        "run_healthcheck",
+        lambda **_kwargs: {
+            "tool_name": "healthcheck",
+            "ok": True,
+            "data": {
+                "summary": {"ok": False, "critical_count": 1},
+                "checks": [
+                    {
+                        "name": "notification_credentials",
+                        "status": "error",
+                    }
+                ],
+            },
+        },
+    )
+
+    rc = cli.main([command, "--config-key", "us"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    if command == "healthcheck":
+        assert payload["ok"] is True
+        assert payload["data"]["summary"]["ok"] is False
+    else:
+        assert payload["ok"] is False
+        assert payload["data"]["execution_ok"] is True
+        assert payload["data"]["readiness_ok"] is False
+
+
+def test_top_level_healthcheck_passes_inbound_diagnostics_args(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _healthcheck(**kwargs):
+        calls.append(kwargs)
+        return {"tool_name": "healthcheck", "ok": True, "data": {"status": "pass"}}
+
+    monkeypatch.setattr(cli, "run_healthcheck", _healthcheck)
+
+    rc = cli.main(
+        [
+            "healthcheck",
+            "--config-path",
+            "config.us.json",
+            "--audit-db",
+            "inbound.sqlite3",
+            "--profile-path",
+            "service.profile.json",
+            "--include-service-status",
+        ]
+    )
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "healthcheck"
+    assert calls == [{
+        "config_key": None,
+        "config_path": "config.us.json",
+        "accounts": None,
+        "opend_telnet_host": None,
+        "opend_telnet_port": None,
+        "audit_db": "inbound.sqlite3",
+        "profile_path": "service.profile.json",
+        "env_file": None,
+        "include_service_status": True,
+    }]
+
+
+def test_top_level_healthcheck_forwards_env_file(monkeypatch, capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    env_file = tmp_path / "options-monitor.env"
+    env_file.write_text("OM_FEISHU_BOT_APP_ID=cli_1\n", encoding="utf-8")
+    bootstrap_calls: list[dict] = []
+    calls: list[dict] = []
+
+    def _bootstrap_process_env(**kwargs):
+        bootstrap_calls.append(kwargs)
+
+    def _healthcheck(**kwargs):
+        calls.append(kwargs)
+        return {"tool_name": "healthcheck", "ok": True, "data": {"status": "pass"}}
+
+    monkeypatch.setattr("src.interfaces.cli.command_environment.bootstrap_process_env", _bootstrap_process_env)
+    monkeypatch.setattr(cli, "run_healthcheck", _healthcheck)
+
+    rc = cli.main(["healthcheck", "--config-key", "us", "--env-file", str(env_file)])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "healthcheck"
+    assert calls == [{
+        "config_key": "us",
+        "config_path": None,
+        "accounts": None,
+        "opend_telnet_host": None,
+        "opend_telnet_port": None,
+        "audit_db": None,
+        "profile_path": None,
+        "env_file": str(env_file),
+        "include_service_status": False,
+    }]
+    assert bootstrap_calls == [{
+        "repo_root": cli.repo_base(),
+        "env_file": str(env_file),
+        "include_local_env_file": False,
+    }]
+
+
+def test_support_bundle_command_forwards_diagnostic_args(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _support_bundle_response(**kwargs):
+        calls.append(kwargs)
+        return {
+            "schema_version": "1.0",
+            "tool_name": "support.bundle",
+            "ok": True,
+            "data": {
+                "bundle_name": "options-monitor-support.json",
+                "bundle_path_public": ".../options-monitor-support.json",
+            },
+            "warnings": [],
+            "error": None,
+            "meta": {},
+        }
+
+    monkeypatch.setattr(cli, "support_bundle_response", _support_bundle_response)
+
+    rc = cli.main([
+        "support", "bundle", "--config-key", "us", "--accounts", "lx", "sy", "--profile-path",
+        "service.profile.json", "--env-file", "options-monitor.env", "--no-local-env-file",
+        "--include-healthcheck", "--runtime-root", "/var/lib/options-monitor", "--output-dir", "/tmp/support",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "support.bundle"
+    assert calls == [{
+        "repo_root": cli.repo_base(),
+        "config_key": "us",
+        "config_path": None,
+        "accounts": ["lx", "sy"],
+        "profile_path": "service.profile.json",
+        "env_file": "options-monitor.env",
+        "include_local_env_file": False,
+        "include_healthcheck": True,
+        "output_dir": "/tmp/support",
+        "runtime_root": "/var/lib/options-monitor",
+    }]
+
+
+def test_bot_llm_check_command_forwards_diagnostic_args(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _check_bot_llm(**kwargs):
+        calls.append(kwargs)
+        return {"summary": {"ok": True, "status": "ready"}, "checks": []}
+
+    monkeypatch.setattr(cli, "check_bot_llm", _check_bot_llm)
+
+    rc = cli.main([
+        "assistant", "llm-check", "--bot-config", "config.bot.json", "--env-file",
+        "options-monitor.env", "--no-local-env-file", "--live",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "bot.llm_check"
+    assert payload["ok"] is True
+    assert calls == [{
+        "repo_root": cli.repo_base(),
+        "config_path": "config.bot.json",
+        "env_file": "options-monitor.env",
+        "include_local_env_file": False,
+        "live": True,
+    }]
+
+
+def test_bot_model_catalog_command_renders_provider_catalog(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main(["assistant", "model", "catalog"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "bot.model.catalog"
+    providers = {item["provider"]: item for item in payload["data"]["providers"]}
+    assert providers["deepseek"]["api_kind"] == "chat_completions"
+    assert providers["deepseek"]["default_api_key_env"] == "DEEPSEEK_API_KEY"
+    assert providers["kimi"]["api_kind"] == "chat_completions"
+    assert providers["kimi"]["default_base_url"] == "https://api.moonshot.ai/v1"
+    assert providers["kimi"]["default_api_key_env"] == "MOONSHOT_API_KEY"
+    assert providers["kimi-code"]["api_kind"] == "chat_completions"
+    assert providers["kimi-code"]["default_base_url"] == "https://api.kimi.com/coding/v1"
+    assert providers["kimi-code"]["default_api_key_env"] == "KIMI_API_KEY"
+    assert providers["openai"]["api_kind"] == "responses"
+    assert providers["ollama"]["default_base_url"] == "http://127.0.0.1:11434/v1"
+    assert providers["ollama"]["requires_api_key"] is False
+
+
+def test_bot_model_list_text_does_not_print_credential_env_name(tmp_path: Path, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_path = _write_config(tmp_path, """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+bot:
+  enabled: true
+  active_model: openai-default
+  models:
+    openai-default:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OM_LLM_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""")
+
+    rc = cli.main(["assistant", "model", "list", "--config-yaml", str(config_path), "--format", "text"])
+    text = capsys.readouterr().out
+
+    assert rc == 0
+    assert "openai-default" in text
+    assert "credential_configured=False" in text
+    assert "context_window_tokens=24000" in text
+    assert "OM_LLM_API_KEY" not in text
+    assert "api_key_env" not in text
+
+
+def test_bot_model_check_forwards_live_flag(tmp_path: Path, monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _check_bot_llm(**kwargs):
+        calls.append(kwargs)
+        return {"summary": {"ok": True, "status": "ready"}, "checks": [], "config": {}}
+
+    monkeypatch.setattr(cli, "check_bot_llm", _check_bot_llm)
+    config_path = _write_config(tmp_path, """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+bot:
+  enabled: true
+  active_model: openai-default
+  models:
+    openai-default:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OM_LLM_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""")
+
+    rc = cli.main([
+        "assistant", "model", "check", "openai-default", "--config-yaml", str(config_path), "--live",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "bot.model.check"
+    assert calls[-1]["live"] is True
+
+
+def test_bot_model_add_dry_run_does_not_write_config(tmp_path: Path, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_path = _write_config(tmp_path, """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+bot:
+  enabled: true
+  enabled: false
+""")
+    before = config_path.read_text(encoding="utf-8")
+
+    rc = cli.main([
+        "assistant", "model", "add", "deepseek-default", "--config-yaml", str(config_path), "--provider",
+        "deepseek", "--model", "deepseek-chat", "--context-window-tokens", "24000", "--max-output-tokens",
+        "2048",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "bot.model.add"
+    data = payload["data"]
+    assert data["dry_run"] is True
+    assert data["write_applied"] is False
+    assert data["profile"]["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert data["profile"]["context_window_tokens"] == 24000
+    assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_bot_model_add_requires_context_window_tokens(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "assistant", "model", "add", "deepseek-default", "--provider", "deepseek", "--model",
+            "deepseek-chat",
+        ])
+
+    assert exc.value.code == 2
+    assert "--context-window-tokens" in capsys.readouterr().err
+
+
+def test_bot_model_current_text_displays_authoring_and_runtime_context(
+    tmp_path: Path, capsys
+) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_path = _write_config(tmp_path, """\
+bot:
+  enabled: true
+  active_model: openai-default
+  models:
+    openai-default:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OM_LLM_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""")
+    runtime_path = tmp_path / "config.bot.json"
+    runtime_path.write_text(
+        json.dumps(
+            {
+                "bot": {'enabled': True, 'llm': {'provider': 'openai', 'model': 'gpt-5.2', 'base_url': '', 'api_key_env': 'OM_LLM_API_KEY', 'context_window_tokens': 24000, 'max_output_tokens': 2048}}
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli.main([
+        "assistant", "model", "current", "--config-yaml", str(config_path), "--bot-config",
+        str(runtime_path), "--format", "text",
+    ])
+    text = capsys.readouterr().out
+
+    assert rc == 0
+    assert "active_model: openai-default" in text
+    assert text.count("context_window_tokens=24000") == 2
+    assert "drift: False" in text
+
+
+def test_bot_model_use_apply_switches_active_model_and_writes_backup(tmp_path: Path, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_path = _write_config(tmp_path, """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+bot:
+  enabled: true
+  active_model: openai-default
+  models:
+    openai-default:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OM_LLM_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+    deepseek-default:
+      provider: deepseek
+      model: deepseek-chat
+      api_key_env: DEEPSEEK_API_KEY
+      context_window_tokens: 24000
+      max_output_tokens: 2048
+""")
+
+    rc = cli.main([
+        "assistant", "model", "use", "deepseek-default", "--config-yaml", str(config_path), "--apply",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "bot.model.use"
+    data = payload["data"]
+    assert data["dry_run"] is False
+    assert data["write_applied"] is True
+    assert data["backup_path"]
+    assert Path(data["backup_path"]).exists()
+    updated = config_path.read_text(encoding="utf-8")
+    assert "active_model: deepseek-default" in updated
+    assert "rebuild_hint" in data
+
+
+def test_no_local_env_file_flag_prevents_process_env_bootstrap(monkeypatch, tmp_path) -> None:
+    from src.interfaces.cli.command_environment import command_environment
+    calls = []
+    monkeypatch.delenv("OM_ENV_FILE", raising=False)
+    monkeypatch.setattr("src.interfaces.cli.command_environment.bootstrap_process_env", lambda **kwargs: calls.append(kwargs))
+    with command_environment(["assistant", "llm-check", "--no-local-env-file"], repo_root=tmp_path, discover_local=True):
+        assert calls == []
+
+
+def test_bot_control_commands_command_renders_catalog(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main(["assistant", "commands"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "assistant.commands"
+    assert payload["ok"] is True
+    assert payload["data"]["summary"]["direct_executable_count"] >= 1
+    intents = {item["intent_name"] for item in payload["data"]["commands"]}
+    assert "runtime_status" in intents
+    assert "manual_trade_confirm" in intents
+
+    rc = cli.main(["assistant", "commands", "--format", "text"])
+    text = capsys.readouterr().out
+
+    assert rc == 0
+    assert "/status" in text
+    assert "/record-open" in text
+    assert "/record-close" in text
+    assert "/confirm attribution|trade|symbol|upgrade|model" in text
+
+
+def test_bot_capabilities_command_renders_capability_catalog(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main(["assistant", "capabilities"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "assistant.capabilities"
+    assert payload["ok"] is True
+    assert payload["data"]["summary"]["capability_count"] >= payload["data"]["summary"]["slash_command_count"]
+    capabilities = {item["capability_id"]: item for item in payload["data"]["capabilities"]}
+    assert capabilities["runtime_status"]["direct_executable"] is True
+    assert capabilities["manual_trade_open"]["direct_executable"] is False
+    assert capabilities["upgrade_now"]["risk_level"] == "preview_admin"
+
+    rc = cli.main(["assistant", "capabilities", "--format", "text"])
+    text = capsys.readouterr().out
+
+    assert rc == 0
+    assert "Deterministic Control capabilities" in text
+    assert "Read and local commands" in text
+    assert "Preview commands" in text
+    assert "Confirm and cancel commands" in text
+    assert "runtime_status (状态): risk=read_only direct_executable=true" in text
+    assert "manual_trade_open (记录开仓): risk=preview_write direct_executable=false" in text
+    assert "upgrade_now (立即升级): risk=preview_admin direct_executable=false" in text
+
+
+def test_legacy_agent_command_alias_is_hidden_but_supported(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["--help"])
+    help_text = capsys.readouterr().out
+
+    assert exc.value.code == 0
+    assert "bot" in help_text
+    assert "assistant" not in help_text
+    assert " agent " not in help_text
+
+    rc = cli.main(["agent", "commands"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "assistant.commands"
+    assert payload["ok"] is True
+
+
+def _runtime_status_envelope(*, ok: bool = True) -> dict:
+    return {
+        "tool_name": "runtime_status",
+        "ok": ok,
+        "data": {
+            "summary": {
+                "ok": True,
+                "warning_count": 0,
+                "latest_status": "ok",
+                "freshness_status": "fresh",
+                "ledger_status": "ok",
+                "ledger_fail_closed": False,
+                "ledger_sqlite_path": "output_shared/state/option_positions.sqlite3",
+                "ledger_trade_event_count": 3,
+                "ledger_position_lot_count": 2,
+            },
+            "freshness": {
+                "status": "fresh",
+                "age_seconds": 42,
+                "max_age_minutes": 60,
+                "latest_source": "latest_run.last_run",
+            },
+            "config": {
+                "config_key": "us",
+                "config_path": ".../config.us.json",
+                "accounts": ["lx", "sy"],
+            },
+            "latest_run_selection": {
+                "found": True,
+                "path": "output_runs/run-1",
+                "source": "requested",
+            },
+            "latest_scanned_run_selection": {
+                "found": True,
+                "path": "output_runs/run-1",
+                "source": "requested",
+            },
+            "notification_diagnosis": {
+                "status": "sent",
+                "final_reason": "confirmed",
+                "notification_route": {
+                    "provider": "wechat_clawbot",
+                    "channel": "wechat_clawbot",
+                    "target_configured": True,
+                },
+                "send_attempted_count": 1,
+                "send_confirmed_count": 1,
+                "send_failed_count": 0,
+            },
+            "ledger_store": {
+                "trade_event_count": 3,
+                "position_lot_count": 2,
+                "sqlite_path": "output_shared/state/option_positions.sqlite3",
+            },
+            "projection_verify": {
+                "exists": True,
+                "ok": True,
+                "mode": "full",
+                "path": "projection_verify.latest.json",
+            },
+            "trade_intake": {
+                "enabled": True,
+                "mode": "apply",
+                "summary": {
+                    "listener_status": "listening",
+                    "processed_count": 4,
+                    "failed_count": 0,
+                    "unresolved_count": 0,
+                    "receipt_count": 2,
+                    "receipt_confirmed_count": 2,
+                    "receipt_failed_count": 0,
+                },
+            },
+            "required_data_prefetch": {
+                "available": True,
+                "available_account_count": 2,
+                "account_count": 2,
+                "total_opend_calls": 4,
+                "total_rate_gate_wait_sec": 0.5,
+                "total_errors": 0,
+                "primary_bottleneck": None,
+            },
+            "latest_scanned_run_required_data_prefetch": {
+                "available": True,
+                "available_account_count": 2,
+                "account_count": 2,
+                "total_opend_calls": 4,
+                "total_rate_gate_wait_sec": 0.5,
+                "total_errors": 0,
+                "primary_bottleneck": None,
+            },
+            "service_upgrade": {"status": "current", "target_version": None},
+        },
+        "warnings": [],
+    }
+
+
+def test_top_level_status_prints_human_summary(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[tuple[str, dict]] = []
+
+    def _execute_tool(name: str, payload: dict) -> dict:
+        calls.append((name, payload))
+        return _runtime_status_envelope()
+
+    monkeypatch.setattr(cli, "execute_tool", _execute_tool)
+
+    rc = cli.main(["status", "--config-key", "us", "--accounts", "lx", "sy", "--run-id", "run-1"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert calls == [("runtime_status", {"config_key": "us", "accounts": ["lx", "sy"], "run_id": "run-1"})]
+    assert "options-monitor status" in out
+    assert "overall: OK freshness=fresh warnings=0 latest_status=ok" in out
+    assert "config: key=us accounts=lx, sy" in out
+    assert "config.us.json" not in out
+    assert "notifications: status=sent reason=confirmed route=wechat_clawbot/wechat_clawbot target=yes sent=1 confirmed=1 failed=0" in out
+    assert "ledger: status=ok fail_closed=no events=3 lots=2" in out
+    assert "option_positions.sqlite3" not in out
+
+
+def test_top_level_status_forwards_env_file(monkeypatch, capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    env_file = tmp_path / "options-monitor.env"
+    env_file.write_text("OM_RUNTIME_ROOT=/tmp/options-monitor\n", encoding="utf-8")
+    bootstrap_calls: list[dict] = []
+    calls: list[tuple[str, dict]] = []
+
+    def _bootstrap_process_env(**kwargs):
+        bootstrap_calls.append(kwargs)
+
+    def _execute_tool(name: str, payload: dict) -> dict:
+        calls.append((name, payload))
+        return _runtime_status_envelope()
+
+    monkeypatch.setattr("src.interfaces.cli.command_environment.bootstrap_process_env", _bootstrap_process_env)
+    monkeypatch.setattr(cli, "execute_tool", _execute_tool)
+
+    rc = cli.main(["status", "--config-key", "us", "--env-file", str(env_file), "--json"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "runtime_status"
+    assert calls == [("runtime_status", {"config_key": "us", "env_file": str(env_file)})]
+    assert bootstrap_calls == [{
+        "repo_root": cli.repo_base(),
+        "env_file": str(env_file),
+        "include_local_env_file": False,
+    }]
+
+
+def test_research_collect_forwards_remote_runtime_selection(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+    import src.interfaces.cli.research as research_cli
+
+    calls: list[dict] = []
+
+    def _run_research_collect(payload: dict, **kwargs) -> dict:
+        calls.append(payload)
+        return {"tool_name": "research.collect", "ok": True, "data": {"status": "ok"}}
+
+    monkeypatch.setattr(research_cli, "run_research_collect", _run_research_collect)
+
+    rc = cli.main([
+        "research", "collect", "--config-key", "us", "--config-path", "/var/lib/options-monitor/config.us.json",
+        "--profile-path", "/var/lib/options-monitor/service.profile.json", "--runs-root",
+        "/var/lib/options-monitor/output_runs", "--report-dir",
+        "/var/lib/options-monitor/output_shared/reports", "--shared-state-dir",
+        "/var/lib/options-monitor/output_shared/state", "--accounts-root",
+        "/var/lib/options-monitor/output_accounts", "--run-id", "run-1", "--runs-limit", "3", "--tail-limit",
+        "50", "--max-run-age-minutes", "90", "--max-notification-chars", "2000", "--output", "json",
+        "--no-write-outputs",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "research.collect"
+    assert calls == [
+        {
+            "scope": "full",
+            "config_key": "us",
+            "config_path": "/var/lib/options-monitor/config.us.json",
+            "profile_path": "/var/lib/options-monitor/service.profile.json",
+            "report_dir": "/var/lib/options-monitor/output_shared/reports",
+            "shared_state_dir": "/var/lib/options-monitor/output_shared/state",
+            "accounts_root": "/var/lib/options-monitor/output_accounts",
+            "runs_root": "/var/lib/options-monitor/output_runs",
+            "run_id": "run-1",
+            "runs_limit": 3,
+            "tail_limit": 50,
+            "max_run_age_minutes": 90,
+            "max_notification_chars": 2000,
+            "output": "json",
+            "include_healthcheck": False,
+            "write_outputs": False,
+            "confirm": False,
+        }
+    ]
+
+
+def test_top_level_status_json_prints_raw_runtime_status(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    def _execute_tool(name: str, payload: dict) -> dict:
+        assert name == "runtime_status"
+        assert payload == {"profile_path": "service.profile.json"}
+        return _runtime_status_envelope()
+
+    monkeypatch.setattr(cli, "execute_tool", _execute_tool)
+
+    rc = cli.main(["status", "--profile-path", "service.profile.json", "--json"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "runtime_status"
+    assert payload["data"]["summary"]["latest_status"] == "ok"
+
+
+def test_top_level_status_returns_error_when_runtime_status_tool_fails(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    def _execute_tool(_name: str, _payload: dict) -> dict:
+        return {
+            "tool_name": "runtime_status",
+            "ok": False,
+            "data": {},
+            "warnings": ["read failed"],
+            "error": {"code": "RUNTIME_STATUS_ERROR", "message": "cannot read profile"},
+        }
+
+    monkeypatch.setattr(cli, "execute_tool", _execute_tool)
+
+    rc = cli.main(["status", "--config-key", "us"])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "overall: FAIL" in out
+    assert "error: RUNTIME_STATUS_ERROR cannot read profile" in out
+    assert "- read failed" in out
+
+
+def _write_run_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_top_level_runs_lists_runtime_runs(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    runs_root = tmp_path / "output_runs"
+    scan_run = runs_root / "run-scan"
+    skip_run = runs_root / "run-skip"
+    _write_run_json(
+        scan_run / "state" / "tick_metrics.json",
+        {
+            "ran_scan": True,
+            "sent": True,
+            "accounts": [{"account": "lx", "ran_scan": True}],
+            "reason": "sent",
+        },
+    )
+    _write_run_json(
+        skip_run / "state" / "tick_metrics.json",
+        {
+            "sent": False,
+            "scheduler_decision": {
+                "should_run_scan": False,
+                "should_notify": False,
+                "reason": "market closed",
+            },
+            "accounts": [{"account": "sy", "ran_scan": False}],
+            "reason": "no_account_notification",
+        },
+    )
+    os.utime(skip_run, (100, 100))
+    os.utime(scan_run, (200, 200))
+
+    rc = cli.main(["runs", "--runs-root", str(runs_root), "--limit", "2"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "options-monitor runs" in out
+    assert "count: 2/2 limit=2 scanned_only=no" in out
+    assert "- run-scan " in out
+    assert "status=scan scan=yes sent=yes accounts=lx reason=sent" in out
+    assert "- run-skip " in out
+    assert "status=skipped scan=no sent=no accounts=sy reason=no_account_notification" in out
+
+
+def test_top_level_runs_json_can_select_run(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    runs_root = tmp_path / "output_runs"
+    _write_run_json(
+        runs_root / "run-1" / "state" / "last_run.json",
+        {"schema_kind": "option_positions_auto_close_expired_run", "status": "skipped", "accounts": ["lx"]},
+    )
+
+    rc = cli.main(["runs", "--runs-root", str(runs_root), "--run-id", "run-1", "--json"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "runs"
+    assert payload["data"]["summary"]["requested_found"] is True
+    assert payload["data"]["selected_run"]["run_id"] == "run-1"
+    assert payload["data"]["selected_run"]["status"] == "skipped"
+
+
+def test_top_level_runs_missing_selected_run_returns_error(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    runs_root = tmp_path / "output_runs"
+    runs_root.mkdir()
+
+    rc = cli.main(["runs", "--runs-root", str(runs_root), "--run-id", "missing"])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "options-monitor runs" in out
+    assert "requested: not found missing" in out
+    assert "count: 0/0" in out
+
+
+def test_top_level_logs_tails_run_audit(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    runs_root = tmp_path / "output_runs"
+    audit = runs_root / "run-1" / "state" / "audit_events.jsonl"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_text('{"message":"first"}\n{"message":"second"}\n', encoding="utf-8")
+
+    rc = cli.main(["logs", "--runs-root", str(runs_root), "--run-id", "run-1", "--kind", "audit", "--lines", "1"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "options-monitor logs" in out
+    assert "run: run-1" in out
+    assert "audit_events.jsonl exists=yes lines=1" in out
+    assert '{"message":"second"}' in out
+    assert '{"message":"first"}' not in out
+
+
+def test_top_level_logs_json_can_tail_explicit_file(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    log_file = tmp_path / "service.log"
+    log_file.write_text("one\ntwo\nthree\n", encoding="utf-8")
+
+    rc = cli.main(["logs", "--file", str(log_file), "--lines", "2", "--json"])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["tool_name"] == "logs"
+    assert payload["data"]["files"][0]["tail"] == ["two", "three"]
+
+
+def test_top_level_logs_missing_selected_run_returns_error(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    runs_root = tmp_path / "output_runs"
+    runs_root.mkdir()
+
+    rc = cli.main(["logs", "--runs-root", str(runs_root), "--run-id", "missing"])
+    out = capsys.readouterr().out
+
+    assert rc == 2
+    assert "requested run: not found" in out
+
+
+def test_top_level_setup_requires_current_subcommand(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["setup", "--market", "us", "--futu-acc-id", "123456"])
+
+    assert exc.value.code == 2
+    assert "setup" in capsys.readouterr().err
+
+
+def test_config_build_rejects_legacy_source(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main([
+        "config", "build", "--source", "legacy", "--market", "us", "--dry-run",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "INPUT_ERROR"
+    assert payload["error"]["details"]["allowed"] == ["yaml"]
+
+
+def test_config_build_defaults_to_yaml_source(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+  hk:
+    accounts: [lx]
+    symbols: ["0700.HK"]
+""",
+        encoding="utf-8",
+    )
+
+    rc = cli.main([
+        "config", "build", "--market", "us", "--config-yaml", str(config_yaml), "--output",
+        str(tmp_path / "config.us.json"), "--dry-run",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert payload["source_format"] == "yaml"
+    assert payload["dry_run"] is True
+    assert "warnings" not in payload
+
+
+def test_config_build_removes_legacy_json_flags(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "config", "build", "--market", "us", "--user-config", "configs/examples/user.example.us.json",
+            "--dry-run",
+        ])
+
+    assert exc.value.code == 2
+    assert "unrecognized arguments: --user-config" in capsys.readouterr().err
+
+
+def test_config_validate_rejects_runtime_flags_with_yaml_source(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    config_yaml = tmp_path / "config.yaml"
+    config_yaml.write_text(
+        """\
+accounts:
+  lx:
+    type: futu
+    futu_account_id: "REAL_12345678"
+markets:
+  us:
+    accounts: [lx]
+    symbols: [NVDA]
+""",
+        encoding="utf-8",
+    )
+
+    rc = cli.main([
+        "config", "validate", "--source", "yaml", "--market", "us", "--config-yaml", str(config_yaml),
+        "--config-path", "config.us.json",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "INPUT_ERROR"
+    assert payload["error"]["details"]["flags"] == ["--config-path"]
+
+
+def test_config_validate_rejects_yaml_flag_with_runtime_source(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main([
+        "config", "validate", "--source", "runtime", "--config-yaml", "config.yaml",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "INPUT_ERROR"
+    assert payload["error"]["details"]["flags"] == ["--config-yaml"]
+
+
+def test_config_validate_defaults_to_runtime_source(monkeypatch, capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _validate_runtime_config(**kwargs):
+        calls.append(kwargs)
+        return {"tool_name": "config.validate", "ok": True, "data": {"status": "pass"}}
+
+    monkeypatch.setattr(cli, "_validate_runtime_config", _validate_runtime_config)
+
+    rc = cli.main([
+        "config", "validate", "--config-path", "config.us.json", "--market", "us",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 0
+    assert payload["ok"] is True
+    assert calls == [{"config_key": None, "config_path": "config.us.json", "market": "us"}]
+
+
+def test_config_validate_rejects_related_runtime_paths_for_yaml_source(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    rc = cli.main([
+        "config", "validate", "--source", "yaml", "--market", "us", "--config-yaml", "config.yaml",
+        "--related-config-path", "config.hk.json",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    assert payload["error"]["code"] == "INPUT_ERROR"
+    assert payload["error"]["details"]["flags"] == ["--related-config-path"]
+
+
+@pytest.mark.parametrize("argv", [["config", "build", "--help"], ["config", "explain", "--help"]])
+def test_config_authoring_help_hides_legacy_flags(argv: list[str], capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(argv)
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 0
+    assert "--source {yaml}" in out
+    assert "--source legacy" not in out
+    assert "--common-user-config" not in out
+    assert "--no-common-user-config" not in out
+    assert "--user-config" not in out
+
+
+def test_service_render_requires_yaml_authoring_source(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    runtime = tmp_path / "runtime"
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main([
+            "service", "render", "--target", "systemd", "--repo-root", str(repo), "--runtime-root",
+            str(runtime), "--markets", "us",
+        ])
+
+    assert exc.value.code == 2
+    assert "the following arguments are required: --config-yaml" in capsys.readouterr().err
+
+
+def test_init_runtime_command_is_removed(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["init", "runtime", "--market", "us", "--futu-acc-id", "123456"])
+
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_service_drift_preserves_timer_state_only_when_requested(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    import src.interfaces.cli.main as cli
+
+    profile = {"service_provider": "systemd"}
+    snapshot = {
+        "options-monitor-tick-us.timer": {
+            "activation_state": "disabled",
+            "active_state": "inactive",
+        }
+    }
+    drift_calls: list[dict] = []
+    capture_calls: list[dict] = []
+    load_calls: list[Path] = []
+
+    def _load(path):
+        load_calls.append(Path(path))
+        return profile
+
+    def _capture(**kwargs):
+        capture_calls.append(kwargs)
+        return snapshot
+
+    def _drift(**kwargs):
+        drift_calls.append(kwargs)
+        return {"summary": {"ok": True}, "changed": False}
+
+    monkeypatch.setattr(cli, "load_service_profile", _load)
+    monkeypatch.setattr(cli, "capture_preserved_timer_activation_states", _capture)
+    monkeypatch.setattr(cli, "service_drift", _drift)
+
+    repo = tmp_path / "current"
+    runtime = tmp_path / "runtime"
+    assert cli.main([
+        "service", "drift", "--repo-root", str(repo), "--runtime-root", str(runtime),
+    ]) == 0
+    assert _read_json_output(capsys)["tool_name"] == "service.drift"
+    assert drift_calls[0] == {
+        "repo_root": str(repo),
+        "runtime_root": str(runtime),
+        "profile_path": None,
+        "confirm": False,
+    }
+    assert capture_calls == []
+    assert load_calls == []
+
+    assert cli.main([
+        "service", "drift", "--repo-root", str(repo), "--runtime-root", str(runtime),
+        "--preserve-activation-state",
+    ]) == 0
+    payload = _read_json_output(capsys)
+    assert payload["tool_name"] == "service.drift"
+    expected_profile_path = runtime / "service.profile.json"
+    assert load_calls == [expected_profile_path]
+    assert capture_calls == [{
+        "repo_root": repo,
+        "runtime_root": runtime,
+        "profile": profile,
+    }]
+    assert drift_calls[1]["profile_path"] == expected_profile_path
+    assert drift_calls[1]["profile"] is profile
+    assert drift_calls[1]["activation_policy"] == "preserve-existing"
+    assert drift_calls[1]["preserved_activation_states"] == snapshot
+
+
+def test_service_drift_preserve_fails_before_confirmed_reconcile(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    import src.interfaces.cli.main as cli
+    import src.application.service_upgrade as service_upgrade_module
+
+    target = "options-monitor-tick-hk.timer"
+    monkeypatch.setattr(
+        cli,
+        "load_service_profile",
+        lambda _path: {"service_provider": "systemd"},
+    )
+    monkeypatch.setattr(
+        service_upgrade_module,
+        "service_drift",
+        lambda **_kwargs: {
+            "checked": True,
+            "supported": True,
+            "expected_services": [target],
+            "installed_units": [target],
+            "activation_states": {target: "unknown"},
+            "active_states": {target: "active"},
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "service_drift",
+        lambda **_kwargs: pytest.fail("reconcile must not run without a snapshot"),
+    )
+
+    rc = cli.main([
+        "service", "drift", "--repo-root", str(tmp_path / "current"), "--runtime-root",
+        str(tmp_path / "runtime"), "--preserve-activation-state", "--confirm",
+    ])
+    payload = _read_json_output(capsys)
+
+    assert rc == 2
+    assert payload["ok"] is False
+    assert payload["error"] == {
+        "code": "DEPENDENCY_MISSING",
+        "message": (
+            "could not determine whether managed timers were active before the "
+            f"release switch: {target}"
+        ),
+        "details": {
+            "status": "service_activation_snapshot_failed",
+            "remediation": [
+                "manual_check_timer_state: "
+                f"systemctl is-enabled {target}; systemctl is-active {target}"
+            ],
+        },
+    }
+
+
+def test_top_level_update_commands_delegate_to_service_upgrade(monkeypatch, capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[tuple[str, dict]] = []
+
+    def _check(**kwargs):
+        calls.append(("check", kwargs))
+        return {"ok": True, "status": "current"}
+
+    def _upgrade(**kwargs):
+        calls.append(("apply", kwargs))
+        return {"ok": True, "status": "dry_run"}
+
+    def _verify(**kwargs):
+        calls.append(("verify", kwargs))
+        return {"ok": True, "status": "ok"}
+
+    def _rollback(**kwargs):
+        calls.append(("rollback", kwargs))
+        return {"ok": True, "status": "dry_run"}
+
+    monkeypatch.setattr(cli, "service_upgrade_check", _check)
+    monkeypatch.setattr(cli, "service_upgrade", _upgrade)
+    monkeypatch.setattr(cli, "service_upgrade_verify", _verify)
+    monkeypatch.setattr(cli, "service_rollback", _rollback)
+
+    repo = tmp_path / "current"
+    runtime = tmp_path / "runtime"
+
+    assert cli.main(["update", "check", "--repo-root", str(repo), "--runtime-root", str(runtime)]) == 0
+    assert _read_json_output(capsys)["tool_name"] == "update.check"
+
+    assert cli.main([
+        "update", "verify", "--repo-root", str(repo), "--runtime-root", str(runtime), "--no-check-latest",
+    ]) == 0
+    assert _read_json_output(capsys)["tool_name"] == "update.verify"
+
+    assert cli.main([
+        "update", "apply", "--repo-root", str(repo), "--runtime-root", str(runtime), "--target-version",
+        "1.2.70", "--no-restart-services", "--preserve-activation-state",
+    ]) == 0
+    assert _read_json_output(capsys)["tool_name"] == "update.apply"
+
+    assert cli.main([
+        "update", "rollback", "--repo-root", str(repo), "--runtime-root", str(runtime), "--to-version",
+        "1.2.69", "--no-restart-services", "--preserve-activation-state",
+    ]) == 0
+    assert _read_json_output(capsys)["tool_name"] == "update.rollback"
+
+    assert calls[0] == ("check", {"repo_root": str(repo), "runtime_root": str(runtime), "cache_root": None, "remote_name": "origin"})
+    assert calls[1] == (
+        "verify",
+        {
+            "repo_root": str(repo),
+            "runtime_root": str(runtime),
+            "cache_root": None,
+            "remote_name": "origin",
+            "check_latest": False,
+        },
+    )
+    assert calls[2][0] == "apply"
+    assert calls[2][1]["repo_root"] == str(repo)
+    assert calls[2][1]["runtime_root"] == str(runtime)
+    assert calls[2][1]["target_version"] == "1.2.70"
+    assert calls[2][1]["confirm"] is False
+    assert calls[2][1]["restart_services"] is False
+    assert calls[2][1]["preserve_activation_state"] is True
+    assert calls[3][0] == "rollback"
+    assert calls[3][1]["to_version"] == "1.2.69"
+    assert calls[3][1]["confirm"] is False
+    assert calls[3][1]["restart_services"] is False
+    assert calls[3][1]["preserve_activation_state"] is True
+
+
+def test_service_upgrade_compat_commands_are_removed(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    for command in ("upgrade-check", "upgrade", "rollback"):
+        with pytest.raises(SystemExit) as exc:
+            cli.main(["service", command])
+        assert exc.value.code == 2
+        assert "invalid choice" in capsys.readouterr().err
+
+
+def test_config_get_reads_runtime_snapshot(capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+    from src.application.config_defaults import DEFAULT_CONFIG_REF, default_config_sha256
+
+    cfg = {
+        "_generated": {
+            "schema_version": "1.0",
+            "generator": "options-monitor",
+            "source_format": "yaml",
+            "market": "us",
+            "sources": [
+                {
+                    "role": "system",
+                    "loaded": True,
+                    "inline": True,
+                    "ref": DEFAULT_CONFIG_REF,
+                    "sha256": default_config_sha256(),
+                },
+                {
+                    "role": "market_user",
+                    "loaded": True,
+                    "inline": True,
+                    "ref": "test-inline",
+                    "sha256": "test-inline-sha",
+                },
+            ],
+        },
+        "symbols": [
+            {
+                "symbol": "NVDA",
+                "sell_put": {
+                    "enabled": True,
+                    "min_dte": 7,
+                    "max_dte": 45,
+                    "max_strike": 100,
+                },
+            }
+        ],
+        "schedule": {"timezone": "America/New_York"},
+        "runtime": {"prefetch": {"max_workers": 2}},
+    }
+    path = tmp_path / "config.us.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    assert cli.main([
+        "config", "get", "--config-path", str(path), "--key", "runtime.prefetch.max_workers",
+    ]) == 0
+    payload = _read_json_output(capsys)
+    assert payload["tool_name"] == "config.get"
+    assert payload["data"]["value"] == 2
+    assert payload["data"]["readiness"]["ok"] is True
+
+    assert json.loads(path.read_text(encoding="utf-8"))["runtime"]["prefetch"]["max_workers"] == 2
+
+
+def test_config_get_rejects_stale_runtime_snapshot(tmp_path: Path) -> None:
+    from src.application.agent_tool_contracts import AgentToolError
+    from src.application.config_defaults import DEFAULT_CONFIG_REF, default_config_sha256
+    from src.application.config_edit import get_runtime_config_value
+
+    source = tmp_path / "config.yaml"
+    source.write_text("accounts: {}\n", encoding="utf-8")
+    path = tmp_path / "config.us.json"
+    path.write_text(
+        json.dumps(
+            {
+                "_generated": {
+                    "schema_version": "1.0",
+                    "generator": "options-monitor",
+                    "source_format": "yaml",
+                    "market": "us",
+                    "sources": [
+                        {
+                            "role": "system",
+                            "loaded": True,
+                            "inline": True,
+                            "ref": DEFAULT_CONFIG_REF,
+                            "sha256": default_config_sha256(),
+                        },
+                        {
+                            "role": "market_user",
+                            "loaded": True,
+                            "inline": False,
+                            "path": str(source),
+                            "sha256": "stale-sha",
+                        },
+                    ],
+                },
+                "schedule": {"timezone": "America/New_York"},
+                "runtime": {"prefetch": {"max_workers": 2}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentToolError) as exc:
+        get_runtime_config_value(
+            config_path=path,
+            key="runtime.prefetch.max_workers",
+            repo_root=tmp_path,
+        )
+
+    assert exc.value.code == "CONFIG_ERROR"
+    assert exc.value.details["freshness"]["ok"] is False
+    assert exc.value.details["freshness"]["errors"][0]["code"] == "source_changed"
+
+
+def test_config_symbol_set_delegates_to_yaml_authoring(monkeypatch, capsys, tmp_path: Path) -> None:
+    import src.interfaces.cli.main as cli
+
+    calls: list[dict] = []
+
+    def _set_yaml_symbol_config(**kwargs):
+        calls.append(kwargs)
+        return {"ok": True, "dry_run": False, "write_applied": True, "summary": {"canonical_symbol": "9898.HK"}}
+
+    config_yaml = tmp_path / "config.yaml"
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(cli, "repo_base", lambda: tmp_path)
+    monkeypatch.setattr(cli, "set_yaml_symbol_config", _set_yaml_symbol_config)
+
+    assert cli.main([
+        "config", "symbol", "set", "--config-yaml", str(config_yaml), "--market", "hk", "--symbol", "09898",
+        "--covered-call-enabled", "true", "--covered-call-min-strike", "85", "--sell-put-enabled", "false",
+        "--combo-yield-enabled", "true", "--rebuild-runtime-root", str(runtime_root), "--apply", "--no-backup",
+    ]) == 0
+
+    payload = _read_json_output(capsys)
+    assert payload["ok"] is True
+    assert calls == [{
+        "repo_root": tmp_path,
+        "market": "hk",
+        "symbol": "09898",
+        "config_path": str(config_yaml),
+        "covered_call_enabled": True,
+        "covered_call_min_strike": 85.0,
+        "sell_put_enabled": False,
+        "sell_put_max_strike": None,
+        "expected_source_sha256": None,
+        "combo_yield_enabled": True,
+        "rebuild_runtime_root": str(runtime_root),
+        "apply": True,
+        "backup": False,
+    }]
+
+
+def test_config_set_command_is_removed(capsys) -> None:
+    import src.interfaces.cli.main as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["config", "set", "--config-path", "config.us.json", "--key", "runtime.prefetch.max_workers", "--json-value", "4"])
+
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err

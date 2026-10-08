@@ -1,0 +1,621 @@
+from __future__ import annotations
+from src.application.trades.attribution import confirm_wheel_linkage
+
+import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import src.application.wheel as wheel_application
+from src.application.wheel.candidate_snapshot import load_wheel_candidate_cash_fact
+from src.application.agent_tool_contracts import (
+    AgentToolError,
+    build_error_payload,
+    build_response,
+)
+from src.application.agent_tool_config import load_runtime_config
+from src.application.wheel.candidate_snapshot import current_wheel_candidate_policy_hash
+from src.application.exchange_rate_loader import load_current_exchange_rate_snapshot
+from src.application.ledger.api import (
+    open_position_ledger_from_runtime_config,
+    recover_wheel_assignment,
+    resolve_position_ledger_sqlite_path,
+    resolve_position_data_config_path,
+)
+from src.application.wheel import (
+    build_wheel_read_model,
+    end_wheel_lifecycle,
+    load_wheel_candidate_snapshot,
+    resolve_wheel_config,
+)
+from src.application.wheel.capacity import (
+    load_shared_cash_capacity_fact,
+    load_shared_coverage_fact,
+)
+from src.application.wheel.workflows import (
+    cancel_wheel_intent,
+    create_wheel_intent,
+    reject_wheel_linkage,
+)
+from src.interfaces.cli.ledger_write_safety import (
+    add_write_flags,
+    guard_ledger_write,
+    resolve_cli_write_control,
+)
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    config = parser.add_mutually_exclusive_group(required=True)
+    config.add_argument("--config-key", choices=("us", "hk"))
+    config.add_argument("--config", dest="config_path")
+    parser.add_argument("--data-config")
+    parser.add_argument("--runtime-root")
+    parser.add_argument("--as-of-ms", type=int)
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    add_write_flags(parser, high_risk=True)
+
+
+def _add_identity(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--account", required=True)
+    parser.add_argument("--stock-lot-id", required=True)
+    parser.add_argument("--expected-batch-generation-hash", required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--actor", required=True)
+
+
+def _add_branch_identity(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--account", required=True)
+    identity = parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--wheel-branch-id")
+    identity.add_argument("--stock-lot-id")
+    parser.add_argument("--expected-batch-generation-hash", required=True)
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--actor", required=True)
+
+
+def _add_neutral_identity(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--account", required=True)
+    identity = parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--wheel-branch-id")
+    identity.add_argument("--stock-lot-id")
+    parser.add_argument("--direction", choices=("call", "put"), default="call")
+    parser.add_argument(
+        "--expected-batch-generation-hash",
+        "--expected-batch-generation-hash",
+        dest="expected_batch_generation_hash",
+        required=True,
+    )
+    parser.add_argument("--request-id", required=True)
+    parser.add_argument("--actor", required=True)
+
+
+def _add_activation_runtime(parser: argparse.ArgumentParser, *, write: bool) -> None:
+    parser.add_argument("--market", choices=("us", "hk"), required=True)
+    parser.add_argument("--config", dest="config_path")
+    parser.add_argument("--data-config")
+    parser.add_argument("--runtime-root")
+    parser.add_argument("--format", choices=("text", "json"), default="text")
+    if write:
+        parser.add_argument("--expected-source-sha256")
+        add_write_flags(parser, high_risk=True)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Manage Wheel lifecycle facts")
+    commands = parser.add_subparsers(dest="wheel_command", required=True)
+
+    recover = commands.add_parser("recover", help="recover one missing assignment Wheel branch")
+    recover.add_argument("--account", required=True)
+    recover.add_argument("--market", required=True, choices=("us", "hk"))
+    recover.add_argument("--assignment-event-id", required=True)
+    recover.add_argument("--allow-completed-combo-yield", action="store_true")
+    recover.add_argument("--expected-preview-hash")
+    _add_common(recover)
+
+    end = commands.add_parser("end", help="manually end one Wheel lifecycle")
+    _add_identity(end)
+    _add_common(end)
+
+    branch = commands.add_parser("branch", help="start or end one Wheel branch")
+    branch_commands = branch.add_subparsers(dest="branch_action", required=True)
+    for action in ("start", "end"):
+        command = branch_commands.add_parser(action)
+        _add_branch_identity(command)
+        _add_common(command)
+
+    activation = commands.add_parser(
+        "activation", help="inspect or change the local Wheel activation window"
+    )
+    activation_commands = activation.add_subparsers(
+        dest="activation_action", required=True
+    )
+    status = activation_commands.add_parser("status")
+    status.add_argument("--account", required=True)
+    _add_activation_runtime(status, write=False)
+    for action in ("enable", "disable"):
+        command = activation_commands.add_parser(action)
+        command.add_argument("--account", required=True)
+        command.add_argument("--expected-current-generation", type=int, required=True)
+        command.add_argument("--request-id", required=True)
+        command.add_argument("--actor", required=True)
+        _add_activation_runtime(command, write=True)
+
+    rebind = activation_commands.add_parser("rebind-policy", help="accept the configured policy without reopening the window")
+    rebind.add_argument("--account", required=True)
+    rebind.add_argument("--request-id", required=True)
+    rebind.add_argument("--actor", required=True)
+    rebind.add_argument("--expected-preview-hash")
+    _add_activation_runtime(rebind, write=False)
+    add_write_flags(rebind, high_risk=True)
+
+    accept = activation_commands.add_parser(
+        "accept-policy",
+        help=(
+            "accept the configured policy for every drifting account in one market; "
+            "rebuilds the runtime snapshot when a rebind needs it, then delegates to "
+            "rebind-policy. write_applied means a snapshot rebuild or a binding insert "
+            "happened, never that every account was accepted"
+        ),
+    )
+    accept.add_argument("--account", help="limit acceptance to one already-activated account")
+    accept.add_argument("--actor", required=True)
+    accept.add_argument(
+        "--expected-plan-hash",
+        "--expected-preview-hash",
+        dest="expected_plan_hash",
+        help="optional plan hash from a dry run; when given it must match",
+    )
+    _add_activation_runtime(accept, write=False)
+    add_write_flags(accept, high_risk=True)
+
+    intent = commands.add_parser("intent", help="manage Wheel option intents")
+    intent_commands = intent.add_subparsers(dest="intent_action", required=True)
+    create = intent_commands.add_parser("create")
+    _add_neutral_identity(create)
+    create.add_argument("--run-id", required=True)
+    create.add_argument("--final-candidate-id", required=True)
+    create.add_argument("--expected-snapshot-hash", required=True)
+    create.add_argument("--expires-at-ms", type=int, required=True)
+    create.add_argument("--broker-order-id")
+    _add_common(create)
+    cancel = intent_commands.add_parser("cancel")
+    _add_neutral_identity(cancel)
+    cancel.add_argument("--intent-id", required=True)
+    cancel.add_argument("--broker-order-inactive-confirmed", action="store_true")
+    cancel.add_argument("--reason", required=True)
+    _add_common(cancel)
+
+    linkage = commands.add_parser("linkage", help="resolve Wheel option attribution")
+    linkage_commands = linkage.add_subparsers(dest="linkage_action", required=True)
+    for action in ("confirm", "reject"):
+        command = linkage_commands.add_parser(action)
+        _add_neutral_identity(command)
+        command.add_argument(
+            "--option-record-id",
+            "--call-record-id",
+            dest="option_record_id",
+            required=True,
+        )
+        command.add_argument("--linkage-candidate-id", required=True)
+        command.add_argument("--expected-input-hash", required=True, help=("trade_attribution_read prepare_confirmation=true input_hash (full attribution snapshot)" if action == "confirm" else "linkage candidate input_snapshot_hash"))
+        if action == "reject":
+            command.add_argument("--reason", required=True)
+        _add_common(command)
+    return parser.parse_args(argv)
+
+
+def _open_runtime(args: argparse.Namespace, *, apply_changes: bool) -> tuple[Path, dict[str, Any], Any]:
+    base = Path(__file__).resolve().parents[3]
+    config_path_value = getattr(args, "config_path", None)
+    config_key = getattr(args, "config_key", None)
+    if config_path_value is None and config_key is None:
+        config_key = getattr(args, "market", None)
+    config_path, cfg = load_runtime_config(
+        config_key=config_key,
+        config_path=config_path_value,
+        expected_market=getattr(args, "market", None),
+    )
+    data_config = resolve_position_data_config_path(
+        base=base,
+        cfg=cfg,
+        data_config=args.data_config,
+        config_path=config_path,
+    )
+    if apply_changes and guard_ledger_write(
+        data_config=data_config,
+        args=args,
+        as_json=args.format == "json",
+    ) is None:
+        raise SystemExit(2)
+    _resolved, repo = open_position_ledger_from_runtime_config(
+        base=base,
+        cfg=cfg,
+        data_config=data_config,
+        config_path=config_path,
+        runtime_root=args.runtime_root,
+    )
+    return config_path, cfg, repo
+
+
+def _write_requested(args: argparse.Namespace) -> bool:
+    if (getattr(args, "confirm", False) or getattr(args, "yes", False)) and not getattr(
+        args, "apply", False
+    ):
+        raise SystemExit("Wheel writes require --apply together with --confirm or --yes")
+    return bool(
+        resolve_cli_write_control(
+            args,
+            command_name="wheel",
+            high_risk=True,
+        )["write_requested"]
+    )
+
+
+def _batch(model: dict[str, Any], lot_id: str) -> dict[str, Any]:
+    matches = [
+        item
+        for item in model.get("batches") or []
+        if item.get("stock_lot_id") == lot_id
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Wheel batch must resolve uniquely: {lot_id}")
+    return matches[0]
+
+
+def _branch(
+    model: dict[str, Any],
+    *,
+    wheel_branch_id: str | None,
+    lot_id: str | None,
+) -> dict[str, Any]:
+    branch_id = str(wheel_branch_id or "").strip()
+    lot_id = str(lot_id or "").strip()
+    if bool(branch_id) == bool(lot_id):
+        raise ValueError("Exactly one of wheel_branch_id or stock_lot_id is required")
+    matches = [
+        item
+        for item in model.get("wheel_branches") or []
+        if (
+            branch_id
+            and str(item.get("wheel_branch_id") or "").strip() == branch_id
+        )
+        or (
+            lot_id
+            and item.get("direction") == "call"
+            and str(item.get("stock_lot_id") or "").strip() == lot_id
+        )
+    ]
+    if len(matches) != 1:
+        identity = branch_id or lot_id
+        raise ValueError(f"Wheel branch must resolve uniquely: {identity}")
+    return matches[0]
+
+
+def _coverage(
+    repo: Any,
+    cfg: dict[str, Any],
+    *,
+    runtime_root: Path,
+    account: str,
+    batch: dict[str, Any],
+    as_of_ms: int,
+    source_identity: str,
+) -> dict[str, Any]:
+    portfolio = cfg.get("portfolio")
+    portfolio = portfolio if isinstance(portfolio, dict) else {}
+    return load_shared_coverage_fact(
+        repo,
+        config=cfg,
+        runtime_root=runtime_root,
+        account=account,
+        symbol=str(batch.get("symbol") or ""),
+        broker=str(batch.get("broker") or portfolio.get("broker") or "富途"),
+        as_of_ms=as_of_ms,
+        source_identity=source_identity,
+    )
+
+
+def _cash_capacity(
+    repo: Any,
+    cfg: dict[str, Any],
+    *,
+    runtime_root: Path,
+    account: str,
+    branch: dict[str, Any],
+    as_of_ms: int,
+) -> dict[str, Any]:
+    portfolio = cfg.get("portfolio")
+    portfolio = portfolio if isinstance(portfolio, dict) else {}
+    return load_shared_cash_capacity_fact(
+        repo,
+        config=cfg,
+        runtime_root=runtime_root,
+        account=account,
+        broker=str(branch.get("broker") or portfolio.get("broker") or "富途"),
+        as_of_ms=as_of_ms,
+        fx_snapshot=load_current_exchange_rate_snapshot(runtime_root=runtime_root),
+    )
+
+
+def execute(args: argparse.Namespace) -> dict[str, Any]:
+    if args.wheel_command == "recover":
+        apply_changes = _write_requested(args)
+        base = Path(__file__).resolve().parents[3]
+        config_path, cfg = load_runtime_config(
+            config_key=args.config_key, config_path=args.config_path, expected_market=args.market,
+        )
+        if args.account not in cfg.get("accounts", {}):
+            raise ValueError("recovery account is not in the target runtime config")
+        data_config = resolve_position_data_config_path(
+            base=base, cfg=cfg, data_config=args.data_config, config_path=config_path,
+        )
+        sqlite_path = resolve_position_ledger_sqlite_path(
+            base=base, cfg=cfg, data_config=data_config, config_path=config_path,
+            runtime_root=args.runtime_root,
+        )
+        # Bind the guard to the same resolved runtime used by recovery.
+        if apply_changes:
+            args.runtime_root = str(sqlite_path.parents[2])
+            if guard_ledger_write(data_config=data_config, args=args, as_json=args.format == "json") is None:
+                raise SystemExit(2)
+        return recover_wheel_assignment(
+            sqlite_path=sqlite_path, account=args.account, market=args.market,
+            assignment_event_id=args.assignment_event_id,
+            expected_preview_hash=args.expected_preview_hash,
+            apply=apply_changes, confirm=apply_changes,
+            allow_completed_combo_yield=args.allow_completed_combo_yield,
+        )
+
+    is_activation_status = (
+        args.wheel_command == "activation" and args.activation_action == "status"
+    )
+    if args.wheel_command == "activation":
+        apply_changes = False if is_activation_status else _write_requested(args)
+        if args.activation_action == "rebind-policy":
+            from src.application.wheel.policy_binding import rebind_wheel_policy
+
+            return rebind_wheel_policy(
+                repo_root=Path(__file__).resolve().parents[3], market=args.market, account=args.account,
+                config_path=args.config_path, runtime_root=args.runtime_root, data_config=args.data_config,
+                request_id=args.request_id, actor=args.actor, expected_preview_hash=args.expected_preview_hash,
+                apply_changes=apply_changes,
+            )
+        if args.activation_action == "accept-policy":
+            from src.application.wheel.policy_acceptance import accept_wheel_policy
+
+            return accept_wheel_policy(
+                repo_root=Path(__file__).resolve().parents[3],
+                market=args.market,
+                actor=args.actor,
+                account=getattr(args, "account", None),
+                config_path=args.config_path,
+                runtime_root=args.runtime_root,
+                data_config=args.data_config,
+                expected_plan_hash=getattr(args, "expected_plan_hash", None),
+                apply_changes=apply_changes,
+            )
+        if apply_changes and not str(args.expected_source_sha256 or "").strip():
+            raise SystemExit(
+                "Wheel activation apply requires --expected-source-sha256 from preview"
+            )
+        return wheel_application.change_wheel_activation(
+            repo_root=Path(__file__).resolve().parents[3],
+            action=args.activation_action,
+            market=args.market,
+            account=args.account,
+            config_path=args.config_path,
+            config_key=args.market,
+            data_config=args.data_config,
+            runtime_root=args.runtime_root,
+            expected_current_generation=getattr(
+                args, "expected_current_generation", None
+            ),
+            request_id=getattr(args, "request_id", None),
+            actor=getattr(args, "actor", None),
+            expected_source_sha256=getattr(args, "expected_source_sha256", None),
+            apply_changes=apply_changes,
+        )
+
+    apply_changes = _write_requested(args)
+    config_path, cfg, repo = _open_runtime(args, apply_changes=apply_changes)
+    market = args.config_key or resolve_wheel_config(cfg, args.account)["market"]
+
+    instant = int(getattr(args, "as_of_ms", None) or _now_ms())
+    if args.wheel_command == "branch":
+        model = build_wheel_read_model(
+            repo,
+            args.account,
+            instant,
+            market=market,
+        )
+        branch = _branch(
+            model,
+            wheel_branch_id=args.wheel_branch_id,
+            lot_id=args.stock_lot_id,
+        )
+        branch_args: dict[str, Any] = {
+            "account": args.account,
+            "wheel_branch_id": branch["wheel_branch_id"],
+            "decision": args.branch_action,
+            "expected_batch_generation_hash": args.expected_batch_generation_hash,
+            "request_id": args.request_id,
+            "actor": args.actor,
+            "market": market,
+            "apply_changes": apply_changes,
+            "as_of_ms": instant,
+        }
+        if args.branch_action == "start":
+            resolved = resolve_wheel_config(
+                cfg,
+                args.account,
+                market=market,
+            )
+            branch_args.update(
+                market=resolved.get("market"),
+                activation_descriptor=resolved.get("activation_descriptor"),
+                account_configured=resolved["account_configured"],
+                policy_sha256=resolved.get("policy_sha256"),
+            )
+        return wheel_application.decide_wheel_branch(repo, **branch_args)
+
+    if args.wheel_command == "end":
+        return end_wheel_lifecycle(
+            repo,
+            account=args.account,
+            lot_id=args.stock_lot_id,
+            expected_batch_generation_hash=args.expected_batch_generation_hash,
+            request_id=args.request_id,
+            actor=args.actor,
+            market=market,
+            apply_changes=apply_changes,
+            as_of_ms=instant,
+        )
+    if args.stock_lot_id and args.direction != "call":
+        raise ValueError("stock_lot_id is a legacy Call-only alias")
+    model = build_wheel_read_model(
+        repo,
+        args.account,
+        instant,
+        market=market,
+    )
+    branch = _branch(
+        model,
+        wheel_branch_id=args.wheel_branch_id,
+        lot_id=args.stock_lot_id,
+    )
+    if branch.get("direction") != args.direction:
+        raise ValueError("Wheel branch direction mismatch")
+    common = {
+        "account": args.account,
+        "wheel_branch_id": branch["wheel_branch_id"],
+        "direction": args.direction,
+        "expected_batch_generation_hash": args.expected_batch_generation_hash,
+        "request_id": args.request_id,
+        "actor": args.actor,
+        "market": market,
+        "apply_changes": apply_changes,
+        "as_of_ms": instant,
+    }
+    if args.wheel_command == "intent" and args.intent_action == "cancel":
+        return cancel_wheel_intent(
+            repo,
+            **common,
+            intent_id=args.intent_id,
+            broker_order_inactive_confirmed=args.broker_order_inactive_confirmed,
+            reason=args.reason,
+            capacity_fact=(
+                _cash_capacity(
+                    repo,
+                    cfg,
+                    runtime_root=Path(args.runtime_root or config_path.parent).resolve(),
+                    account=args.account,
+                    branch=branch,
+                    as_of_ms=instant,
+                )
+                if args.direction == "put"
+                else None
+            ),
+        )
+    if args.wheel_command == "intent":
+        snapshot = load_wheel_candidate_snapshot(
+            base=Path(args.runtime_root or config_path.parent).resolve(),
+            run_id=args.run_id,
+            account=args.account,
+        )
+        capacity_fact = (
+            _coverage(
+                repo,
+                cfg,
+                runtime_root=Path(args.runtime_root or config_path.parent).resolve(),
+                account=args.account,
+                batch=branch,
+                as_of_ms=instant,
+                source_identity=args.request_id,
+            )
+            if args.direction == "call"
+            else load_wheel_candidate_cash_fact(
+                base=Path(args.runtime_root or config_path.parent).resolve(), snapshot=snapshot,
+            )
+        )
+        resolved = resolve_wheel_config(
+            cfg,
+            args.account,
+            market=market,
+        )
+        return create_wheel_intent(
+            repo,
+            **common,
+            candidate_snapshot=snapshot,
+            current_strategy_policy_sha256=current_wheel_candidate_policy_hash(
+                base=Path(args.runtime_root or config_path.parent).resolve(), run_id=args.run_id, account=args.account,
+                config_path=config_path, config=cfg, snapshot=snapshot,
+            ),
+            final_candidate_id=args.final_candidate_id,
+            expected_snapshot_hash=args.expected_snapshot_hash,
+            expires_at_ms=args.expires_at_ms,
+            broker_order_id=args.broker_order_id,
+            capacity_fact=capacity_fact,
+            runtime_config=cfg,
+            new_intent_enabled=resolved["enabled_for_new_lifecycle"],
+            account_configured=resolved["account_configured"],
+            activation_descriptor=resolved.get("activation_descriptor"),
+            policy_sha256=str(resolved.get("policy_sha256") or ""),
+        )
+    if args.linkage_action == "confirm":
+        return confirm_wheel_linkage(
+            repo,
+            **{key: value for key, value in common.items() if key not in {"market", "as_of_ms"}},
+            option_lot_id=args.option_record_id,
+            linkage_candidate_id=args.linkage_candidate_id,
+            expected_input_hash=args.expected_input_hash,
+            config=cfg, runtime_root=repo.ledger_store.runtime_root,
+        )
+    return reject_wheel_linkage(
+        repo,
+        **common,
+        option_lot_id=args.option_record_id,
+        linkage_candidate_id=args.linkage_candidate_id,
+        expected_input_hash=args.expected_input_hash,
+        reason=args.reason,
+    )
+
+
+def _print_result(result: dict[str, Any], *, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    for key, value in result.items():
+        rendered = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+        print(f"{key}: {rendered}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        result = execute(args)
+    except (AgentToolError, ValueError) as exc:
+        err = (
+            exc
+            if isinstance(exc, AgentToolError)
+            else AgentToolError(code="INPUT_ERROR", message=str(exc))
+        )
+        _print_result(
+            build_response(
+                tool_name="wheel",
+                ok=False,
+                error=build_error_payload(err),
+            ),
+            output_format=args.format,
+        )
+        return 2
+    _print_result(result, output_format=args.format)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

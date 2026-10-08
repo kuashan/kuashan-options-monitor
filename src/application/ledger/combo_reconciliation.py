@@ -1,0 +1,767 @@
+from __future__ import annotations
+
+from domain.domain.trade_contract_identity import require_option_multiplier
+
+from datetime import datetime, timezone
+from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
+
+from domain.domain.combo_reconciliation import match_post_trade_combo_pairs, delivered_combo_exposures_for_lot
+from domain.domain.config_contract import RUNTIME_SCHEDULE_TIMEZONE_BY_MARKET
+from domain.domain.decision_state_fingerprint import canonical_sha256
+from domain.domain.ledger import ContractKey, TradeEvent
+from domain.domain.ledger.position_fields import (
+    effective_contracts_open,
+    effective_multiplier,
+    now_ms,
+)
+from src.application.ledger.combo_membership import (
+    resolve_combo_group_membership,
+    resolve_lot_group_bindings,
+)
+from src.application.ledger.event_codec import valid_void_target_event_id
+from src.application.ledger.lot_resolver import (
+    contract_key_from_lot_fields,
+    lot_contract_value,
+    lot_payload_int,
+)
+from src.application.ledger.publisher import (
+    project_stored_trade_events_to_position_lots,
+)
+from src.application.ledger.position_projection_runtime import (
+    run_position_projection_in_transaction,
+)
+from src.application.ledger.current_decision_projection import (
+    capture_trade_event_decision_projection_fence,
+)
+from src.application.ledger.writer import (
+    _finish_trade_event_decision_projection,
+)
+from src.application.ledger.repository import (
+    require_option_positions_event_read_repo,
+    with_sqlite_repo_transaction,
+)
+from src.infrastructure.feishu_bitable import safe_float
+
+
+_PENDING_INFERENCE_STATUSES = {"proposal_ready", "ambiguous"}
+_TERMINAL_PAIR_STATUSES = {"user_rejected", "superseded"}
+_REACTIVATABLE_STALE_REASON = "facts_drifted_or_leg_claimed"
+
+
+def reconcile_combo_pair_inferences(
+    *,
+    repo: Any,
+    account: str,
+    runtime_environment: str,
+    exposures: Iterable[Mapping[str, Any]] = (),
+    persist: bool = False,
+    effective_now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Derive Combo inferences from canonical ledger facts, optionally persisting proposals."""
+
+    account_value = str(account or "").strip().lower()
+    environment_value = str(runtime_environment or "").strip().lower()
+    if not account_value:
+        raise ValueError("combo reconciliation requires account")
+    if not environment_value:
+        raise ValueError("combo reconciliation requires runtime_environment")
+    now_value = int(effective_now_ms or now_ms())
+    if now_value <= 0:
+        raise ValueError("effective_now_ms must be > 0")
+    exposure_rows = [dict(item) for item in exposures]
+    if not persist:
+        candidate = require_option_positions_event_read_repo(repo)
+        return _reconcile_with_repo(
+            candidate,
+            conn=None,
+            account=account_value,
+            runtime_environment=environment_value,
+            exposures=exposure_rows,
+            persist=False,
+            effective_now_ms=now_value,
+        )
+
+    return with_sqlite_repo_transaction(
+        repo,
+        lambda candidate, conn: _reconcile_with_repo(
+            candidate,
+            conn=conn,
+            account=account_value,
+            runtime_environment=environment_value,
+            exposures=exposure_rows,
+            persist=True,
+            effective_now_ms=now_value,
+        ),
+    )
+
+
+def list_combo_pair_inferences(
+    *,
+    repo: Any,
+    account: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    candidate = getattr(repo, "primary_repo", repo)
+    method = getattr(candidate, "list_combo_pair_inferences", None)
+    if not callable(method):
+        raise TypeError("option_positions repo does not support combo inferences")
+    return method(account=account, status=status)
+
+
+def reject_post_trade_combo_pair(
+    *,
+    repo: Any,
+    inference_id: str,
+    expected_input_hash: str,
+    reason: str,
+    actor: str,
+    effective_now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Reject one exact pending inference without changing ledger facts."""
+
+    inference_value = str(inference_id or "").strip()
+    hash_value = str(expected_input_hash or "").strip()
+    reason_value = str(reason or "").strip()
+    actor_value = str(actor or "").strip()
+    if not all((inference_value, hash_value, reason_value, actor_value)):
+        raise ValueError("combo rejection requires inference, hash, reason, and actor")
+    decision_ms = int(effective_now_ms or now_ms())
+
+    def _run(sqlite_repo: Any, conn: Any) -> dict[str, Any]:
+        existing = sqlite_repo.get_combo_pair_inference(inference_value, conn=conn)
+        if existing is None:
+            raise ValueError(f"combo inference not found: {inference_value}")
+        if (
+            str(existing.get("status") or "").strip().lower() == "user_rejected"
+            and str(existing.get("input_snapshot_hash") or "") == hash_value
+        ):
+            return existing
+        return sqlite_repo.transition_combo_pair_inference(
+            inference_id=inference_value,
+            expected_statuses=sorted(_PENDING_INFERENCE_STATUSES),
+            new_status="user_rejected",
+            expected_input_hash=hash_value,
+            decision_fields={
+                "decision_at_ms": decision_ms,
+                "decision_by": actor_value,
+                "decision_reason": reason_value,
+            },
+            conn=conn,
+        )
+
+    return with_sqlite_repo_transaction(repo, _run)
+
+
+def supersede_post_trade_combo_pair(
+    *,
+    repo: Any,
+    inference_id: str,
+    expected_input_hash: str,
+    reason: str,
+    actor: str,
+    apply_changes: bool = False,
+    effective_now_ms: int | None = None,
+) -> dict[str, Any]:
+    """Atomically void both adoption events and supersede a confirmed inference."""
+
+    inference_value = str(inference_id or "").strip()
+    hash_value = str(expected_input_hash or "").strip()
+    reason_value = str(reason or "").strip()
+    actor_value = str(actor or "").strip()
+    if not all((inference_value, hash_value, reason_value)):
+        raise ValueError("combo supersede requires inference, hash, and reason")
+    if apply_changes and not actor_value:
+        raise ValueError("combo supersede apply requires actor")
+    decision_ms = int(effective_now_ms or now_ms())
+
+    def _run(sqlite_repo: Any, conn: Any) -> dict[str, Any]:
+        inference = sqlite_repo.get_combo_pair_inference(inference_value, conn=conn)
+        if inference is None:
+            raise ValueError(f"combo inference not found: {inference_value}")
+        if str(inference.get("input_snapshot_hash") or "") != hash_value:
+            raise ValueError("combo inference input hash compare-and-set failed")
+        status = str(inference.get("status") or "").strip().lower()
+        if status == "superseded":
+            return {
+                "schema_version": "post_trade_combo_supersede.v1",
+                "status": "already_superseded",
+                "apply_changes": bool(apply_changes),
+                "inference": inference,
+            }
+        if status != "user_confirmed":
+            raise ValueError(f"combo inference is not supersedable: {status}")
+        group_id = str(inference.get("strategy_group_id") or "").strip()
+        adoption_ids = [
+            str(inference.get("put_adoption_event_id") or "").strip(),
+            str(inference.get("call_adoption_event_id") or "").strip(),
+        ]
+        if not group_id or not all(adoption_ids):
+            raise ValueError("confirmed combo inference adoption evidence is incomplete")
+        events = sqlite_repo.list_trade_events(conn=conn)
+        by_id = {
+            str(item.get("event_id") or "").strip(): dict(item)
+            for item in events
+            if str(item.get("event_id") or "").strip()
+        }
+        if any(event_id not in by_id for event_id in adoption_ids):
+            raise ValueError("confirmed combo adoption event is missing")
+        decisions = [(by_id[event_id].get("raw_payload") or {}).get("attribution_decision")
+                     for event_id in adoption_ids]
+        if any(decision is not None for decision in decisions):
+            if (not all(isinstance(decision, Mapping) for decision in decisions)
+                    or decisions[0] != decisions[1]
+                    or not isinstance(decisions[0].get("members"), list)
+                    or {member.get("proof_event_id") for member in decisions[0]["members"]
+                        if isinstance(member, Mapping)} != set(adoption_ids)
+                    or len(decisions[0]["members"]) != 2):
+                raise ValueError("Combo supersede requires the complete attribution decision; two-leg void would change other members")
+        existing_void_targets = {
+            target
+            for item in events
+            if (target := valid_void_target_event_id(item))
+        }
+        if any(event_id in existing_void_targets for event_id in adoption_ids):
+            raise ValueError("confirmed combo adoption event is already voided")
+        membership = resolve_combo_group_membership(
+            group_id=group_id,
+            account=str(inference["account"]),
+            expected_symbol=str(inference["symbol"]),
+            trade_events=events,
+            projected_position_lots=project_stored_trade_events_to_position_lots(events).lots,
+        )
+        if membership.fact.get("status") != "exact":
+            raise ValueError("confirmed combo membership is no longer exact")
+        void_ids = [
+            _combo_decision_event_id("combo-supersede", inference_value, "funding_put"),
+            _combo_decision_event_id("combo-supersede", inference_value, "participation_call"),
+        ]
+        preview = {
+            "schema_version": "post_trade_combo_supersede.v1",
+            "status": "dry_run" if not apply_changes else "superseded",
+            "apply_changes": bool(apply_changes),
+            "inference_id": inference_value,
+            "put_void_event_id": void_ids[0],
+            "call_void_event_id": void_ids[1],
+        }
+        if not apply_changes:
+            return preview
+        void_events = [
+            _combo_void_event(
+                    event_id=event_id,
+                    target=by_id[target_id],
+                    target_event_id=target_id,
+                    inference_id=inference_value,
+                    reason=reason_value,
+                    event_time_ms=decision_ms,
+                )
+            for event_id, target_id in zip(void_ids, adoption_ids, strict=True)
+        ]
+        decision_fence = capture_trade_event_decision_projection_fence(
+            sqlite_repo,
+            conn=conn,
+        )
+        runtime = run_position_projection_in_transaction(
+            sqlite_repo,
+            void_events,
+            conn=conn,
+            mode="forced_full",
+        )
+        events_after = sqlite_repo.list_trade_events(conn=conn)
+        projection_lots = sqlite_repo.list_position_lots(conn=conn)
+        membership_after = resolve_combo_group_membership(
+            group_id=group_id,
+            account=str(inference["account"]),
+            expected_symbol=str(inference["symbol"]),
+            trade_events=events_after,
+            projected_position_lots=projection_lots,
+        )
+        if membership_after.fact.get("status") == "exact":
+            raise ValueError("superseded Combo membership remains exact")
+        updated = sqlite_repo.transition_combo_pair_inference(
+            inference_id=inference_value,
+            expected_statuses=["user_confirmed"],
+            new_status="superseded",
+            expected_input_hash=hash_value,
+            decision_fields={
+                "decision_at_ms": decision_ms,
+                "decision_by": actor_value,
+                "decision_reason": reason_value,
+                "put_void_event_id": void_ids[0],
+                "call_void_event_id": void_ids[1],
+            },
+            conn=conn,
+        )
+        decision_projection = _finish_trade_event_decision_projection(
+            sqlite_repo,
+            conn=conn,
+            fence=decision_fence,
+            events=void_events,
+            created_flags=runtime.created_flags,
+        )
+        sqlite_repo.assert_foreign_keys_clean(conn=conn)
+        return {
+            **preview,
+            "membership": membership_after.fact,
+            "inference": updated,
+            "decision_projection": decision_projection,
+        }
+
+    return with_sqlite_repo_transaction(
+        repo,
+        _run,
+        require_projection_publication=True,
+    )
+
+
+def combo_attribution_candidates_from_rows(
+    rows: Mapping[str, Any], *, account: str, runtime_environment: str,
+    exposures: list[dict[str, Any]], effective_now_ms: int, include_claimed: bool = False,
+) -> dict[str, Any]:
+    """Reuse the canonical matcher on the caller's complete ledger snapshot."""
+    events = list(rows.get("trade_events") or [])
+    lots = list(rows.get("stored_position_lots") or [])
+    identities = list(rows.get("account_combo_identities") or [])
+    existing = list(rows.get("account_combo_inferences") or [])
+    confirmed_open_event_ids = {
+        str(item.get(field) or "").strip()
+        for item in existing
+        if str(item.get("status") or "").strip().lower() == "user_confirmed"
+        and resolve_combo_group_membership(group_id=item["strategy_group_id"], account=account,
+            trade_events=events, projected_position_lots=lots).global_current_lot_ids
+        for field in ("put_open_event_id", "call_open_event_id")
+        if str(item.get(field) or "").strip()
+    }
+    reactivatable_inference_ids = {
+        str(item.get("inference_id") or "").strip()
+        for item in existing
+        if str(item.get("status") or "").strip().lower() == "expired_unresolved"
+        and str(item.get("decision_reason") or "").strip()
+        == _REACTIVATABLE_STALE_REASON
+        and int(item.get("proposal_expires_at_ms") or 0) >= effective_now_ms
+        and str(item.get("inference_id") or "").strip()
+    }
+    forbidden_inference_ids = {
+        str(item.get("inference_id") or "").strip()
+        for item in existing
+        if str(item.get("status") or "").strip().lower()
+        in _TERMINAL_PAIR_STATUSES
+        or (
+            str(item.get("status") or "").strip().lower()
+            == "expired_unresolved"
+            and str(item.get("inference_id") or "").strip()
+            not in reactivatable_inference_ids
+        )
+        or (
+            str(item.get("status") or "").strip().lower()
+            in _PENDING_INFERENCE_STATUSES
+            and int(item.get("proposal_expires_at_ms") or 0) < effective_now_ms
+        )
+    }
+    effective_identity_open_event_ids = _effective_identity_open_event_ids(
+        account=account,
+        events=events,
+        lots=lots,
+        identities=identities,
+    )
+    lot_facts = _ledger_lot_facts(
+        account=account,
+        runtime_environment=runtime_environment,
+        events=events,
+        lots=lots,
+        confirmed_open_event_ids=set() if include_claimed else confirmed_open_event_ids,
+        effective_identity_open_event_ids=set() if include_claimed else effective_identity_open_event_ids,
+        include_claimed=include_claimed,
+    )
+    matched = match_post_trade_combo_pairs(
+        lots=lot_facts,
+        exposures=exposures,
+        forbidden_inference_ids=forbidden_inference_ids,
+    )
+    rejected_exposures: dict[str, set[str]] = {}
+    rejected = [item for item in existing if item.get("status") == "user_rejected"]
+    if include_claimed and rejected:
+        rejected_ids = {item["inference_id"] for item in rejected}
+        probe = match_post_trade_combo_pairs(lots=lot_facts, exposures=exposures)
+        exact_pairs = [*rejected, *(item for item in probe["inferences"] if item["inference_id"] in rejected_ids)]
+        by_lot = {item["record_id"]: item for item in lot_facts}
+        delivered = {lot_id: set(delivered_combo_exposures_for_lot(item, exposures)) for lot_id, item in by_lot.items()}
+        rejected_counterparts: dict[tuple[str, str], set[str]] = {}
+        for pair in exact_pairs:
+            for leg, opposite in (("put", "call"), ("call", "put")):
+                lot_id = pair.get(leg + "_record_id")
+                if lot_id in by_lot and by_lot[lot_id]["open_event_id"] == pair.get(leg + "_open_event_id"):
+                    for exposure in pair.get("candidate_exposure_ids") or []:
+                        rejected_counterparts.setdefault((lot_id, exposure), set()).add(pair[opposite + "_open_event_id"])
+        for (lot_id, exposure), rejected_ids in rejected_counterparts.items():
+            lot = by_lot[lot_id]
+            counterparts = {item["open_event_id"] for other_id, item in by_lot.items()
+                if item["option_type"] != lot["option_type"] and item["broker_account_ref"] == lot["broker_account_ref"]
+                and exposure in delivered[other_id]}
+            if counterparts <= rejected_ids:
+                rejected_exposures.setdefault(lot_id, set()).add(exposure)
+    return {**matched, "lot_facts": lot_facts, "reactivatable_inference_ids": reactivatable_inference_ids,
+            "rejected_exposure_ids_by_lot": {key: sorted(value) for key, value in rejected_exposures.items()}}
+
+
+def _reconcile_with_repo(
+    repo: Any,
+    *,
+    conn: Any,
+    account: str,
+    runtime_environment: str,
+    exposures: list[dict[str, Any]],
+    persist: bool,
+    effective_now_ms: int,
+) -> dict[str, Any]:
+    inference_list = getattr(repo, "list_combo_pair_inferences", None)
+    identity_list = getattr(repo, "list_strategy_group_identities", None)
+    if not callable(inference_list) or not callable(identity_list):
+        raise TypeError("option_positions repo lacks combo reconciliation read methods")
+    if persist:
+        expire = getattr(repo, "expire_combo_pair_inferences", None)
+        if not callable(expire):
+            raise TypeError("option_positions repo lacks combo inference expiry")
+        expire(
+            effective_now_ms=effective_now_ms,
+            account=account,
+            conn=conn,
+        )
+    events = repo.list_trade_events(conn=conn)
+    lots = repo.list_position_lots(conn=conn)
+    identities = identity_list(account=account, conn=conn)
+    existing = inference_list(account=account, conn=conn)
+    matched = combo_attribution_candidates_from_rows(
+        {"trade_events": events, "stored_position_lots": lots, "account_combo_identities": identities,
+         "account_combo_inferences": existing}, account=account, runtime_environment=runtime_environment,
+        exposures=exposures, effective_now_ms=effective_now_ms)
+    lot_facts = matched.pop("lot_facts")
+    reactivatable_inference_ids = matched.pop("reactivatable_inference_ids")
+    inserted_count = 0
+    reactivated_count = 0
+    stale_expired_count = 0
+    if persist:
+        upsert = getattr(repo, "upsert_combo_pair_inference", None)
+        expire_stale = getattr(repo, "expire_stale_combo_pair_inferences", None)
+        if not callable(upsert) or not callable(expire_stale):
+            raise TypeError("option_positions repo lacks combo inference write methods")
+        for inference in matched["inferences"]:
+            inference_id = str(inference["inference_id"])
+            is_reactivation = inference_id in reactivatable_inference_ids
+            inserted_count += int(
+                bool(
+                    upsert(
+                        inference,
+                        reactivate_stale=is_reactivation,
+                        conn=conn,
+                    )
+                )
+            )
+            reactivated_count += int(is_reactivation)
+        stale_expired_count = int(
+            expire_stale(
+                account=account,
+                active_inference_ids=[
+                    str(item["inference_id"])
+                    for item in matched["inferences"]
+                ],
+                effective_now_ms=effective_now_ms,
+                conn=conn,
+            )
+        )
+    return {
+        "ok": True,
+        "account": account,
+        "runtime_environment": runtime_environment,
+        "persisted": bool(persist),
+        "effective_now_ms": effective_now_ms,
+        "ledger_lot_fact_count": len(lot_facts),
+        "candidate_exposure_count": len(exposures),
+        "inserted_inference_count": inserted_count,
+        "reactivated_inference_count": reactivated_count,
+        "stale_expired_count": stale_expired_count,
+        **matched,
+    }
+
+
+def _ledger_lot_facts(
+    *,
+    account: str,
+    runtime_environment: str,
+    events: list[dict[str, Any]],
+    lots: list[dict[str, Any]],
+    confirmed_open_event_ids: set[str],
+    effective_identity_open_event_ids: set[str],
+    include_claimed: bool = False,
+) -> list[dict[str, Any]]:
+    # The strategy family left the lot payload (``write-side-definition.md`` §2
+    # RECONSTRUCTIBLE; §7 moves it to the strategy/event side). "Is this lot
+    # already grouped?" is replayed from the events that bound it -- the same
+    # answer the payload used to carry, with voided adoptions excluded.
+    group_bindings = resolve_lot_group_bindings(events)
+    events_by_id = {
+        str(item.get("event_id") or "").strip(): item
+        for item in events
+        if str(item.get("event_id") or "").strip()
+    }
+    open_by_lot = {
+        str(item.get("lot_id") or "").strip(): item
+        for item in events
+        if str(item.get("event_type") or "").strip().lower() == "open"
+        and str(item.get("lot_id") or "").strip()
+    }
+    out: list[dict[str, Any]] = []
+    for row in lots:
+        fields = dict(row.get("fields") or {})
+        lot_contract_key = contract_key_from_lot_fields(fields)
+        if (
+            str(
+                lot_contract_value(fields, lot_contract_key, "account", "account")
+                or ""
+            )
+            .strip()
+            .lower()
+            != account
+        ):
+            continue
+        lot_id = str(row.get("record_id") or "").strip()
+        open_event_id = str(
+            fields.get("open_event_id") or fields.get("source_event_id") or ""
+        ).strip()
+        event = events_by_id.get(open_event_id) or open_by_lot.get(lot_id) or {}
+        if not open_event_id:
+            open_event_id = str(event.get("event_id") or "").strip()
+        contract = dict(event.get("contract_key") or {})
+        trade_time_ms = _event_time_ms(event, fields)
+        symbol = str(
+            lot_contract_value(
+                fields, lot_contract_key, "underlying_symbol", "symbol"
+            )
+            or contract.get("underlying_symbol")
+            or ""
+        ).strip().upper()
+        currency = str(
+            fields.get("currency") or event.get("currency") or ""
+        ).strip().upper()
+        broker = str(
+            lot_contract_value(fields, lot_contract_key, "broker", "broker")
+            or contract.get("broker")
+            or ""
+        ).strip().lower()
+        market = _market(symbol=symbol, currency=currency, broker=broker)
+        broker_account_ref = _event_broker_account_ref(event, expected_account=account)
+        group_binding = {} if include_claimed else group_bindings.get(lot_id) or {}
+        group_id = str(group_binding.get("strategy_group_id") or "").strip()
+        leg_role = str(group_binding.get("leg_role") or "").strip().lower()
+        strategy = str(group_binding.get("strategy") or "").strip().lower()
+        out.append(
+            {
+                "record_id": lot_id,
+                "open_event_id": open_event_id,
+                "account": account,
+                "broker": broker,
+                "broker_account_ref": broker_account_ref,
+                "runtime_environment": str(broker_account_ref.get("environment") or "").lower(),
+                "market": market,
+                "market_date": _market_date(
+                    event_time_ms=trade_time_ms,
+                    market=market,
+                ),
+                "symbol": symbol,
+                "option_type": str(
+                    lot_contract_value(
+                        fields, lot_contract_key, "option_type", "option_type"
+                    )
+                    or contract.get("option_type")
+                    or ""
+                ).strip().lower(),
+                "position_side": str(
+                    fields.get("position_side")
+                    or fields.get("side")
+                    or contract.get("position_side")
+                    or ""
+                ).strip().lower(),
+                "contracts_opened": lot_payload_int(
+                    fields, "contracts_opened", "contracts"
+                ),
+                "contracts_open": effective_contracts_open(fields),
+                "currency": currency,
+                "multiplier": effective_multiplier(fields),
+                "strike": _lot_contract_strike(fields, lot_contract_key),
+                "expiration_ymd": (
+                    str(
+                        lot_contract_value(
+                            fields,
+                            lot_contract_key,
+                            "expiration_ymd",
+                            "expiration_ymd",
+                        )
+                        or ""
+                    ).strip()
+                    or str(contract.get("expiration_ymd") or "").strip()
+                ),
+                "trade_time_ms": trade_time_ms,
+                # The strategy family is no longer in the lot payload; the
+                # event-layer replay answers it (see ``group_bindings``).
+                "strategy": strategy,
+                "strategy_group_id": group_id,
+                "leg_role": leg_role,
+                "effective_combo_identity": (
+                    open_event_id in effective_identity_open_event_ids
+                ),
+                "confirmed_combo_claim": (
+                    open_event_id in confirmed_open_event_ids
+                ),
+            }
+        )
+    return out
+
+
+def _lot_contract_strike(
+    fields: Mapping[str, Any],
+    contract_key: Mapping[str, Any],
+) -> float | None:
+    """``contract_key.strike`` first, the retired flat sibling after."""
+    strike = safe_float(lot_contract_value(fields, contract_key, "strike", "strike"))
+    return float(strike) if strike is not None else None
+
+
+def _event_broker_account_ref(
+    event: Mapping[str, Any], *, expected_account: str,
+) -> dict[str, str]:
+    raw = event.get("raw_payload") or {}
+    execution = raw.get("execution_input") or {}
+    ref = execution.get("broker_account_ref") or {}
+    if not isinstance(ref, Mapping):
+        return {}
+    if ref.get("account_label") not in (None, "", expected_account):
+        return {}
+    identity = {key: str(ref.get(key) or "").strip() for key in
+                ("broker_id", "external_account_id", "environment")}
+    if not all(identity.values()) or identity["environment"] not in {"REAL", "SIMULATE"}:
+        return {}
+    # Listener endpoints are transport metadata, never physical account identity.
+    return identity
+
+
+def _effective_identity_open_event_ids(
+    *,
+    account: str,
+    events: list[dict[str, Any]],
+    lots: list[dict[str, Any]],
+    identities: list[dict[str, Any]],
+) -> set[str]:
+    out: set[str] = set()
+    for identity in identities:
+        group_id = str(identity.get("group_id") or "").strip()
+        if not group_id:
+            continue
+        resolved = resolve_combo_group_membership(
+            group_id=group_id,
+            account=account,
+            expected_symbol=str(identity.get("symbol") or "").strip().upper(),
+            trade_events=events,
+            projected_position_lots=lots,
+        )
+        if resolved.fact.get("status") != "exact":
+            continue
+        for field in (
+            "funding_put_open_event_id",
+            "participation_call_open_event_id",
+        ):
+            value = str(identity.get(field) or "").strip()
+            if value:
+                out.add(value)
+    return out
+
+
+def _event_time_ms(event: Mapping[str, Any], fields: Mapping[str, Any]) -> int:
+    for value in (
+        event.get("event_time_ms"),
+        event.get("trade_time_ms"),
+        # ``opened_at`` converged onto ``opened_at_ms``; the flat spelling is
+        # kept for a row written before the shape switch.
+        fields.get("opened_at_ms"),
+        fields.get("opened_at"),
+    ):
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed
+    return 0
+
+
+def _market(*, symbol: str, currency: str, broker: str) -> str:
+    if symbol.endswith(".HK") or currency == "HKD" or broker in {"hk", "hkcc"}:
+        return "HK"
+    if symbol and (currency == "USD" or broker in {"futu", "us"}):
+        return "US"
+    return ""
+
+
+def _market_date(*, event_time_ms: int, market: str) -> str:
+    timezone_name = RUNTIME_SCHEDULE_TIMEZONE_BY_MARKET.get(market.lower())
+    if event_time_ms <= 0 or not timezone_name:
+        return ""
+    observed = datetime.fromtimestamp(
+        event_time_ms / 1000,
+        tz=timezone.utc,
+    )
+    return observed.astimezone(ZoneInfo(timezone_name)).date().isoformat()
+
+
+def _combo_decision_event_id(prefix: str, inference_id: str, role: str) -> str:
+    return f"{prefix}:v1:" + canonical_sha256(
+        {"inference_id": inference_id, "role": role}
+    )
+
+
+
+def _combo_void_event(
+    *,
+    event_id: str,
+    target: Mapping[str, Any],
+    target_event_id: str,
+    inference_id: str,
+    reason: str,
+    event_time_ms: int,
+) -> TradeEvent:
+    contract = dict(target.get("contract_key") or {})
+    return TradeEvent(
+        event_id=event_id,
+        event_type="void",
+        event_time_ms=event_time_ms,
+        contract_key=ContractKey.from_values(
+            broker=contract.get("broker"),
+            account=contract.get("account"),
+            underlying_symbol=contract.get("underlying_symbol"),
+            option_type=contract.get("option_type"),
+            strike=contract.get("strike"),
+            expiration_ymd=contract.get("expiration_ymd"),
+        ),
+        contracts=0,
+        price=0.0,
+        currency=str(target.get("currency") or ""),
+        source="post_trade_combo_reconciliation",
+        multiplier=require_option_multiplier(target.get("multiplier")),
+        target_event_id=target_event_id,
+        raw_payload={
+            "source": "post_trade_combo_reconciliation",
+            "source_type": "combo_pair_inference",
+            "mode": "post_trade_combo_supersede",
+            "inference_id": inference_id,
+            "void_target_event_id": target_event_id,
+            "void_reason": reason,
+            "idempotency_key": event_id,
+        },
+    )
+
+
+__all__ = [
+    "list_combo_pair_inferences",
+    "reject_post_trade_combo_pair",
+    "reconcile_combo_pair_inferences",
+    "supersede_post_trade_combo_pair",
+]

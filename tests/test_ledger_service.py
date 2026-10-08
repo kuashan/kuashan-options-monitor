@@ -1,0 +1,351 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from domain.domain.ledger import ContractKey, TradeEvent
+from domain.domain.trade_contract_identity import derive_trade_side
+import src.application.ledger.manual_trades as ledger_manual_trades
+import src.application.ledger.repository as ledger_repository
+
+
+
+def _position_fields(
+    *,
+    lot_id: str = "lot_put_may",
+    strike: float = 450.0,
+    expiration_ymd: str = "2026-05-28",
+    contracts_open: int = 6,
+) -> dict[str, Any]:
+    from domain.domain.option_position_lots import parse_exp_to_ms
+
+    exp_ms = parse_exp_to_ms(expiration_ymd)
+    assert exp_ms is not None
+    return {
+        "record_id": lot_id,
+        "position_key": lot_id,
+        "status": "open",
+        "contracts": contracts_open,
+        "contracts_open": contracts_open,
+        "contracts_closed": 0,
+        "broker": "富途",
+        "account": "sy",
+        "symbol": "0700.HK",
+        "option_type": "put",
+        "side": "short",
+        "currency": "HKD",
+        "strike": strike,
+        "multiplier": 100,
+        "expiration": exp_ms,
+        "source_event_id": "open-put-may",
+    }
+
+
+def _manual_open_event_kwargs(**overrides: Any) -> dict[str, Any]:
+    return {
+        "broker": "富途",
+        "account": "sy",
+        "symbol": "0700.HK",
+        "option_type": "put",
+        "side": "short",
+        "contracts": 6,
+        "currency": "HKD",
+        "strike": 450.0,
+        "multiplier": 100,
+        "expiration_ymd": "2026-05-28",
+        "premium_per_share": 8.0,
+        "opened_at_ms": 1000,
+        **overrides,
+    }
+
+
+def _open_event_from_fields(fields: dict[str, Any], *, event_id: str = "open-put-may") -> dict[str, Any]:
+    from domain.domain.ledger.position_fields import effective_expiration_ymd
+
+    return TradeEvent(
+        event_id=event_id,
+        event_type="open",
+        event_time_ms=1000,
+        contract_key=ContractKey.from_values(
+            broker=fields.get("broker"),
+            account=fields.get("account"),
+            underlying_symbol=fields.get("symbol"),
+            option_type=fields.get("option_type"),
+            strike=fields.get("strike"),
+            expiration_ymd=effective_expiration_ymd(fields),
+                ),
+        contracts=int(fields.get("contracts") or fields.get("contracts_open") or 0),
+        price=1.0,
+        currency=str(fields.get("currency") or "HKD"),
+        source="test_seed_open_lot",
+        multiplier=float(fields.get("multiplier") or 100),
+        lot_id=str(fields.get("record_id") or ""),
+        raw_payload={
+            # §9.2 step 3: the contract key no longer carries the position
+            # side, so translate the record's side into the trade side.
+            "side": derive_trade_side("open", fields.get("side")) or "",
+            "source_type": "test_seed",
+        },
+    ).to_dict()
+
+
+def _broker_open_deal() -> Any:
+    from src.application.trades.normalizer import NormalizedTradeDeal
+
+    return NormalizedTradeDeal(
+        broker="富途",
+        futu_account_id="futu-account-lx",
+        internal_account="lx",
+        deal_id="new-pdd-put",
+        order_id="order-new-pdd-put",
+        symbol="PDD",
+        option_type="put",
+        side="sell",
+        position_effect="open",
+        contracts=1,
+        price=3.05,
+        strike=85.0,
+        multiplier=100,
+        multiplier_source="broker",
+        expiration_ymd="2026-08-28",
+        currency="USD",
+        trade_time_ms=3000,
+        raw_payload={"deal_id": "new-pdd-put"},
+    )
+
+
+def _history_with_invalid_close(*, voided: bool) -> list[dict[str, Any]]:
+    fields = _position_fields()
+    key = ContractKey.from_values(
+        broker=fields["broker"],
+        account=fields["account"],
+        underlying_symbol=fields["symbol"],
+        option_type=fields["option_type"],
+        strike=fields["strike"],
+        expiration_ymd="2026-05-28",
+        )
+    invalid_close_id = "invalid-close"
+    events = [
+        _open_event_from_fields(fields),
+        TradeEvent(
+            event_id=invalid_close_id,
+            event_type="close",
+            event_time_ms=0,
+            contract_key=key,
+            contracts=1,
+            price=0.2,
+            currency="HKD",
+            source="opend_push",
+            multiplier=100,
+            target_lot_id=fields["record_id"],
+        ).to_dict(),
+    ]
+    if voided:
+        events.append(
+            TradeEvent(
+                event_id="void-invalid-close",
+                event_type="void",
+                event_time_ms=2000,
+                contract_key=key,
+                contracts=0,
+                price=0.0,
+                currency="HKD",
+                source="cli_trade_event_repair",
+                multiplier=100,
+                target_event_id=invalid_close_id,
+            ).to_dict()
+        )
+    return events
+
+
+def test_manual_open_ledger_service_projects_new_lot(tmp_path: Path) -> None:
+    from src.application.ledger.commands import persist_manual_open_event_with_ledger
+
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+
+    result = persist_manual_open_event_with_ledger(repo, **_manual_open_event_kwargs())
+
+    assert result.ledger_preflight.status == "ok"
+    assert result.ledger_preflight.event_type == "open"
+    assert result.ledger_preflight.contracts_open_before == 0
+    assert result.ledger_preflight.contracts_open_after == 6
+    assert result.ledger_preflight.position_contracts_open_after == 6
+    assert result.result.created is True
+    assert result.result.lot_id == result.ledger_preflight.target_lot_id
+    lots = repo.list_position_lots()
+    assert len(lots) == 1
+    assert lots[0]["record_id"] == result.ledger_preflight.target_lot_id
+    assert lots[0]["fields"]["contracts_open"] == 6
+
+
+def test_manual_close_ledger_service_closes_exact_lot(tmp_path: Path) -> None:
+    from src.application.ledger.commands import persist_manual_close_event_with_ledger
+
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+    ledger_manual_trades.persist_manual_open_event(repo, **_manual_open_event_kwargs())
+    lot = repo.list_position_lots()[0]
+
+    result = persist_manual_close_event_with_ledger(
+        repo,
+        lot_id=lot["record_id"],
+        fields=lot["fields"],
+        contracts_to_close=2,
+        close_price=1.2,
+        close_reason="manual_buy_to_close",
+        as_of_ms=2000,
+    )
+
+    assert result.ledger_preflight.status == "ok"
+    assert result.ledger_preflight.target_lot_id == lot["record_id"]
+    assert result.ledger_preflight.contracts_open_before == 6
+    assert result.ledger_preflight.contracts_open_after == 4
+    assert result.result.created is True
+    lots = repo.list_position_lots()
+    assert lots[0]["record_id"] == lot["record_id"]
+    assert lots[0]["fields"]["contracts_open"] == 4
+    assert repo.list_trade_events()[-1]["raw_payload"]["record_id"] == lot["record_id"]
+
+
+def test_manual_adjust_ledger_service_targets_exact_lot(tmp_path: Path) -> None:
+    from src.application.ledger.commands import persist_manual_adjust_event_with_ledger
+
+    repo = ledger_repository.SQLiteOptionPositionsRepository(tmp_path / "option_positions.sqlite3")
+    ledger_manual_trades.persist_manual_open_event(repo, **_manual_open_event_kwargs())
+    lot = repo.list_position_lots()[0]
+
+    result = persist_manual_adjust_event_with_ledger(
+        repo,
+        lot_id=lot["record_id"],
+        fields=lot["fields"],
+        contracts=5,
+        premium_per_share=8.5,
+        as_of_ms=2000,
+    )
+
+    assert result.ledger_preflight.status == "ok"
+    assert result.ledger_preflight.event_type == "adjust"
+    assert result.ledger_preflight.target_lot_id == lot["record_id"]
+    assert result.ledger_preflight.contracts_open_before == 6
+    assert result.ledger_preflight.contracts_open_after == 5
+    assert result.result.created is True
+    adjusted = repo.get_record_fields(lot["record_id"])
+    assert adjusted["contracts_opened"] == 5
+    assert adjusted["contracts_open"] == 5
+    assert adjusted["premium_open"] == "8.5"
+    assert repo.list_trade_events()[-1]["raw_payload"]["record_id"] == lot["record_id"]
+
+
+def test_manual_close_ledger_preflight_rejects_target_identity_mismatch() -> None:
+    from src.application.ledger.errors import LedgerPreflightError
+    from src.application.ledger.preflight import preflight_manual_close
+
+    current_fields = _position_fields(strike=450.0)
+    projected_fields = _position_fields(strike=451.0)
+
+    class MismatchedRepo:
+        def get_record_fields(self, lot_id: str) -> dict[str, Any]:
+            assert lot_id == "lot_put_may"
+            return dict(current_fields)
+
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            return [{"record_id": "lot_put_may", "fields": dict(projected_fields)}]
+
+        def list_trade_events(self) -> list[dict[str, Any]]:
+            return [_open_event_from_fields(projected_fields)]
+
+    with pytest.raises(LedgerPreflightError) as exc_info:
+        preflight_manual_close(
+            MismatchedRepo(),
+            lot_id="lot_put_may",
+            contracts_to_close=1,
+            close_price=1.2,
+            close_reason="manual_buy_to_close",
+            as_of_ms=2000,
+        )
+
+    assert exc_info.value.code == "target_contract_mismatch"
+    assert exc_info.value.details["record_id"] == "lot_put_may"
+
+
+def test_manual_close_ledger_preflight_rejects_duplicate_lot_snapshot() -> None:
+    from src.application.ledger.errors import LedgerPreflightError
+    from src.application.ledger.preflight import preflight_manual_close
+
+    fields = _position_fields()
+
+    class DuplicateRepo:
+        def get_record_fields(self, lot_id: str) -> dict[str, Any]:
+            assert lot_id == "lot_put_may"
+            return dict(fields)
+
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            return [
+                {"record_id": "lot_put_may", "fields": dict(fields)},
+                {"record_id": "lot_put_may", "fields": dict(fields)},
+            ]
+
+        def list_trade_events(self) -> list[dict[str, Any]]:
+            return [
+                _open_event_from_fields(fields, event_id="open-put-may"),
+                _open_event_from_fields(fields, event_id="open-put-may"),
+            ]
+
+    with pytest.raises(LedgerPreflightError) as exc_info:
+        preflight_manual_close(
+            DuplicateRepo(),
+            lot_id="lot_put_may",
+            contracts_to_close=1,
+            close_price=1.2,
+            close_reason="manual_buy_to_close",
+            as_of_ms=2000,
+    )
+
+    assert exc_info.value.code == "ledger_shadow_invalid"
+    assert exc_info.value.details["import_errors"] == []
+    error_items = [
+        *exc_info.value.details.get("import_errors", []),
+        *exc_info.value.details.get("projection_errors", []),
+    ]
+    error_codes = {item["code"] for item in error_items}
+    assert "duplicate_event_id" in error_codes or "duplicate_lot_id" in error_codes
+
+
+def test_broker_open_preflight_ignores_import_error_from_validly_voided_event() -> None:
+    from src.application.ledger.preflight import preflight_trade_open
+
+    events = _history_with_invalid_close(voided=True)
+
+    class Repo:
+        def list_trade_events(self) -> list[dict[str, Any]]:
+            return list(events)
+
+    result = preflight_trade_open(Repo(), deal=_broker_open_deal())
+
+    assert result.status == "ok"
+    assert result.event_type == "open"
+    assert result.source_record_count == 3
+    assert result.imported_event_count == 3
+
+
+def test_broker_open_preflight_keeps_active_import_error_fail_closed() -> None:
+    from src.application.ledger.errors import LedgerPreflightError
+    from src.application.ledger.preflight import preflight_trade_open
+
+    events = _history_with_invalid_close(voided=False)
+
+    class Repo:
+        def list_trade_events(self) -> list[dict[str, Any]]:
+            return list(events)
+
+    with pytest.raises(LedgerPreflightError) as exc_info:
+        preflight_trade_open(Repo(), deal=_broker_open_deal())
+
+    assert exc_info.value.code == "ledger_shadow_invalid"
+    assert [item["code"] for item in exc_info.value.details["import_errors"]] == [
+        "event_time_must_be_positive"
+    ]
+    assert [item["code"] for item in exc_info.value.details["projection_errors"]] == [
+        "event_time_must_be_positive"
+    ]

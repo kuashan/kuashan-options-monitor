@@ -1,0 +1,626 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from argparse import ArgumentParser, Namespace
+
+import pytest
+
+from src.application.bot import channel_facade, tools as bot_tools
+from src.application.bot.contracts import AppResult, BotRequest, BotScope, new_id
+from tests.bot_pi_test_support import (
+    _TEST_MODEL,
+    ModelTurn,
+    ToolCall,
+    run_contract,
+)
+from src.application.bot.host_store import BotHostStore
+from src.application.bot.service import prepare_contract
+from src.interfaces.cli import bot_ops
+from src.interfaces.cli.bot_ops import add_bot_commands, handle_bot_command
+from src.infrastructure.pi_agent_process import derive_pi_session_id
+
+
+def _bot_run_namespace(**overrides) -> Namespace:
+    """CLI Namespace for ``bot run``; defaults are the repeated flag set."""
+    base = {
+        "bot_command": "run",
+        "text": "检查运行状态",
+        "config_key": None,
+        "config_path": None,
+        "symbol": None,
+        "month": None,
+        "include_events": False,
+        "host_db": None,
+        "session_key": None,
+        "model_config_json": None,
+        "bot_config": None,
+    }
+    base.update(overrides)
+    return Namespace(**base)
+
+
+def _run_channel(**overrides):
+    """Call the channel facade with this module's repeated request envelope."""
+    base = {
+        "user_message": "检查运行状态",
+        "config_key": None,
+        "channel": "feishu",
+        "sender_id": "ou_1",
+        "conversation_id": "group_1",
+    }
+    base.update(overrides)
+    return channel_facade.run_channel_request(**base)
+
+
+def _store(tmp_path, run_id: str) -> BotHostStore:
+    """Fresh host store already holding one started run for ``run_id``."""
+    store = BotHostStore(tmp_path / "bot.sqlite3")
+    store.start_run(run_id, contract=_contract("运行状态"), session_key="wechat:chat")
+    return store
+
+
+def test_successful_channel_answer_uses_opaque_pi_session_without_legacy_write(
+    monkeypatch, tmp_path, example_config_path
+) -> None:
+    database = tmp_path / "bot.sqlite3"
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(channel_facade, "_channel_model_gate", lambda _path: None)
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(example_config_path.parent))
+
+    def fake_run(_prepared, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return AppResult(status="answered", user_response="结论：运行正常。")
+
+    monkeypatch.setattr(
+        channel_facade,
+        "run_prepared_contract",
+        fake_run,
+    )
+
+    result = _run_channel(config_key="us", conversation_id="chat_1", host_db_path=str(database))
+
+    assert result.status == "answered"
+    assert captured["session_key"] == derive_pi_session_id(
+        "feishu", "ou_1", "chat_1", "key:us"
+    )
+    assert BotHostStore(database).session_turns("feishu:chat_1") == ()
+
+
+def test_channel_path_scope_is_canonical_and_sender_scoped(tmp_path, example_config_path) -> None:
+    first = example_config_path
+    second = tmp_path / "other" / "config.us.json"
+    alias = tmp_path / "config-alias.json"
+    second.parent.mkdir()
+    second.write_bytes(first.read_bytes())
+    alias.symlink_to(first)
+
+    _, canonical, scope = channel_facade.resolve_trusted_config_scope(
+        config_key=None, config_path=str(alias)
+    )
+    _, _, same_scope = channel_facade.resolve_trusted_config_scope(
+        config_key=None, config_path=str(first)
+    )
+    _, _, other_scope = channel_facade.resolve_trusted_config_scope(
+        config_key=None, config_path=str(second)
+    )
+
+    assert canonical == str(first.resolve())
+    assert scope == same_scope
+    assert scope != other_scope
+    first_session = channel_facade._channel_session_key(
+        channel="feishu",
+        sender_id="ou_1",
+        conversation_id="group_1",
+        authority_scope=scope,
+    )
+    assert first_session != channel_facade._channel_session_key(
+        channel="feishu",
+        sender_id="ou_2",
+        conversation_id="group_1",
+        authority_scope=scope,
+    )
+    assert first_session != channel_facade._channel_session_key(
+        channel="feishu",
+        sender_id="ou_1",
+        conversation_id="group_1",
+        authority_scope=other_scope,
+    )
+    assert channel_facade._channel_session_key(
+        channel="feishu",
+        sender_id="ou_1",
+        conversation_id=None,
+        authority_scope=scope,
+    ) == derive_pi_session_id("feishu", "ou_1", "sender:ou_1", scope)
+
+
+def test_channel_key_and_path_resolve_to_the_same_internal_config(
+    monkeypatch, example_config_path
+) -> None:
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(example_config_path.parent))
+
+    key_scope = channel_facade.resolve_trusted_config_scope(
+        config_key="us", config_path=None
+    )
+    path_scope = channel_facade.resolve_trusted_config_scope(
+        config_key=None, config_path=str(example_config_path)
+    )
+
+    assert key_scope[:2] == path_scope[:2] == ("us", str(example_config_path))
+    assert key_scope[2] == "key:us"
+    assert path_scope[2].startswith("path:")
+    assert key_scope[2] != path_scope[2]
+
+
+def test_bot_run_cli_allows_no_config_or_one_explicit_reference() -> None:
+    parser = ArgumentParser()
+    add_bot_commands(parser.add_subparsers(dest="command", required=True))
+
+    parsed = parser.parse_args(
+        ["bot", "run", "--text", "检查运行状态", "--config-key", "us"]
+    )
+    assert parsed.config_key == "us" and parsed.config_path is None
+    no_scope = parser.parse_args(["bot", "run", "--text", "介绍一下自己"])
+    assert no_scope.config_key is None and no_scope.config_path is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(["bot", "resume", "--host-db", "host.db", "--run-id", "old"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "bot",
+                "run",
+                "--text",
+                "检查运行状态",
+                "--config-key",
+                "us",
+                "--config-path",
+                "config.us.json",
+            ]
+        )
+
+
+def test_bot_run_cli_passes_normalized_market_and_path(
+    monkeypatch, example_config_path
+) -> None:
+    captured = {}
+
+    def fake_run(request, **_kwargs):
+        captured["request"] = request
+        return AppResult(status="answered", user_response="结论：运行正常。")
+
+    monkeypatch.setattr(bot_ops, "_run_local_request", fake_run)
+    payload = handle_bot_command(_bot_run_namespace(config_path=str(example_config_path)))
+
+    request = captured["request"]
+    assert payload["status"] == "answered"
+    assert request.explicit_scope.config_key == "us"
+    assert request.explicit_scope.config_path == str(example_config_path)
+    assert request.trusted_tool_scope["authority_scope"].startswith("path:")
+
+
+def test_bot_run_cli_preserves_conceptual_request_without_config(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(request, **_kwargs):
+        captured["request"] = request
+        return AppResult(status="answered", user_response="结论：我是 Bot。")
+
+    monkeypatch.setattr(bot_ops, "_run_local_request", fake_run)
+    payload = handle_bot_command(_bot_run_namespace(text="介绍一下自己"))
+
+    request = captured["request"]
+    assert payload["status"] == "answered"
+    assert request.explicit_scope.config_key is None
+    assert request.explicit_scope.config_path is None
+    assert request.trusted_tool_scope == {}
+
+
+def test_bot_run_cli_config_failure_is_safe_and_precedes_model(
+    monkeypatch, tmp_path
+) -> None:
+    called = False
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("model path must not run")
+
+    monkeypatch.setattr(bot_ops, "_run_local_request", unexpected_run)
+    missing = tmp_path / "private-runtime-config.json"
+    payload = handle_bot_command(_bot_run_namespace(config_path=str(missing)))
+
+    assert payload["status"] == "not_ready"
+    assert payload["error"] == {"code": "CONFIG_ERROR", "reason": "config_missing"}
+    assert str(missing) not in payload["user_response"]
+    assert called is False
+
+
+def test_invalid_channel_identity_or_scope_fails_before_model_gate(
+    monkeypatch, tmp_path, example_config_path
+) -> None:
+    invoked = False
+    directory = tmp_path / "config-directory"
+    directory.mkdir()
+
+    def unexpected_gate(_path):
+        nonlocal invoked
+        invoked = True
+        return None
+
+    monkeypatch.setattr(channel_facade, "_channel_model_gate", unexpected_gate)
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(example_config_path.parent))
+    cases = (
+        ({"config_key": "us", "sender_id": ""}, "channel_identity_or_scope_invalid"),
+        ({"config_key": "us", "config_path": str(example_config_path)}, "channel_identity_or_scope_invalid"),
+        ({"config_key": None, "config_path": None}, "channel_identity_or_scope_invalid"),
+        ({"config_key": None, "config_path": str(tmp_path / "missing.json")}, "config_missing"),
+        ({"config_key": None, "config_path": str(directory)}, "channel_identity_or_scope_invalid"),
+    )
+
+    for case, reason in cases:
+        result = _run_channel(**case)
+        assert result.error == {
+            "code": "CHANNEL_NOT_READY",
+            "reason": reason,
+        }
+    assert invoked is False
+
+
+def test_channel_config_readiness_failures_are_safe_and_precede_model_gate(
+    monkeypatch, tmp_path, example_config_path
+) -> None:
+    unread = tmp_path / "config.unreadable.json"
+    unread.write_text("{", encoding="utf-8")
+    identity = tmp_path / "identity" / "config.us.json"
+    identity.parent.mkdir()
+    identity_payload = json.loads(example_config_path.read_text(encoding="utf-8"))
+    identity_payload["_generated"]["market"] = "hk"
+    identity.write_text(json.dumps(identity_payload), encoding="utf-8")
+    stale = tmp_path / "stale" / "config.us.json"
+    stale.parent.mkdir()
+    stale_payload = json.loads(example_config_path.read_text(encoding="utf-8"))
+    loaded_source = next(
+        item for item in stale_payload["_generated"]["sources"] if item.get("loaded")
+    )
+    loaded_source["sha256"] = "0" * 64
+    stale.write_text(json.dumps(stale_payload), encoding="utf-8")
+    gate_called = False
+
+    def unexpected_gate(_path):
+        nonlocal gate_called
+        gate_called = True
+        return None
+
+    monkeypatch.setattr(channel_facade, "_channel_model_gate", unexpected_gate)
+    cases = (
+        (tmp_path / "missing" / "config.us.json", "config_missing"),
+        (unread, "config_unreadable"),
+        (identity, "config_identity_mismatch"),
+        (stale, "config_stale"),
+    )
+
+    for config_path, reason in cases:
+        result = _run_channel(config_path=str(config_path))
+        assert result.status == "not_ready"
+        assert result.error == {"code": "CHANNEL_NOT_READY", "reason": reason}
+        assert str(config_path) not in result.user_response
+        assert str(config_path) not in json.dumps(result.error, ensure_ascii=False)
+
+    assert gate_called is False
+
+
+def test_valid_channel_config_still_requires_the_model_gate(example_config_path) -> None:
+    result = _run_channel(config_path=str(example_config_path))
+
+    assert result.status == "not_ready"
+    assert result.error == {
+        "code": "CHANNEL_NOT_READY",
+        "reason": "channel_model_config_missing",
+    }
+
+
+def test_channel_config_path_stays_out_of_model_visible_context(
+    monkeypatch, tmp_path, example_config_path
+) -> None:
+    config_path = example_config_path
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(channel_facade, "_channel_model_gate", lambda _path: None)
+
+    def fake_run(prepared, **kwargs):  # type: ignore[no-untyped-def]
+        captured["prepared"] = prepared
+        captured.update(kwargs)
+        return AppResult(status="answered", user_response="结论：运行正常。")
+
+    monkeypatch.setattr(channel_facade, "run_prepared_contract", fake_run)
+    result = _run_channel(config_path=str(config_path), host_db_path=str(tmp_path / "audit.sqlite3"))
+
+    prepared = captured["prepared"]
+    canonical = str(config_path.resolve())
+    assert result.status == "answered"
+    assert prepared.input["config_path"] == canonical
+    assert prepared.input["config_key"] == "us"
+    assert canonical not in json.dumps(prepared.input["messages"], ensure_ascii=False)
+    assert canonical not in str(captured["session_key"])
+
+
+def test_host_store_migrates_existing_session_schema(tmp_path) -> None:
+    path = tmp_path / "bot.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE bot_sessions (session_key TEXT PRIMARY KEY, messages_json TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO bot_sessions VALUES ('legacy', '[{\"role\":\"user\",\"content\":\"hello\"}]', 'now')"
+        )
+
+    store = BotHostStore(path)
+
+    assert store.session_turns("legacy") == ()
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(bot_sessions)")}
+        messages_json = conn.execute(
+            "SELECT messages_json FROM bot_sessions WHERE session_key = 'legacy'"
+        ).fetchone()
+    assert {"messages_json", "turns_json", "memory_json"}.issubset(columns)
+    assert messages_json == ('[{"role":"user","content":"hello"}]',)
+
+
+def test_cancel_request_only_updates_active_run(tmp_path) -> None:
+    store = _store(tmp_path, "run_active")
+
+    assert store.request_cancel("run_active") is True
+    assert store.is_cancel_requested("run_active") is True
+    assert store.request_cancel("missing") is False
+
+
+def test_cancel_command_reports_closed_admission_boundary(tmp_path) -> None:
+    payload = handle_bot_command(
+        Namespace(
+            bot_command="cancel",
+            host_db=str(tmp_path / "bot.sqlite3"),
+            run_id="missing",
+        )
+    )
+
+    assert payload["status"] == "not_ready"
+    assert payload["user_response"] == "该运行不存在、已作出准入决定或已进入终态。"
+
+
+def test_cancel_and_commit_compare_and_set_have_exactly_one_winner(tmp_path) -> None:
+    path = tmp_path / "bot.sqlite3"
+    starter = BotHostStore(path)
+    cancel_store = BotHostStore(path)
+    decision_store = BotHostStore(path)
+
+    for index in range(12):
+        run_id = f"run_race_{index}"
+        starter.start_run(run_id, contract=_contract("运行状态"), session_key="wechat:chat")
+        barrier = threading.Barrier(3)
+        outcome: dict[str, object] = {}
+
+        def cancel() -> None:
+            barrier.wait()
+            outcome["cancel"] = cancel_store.request_cancel(run_id)
+
+        def commit() -> None:
+            barrier.wait()
+            outcome["decision"] = decision_store.claim_admission_decision(run_id, "commit")
+
+        workers = [threading.Thread(target=cancel), threading.Thread(target=commit)]
+        for worker in workers:
+            worker.start()
+        barrier.wait()
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+        state = str(starter.run_record(run_id)["admission_state"])
+        assert state in {"cancel", "commit"}
+        if state == "cancel":
+            assert outcome == {"cancel": True, "decision": "cancel"}
+        else:
+            assert outcome == {"cancel": False, "decision": "commit"}
+
+
+def test_stale_run_becomes_terminal_without_resumable_progress(tmp_path) -> None:
+    store = _store(tmp_path, "run_stale")
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE bot_runs SET started_at = '2000-01-01T00:00:00+00:00' "
+            "WHERE run_id = 'run_stale'"
+        )
+
+    assert store.mark_stale_runs_interrupted(older_than_seconds=1) == 1
+    record = store.run_record("run_stale")
+    assert (record["status"], record["admission_state"]) == ("interrupted", "discard")
+    assert json.loads(record["progress_json"]) == {}
+
+
+def test_reply_outbox_is_idempotent_retryable_and_deliverable(tmp_path) -> None:
+    store = BotHostStore(tmp_path / "bot.sqlite3")
+    first = store.enqueue_reply(
+        delivery_key="wechat:command-1",
+        channel="wechat",
+        session_key="wechat:chat",
+        run_id="run_1",
+        payload={"text": "结论", "context_token": "reusable-private-capability"},
+    )
+    second = store.enqueue_reply(
+        delivery_key="wechat:command-1",
+        channel="wechat",
+        payload={"text": "不应覆盖"},
+    )
+    assert first["payload_json"] == second["payload_json"]
+
+    claimed = store.claim_reply(delivery_key="wechat:command-1")
+    assert claimed["status"] == "delivering"
+    assert claimed["attempt_count"] == 1
+    assert store.mark_reply_failed(
+        "wechat:command-1",
+        error="temporary",
+        retryable=True,
+        retry_after_seconds=1,
+    )
+    assert store.claim_reply(delivery_key="wechat:command-1", before="9999-01-01T00:00:00+00:00")
+    assert store.mark_reply_delivered("wechat:command-1")
+    assert store.claim_reply(delivery_key="wechat:command-1", before="9999-01-01T00:00:00+00:00") is None
+    delivered = store.list_replies()[0]
+    assert delivered["status"] == "delivered"
+    assert delivered["payload_json"] == "{}"
+    assert "reusable-private-capability" not in str(delivered)
+
+
+def test_reply_outbox_scrubs_capability_after_terminal_failure(tmp_path) -> None:
+    store = BotHostStore(tmp_path / "bot.sqlite3")
+    store.enqueue_reply(
+        delivery_key="wechat:terminal",
+        channel="wechat",
+        payload={"text": "结论", "context_token": "terminal-private-capability"},
+    )
+    assert store.claim_reply(delivery_key="wechat:terminal") is not None
+    assert store.mark_reply_failed("wechat:terminal", error="provider reflected a secret", retryable=False)
+
+    terminal = store.list_replies()[0]
+    assert terminal["status"] == "terminal_failed"
+    assert terminal["payload_json"] == "{}"
+    assert terminal["last_error"] == "terminal_delivery_error"
+    assert "terminal-private-capability" not in str(terminal)
+    assert "provider reflected a secret" not in str(terminal)
+
+
+def test_reply_outbox_recovers_expired_delivery_claim(tmp_path) -> None:
+    store = BotHostStore(tmp_path / "bot.sqlite3")
+    store.enqueue_reply(
+        delivery_key="wechat:command-crashed",
+        channel="wechat",
+        payload={"text": "结论"},
+    )
+    assert store.claim_reply(delivery_key="wechat:command-crashed") is not None
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE bot_reply_outbox SET updated_at = '2000-01-01T00:00:00+00:00' WHERE delivery_key = ?",
+            ("wechat:command-crashed",),
+        )
+
+    recovered = store.claim_reply(delivery_key="wechat:command-crashed")
+
+    assert recovered is not None
+    assert recovered["status"] == "delivering"
+    assert recovered["attempt_count"] == 2
+
+
+def test_lane_limit_and_expired_lease_recovery(tmp_path) -> None:
+    store = BotHostStore(tmp_path / "bot.sqlite3")
+    assert store.acquire_lane("chat_read", "lease_1", limit=1, ttl_seconds=60)
+    assert not store.acquire_lane("chat_read", "lease_2", limit=1, ttl_seconds=60)
+    store.release_lane("chat_read", "lease_1")
+    assert store.acquire_lane("chat_read", "lease_2", limit=1, ttl_seconds=60)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE bot_lane_leases SET expires_at = '2000-01-01T00:00:00+00:00' WHERE lease_id = 'lease_2'"
+        )
+    assert store.acquire_lane("chat_read", "lease_3", limit=1, ttl_seconds=60)
+
+
+def test_channel_capacity_exhaustion_does_not_invoke_model_runtime(
+    monkeypatch, tmp_path, example_config_path
+) -> None:
+    database = tmp_path / "bot.sqlite3"
+    store = BotHostStore(database)
+    assert store.acquire_lane("chat_read", "occupied_1", limit=2, ttl_seconds=60)
+    assert store.acquire_lane("chat_read", "occupied_2", limit=2, ttl_seconds=60)
+    invoked = False
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("model runtime must not run when the lane is full")
+
+    monkeypatch.setattr(channel_facade, "_channel_model_gate", lambda _path: None)
+    monkeypatch.setattr(channel_facade, "run_prepared_contract", unexpected_run)
+    monkeypatch.setenv("OM_RUNTIME_ROOT", str(example_config_path.parent))
+
+    result = _run_channel(
+        user_message="7月收益",
+        config_key="us",
+        channel="wechat",
+        sender_id="user_1",
+        conversation_id="chat_1",
+        host_db_path=str(database),
+    )
+
+    assert result.status == "not_ready"
+    assert result.error == {"code": "CHANNEL_NOT_READY", "reason": "channel_capacity_exhausted"}
+    assert invoked is False
+
+
+def _contract(text: str):
+    prepared = prepare_contract(
+        BotRequest(
+            request_id=new_id("req"),
+            source_entry="test",
+            user_message=text,
+            explicit_scope=BotScope(config_key="us"),
+            execution_environment="local",
+        ),
+        reference_year=2026,
+    )
+    assert not isinstance(prepared, AppResult)
+    return prepared
+
+
+def test_cancel_survives_short_schema_writer_contention(tmp_path, monkeypatch) -> None:
+    store = _store(tmp_path, "contended")
+    reached_write = threading.Event()
+    connect = store._connect
+
+    def traced_connect(**kwargs):
+        conn = connect(**kwargs)
+        conn.set_trace_callback(lambda sql: reached_write.set() if "UPDATE bot_reply_outbox" in sql else None)
+        return conn
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+    outcome = {}
+
+    def cancel():
+        try:
+            outcome["cancel"] = store.request_cancel("contended")
+        except Exception as exc:
+            outcome["error"] = exc
+
+    with sqlite3.connect(store.path) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        worker = threading.Thread(target=cancel)
+        worker.start()
+        try:
+            assert reached_write.wait(2)
+            time.sleep(0.15)
+        finally:
+            blocker.rollback()
+            worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert outcome == {"cancel": True}
+    assert store.claim_admission_decision("contended", "commit") == "cancel"
+    assert store.run_record("contended")["cancel_requested"] == 1
+
+
+def test_schema_writer_wait_respects_admission_deadline(tmp_path) -> None:
+    store = _store(tmp_path, "existing")
+    with sqlite3.connect(store.path) as blocker:
+        blocker.execute("BEGIN IMMEDIATE")
+        for acquire in (
+            lambda deadline: store.acquire_lane("foreground", "late", limit=1, ttl_seconds=180, deadline_monotonic=deadline),
+            lambda deadline: store.acquire_session_run("wechat:late", "late", ttl_seconds=180, deadline_monotonic=deadline),
+        ):
+            started = time.monotonic()
+            try:
+                acquire(started + 0.1)
+            except sqlite3.OperationalError as exc:
+                assert "locked" in str(exc)
+            else:
+                raise AssertionError("A held writer must not admit another lease")
+            assert time.monotonic() - started < 0.5
+        assert blocker.execute("SELECT COUNT(*) FROM bot_lane_leases").fetchone()[0] == 0
+        assert blocker.execute("SELECT COUNT(*) FROM bot_session_runs WHERE run_id='late'").fetchone()[0] == 0

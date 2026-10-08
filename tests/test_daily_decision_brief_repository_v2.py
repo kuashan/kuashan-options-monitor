@@ -1,0 +1,1646 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from decision_history_fixtures import replace_history_payload, delete_history_revision
+
+import pytest
+
+
+MARKET_DATE = "2026-07-21"
+TARGET_1000 = "2026-07-21T10:00:00-04:00"
+IDENTITY_NVDA = "candidate:v1:lx:US:NVDA:sell_put"
+IDENTITY_AMD = "candidate:v1:lx:US:AMD:sell_put"
+WHEEL_BRANCH_ID = "assigned-stock-3fab073239d0df8e3addc843a5d6538a2a33297d2cf4405a21d3e5fbcdae16ed"
+IDENTITY_WHEEL = f"candidate:v1:lx:US:NVDA:wheel:{WHEEL_BRANCH_ID}"
+# The exact identity the HK tick rejected on 2026-09-18 after the domain builder
+# grew the `wheel` family: an Assigned Stock lot rebinding to a Wheel window.
+IDENTITY_WHEEL_HK = f"candidate:v1:lx:HK:0700.HK:wheel:{WHEEL_BRANCH_ID}"
+LEGACY_COMBO_DIGEST = "ed465e99ea01d9997906cb18d118e7f0d18750bda01ee6ba42d8927ec38a4463"
+
+
+def _action(*, symbol: str = "NVDA", priority: str = "P1", contracts: int = 1) -> dict:
+    return {
+        "priority": priority,
+        "state": "active",
+        "action_type": "open_candidate",
+        "strategy_family": "sell_put",
+        "account": "lx",
+        "symbol": symbol,
+        "option_type": "put",
+        "side": "short",
+        "expiration": "2026-08-21",
+        "strike": 100,
+        "contract_symbol": f"{symbol}260821P00100000",
+        "metrics": {
+            "mid": 1.0,
+            "capacity": {"contracts_available": contracts},
+        },
+    }
+
+
+def _wheel_action(*, symbol: str = "NVDA", contracts: int = 1) -> dict:
+    action = _action(symbol=symbol, contracts=contracts)
+    action["strategy_family"] = "wheel"
+    action["wheel_branch_id"] = WHEEL_BRANCH_ID
+    return action
+
+
+def _brief(
+    *,
+    run_id: str,
+    actions: list[dict] | None = None,
+    status: str = "ready",
+    actionability: str = "live_actionable",
+    account: str = "lx",
+    market: str = "US",
+    market_date: str = MARKET_DATE,
+) -> dict:
+    return {
+        "schema_version": "daily_decision_brief.v1",
+        "market": market,
+        "market_trading_date": market_date,
+        "account": account,
+        "revision": 999,
+        "run_id": run_id,
+        "generated_at_utc": "2026-07-21T14:00:00+00:00",
+        "data_as_of_utc": "2026-07-21T13:59:00+00:00",
+        "valid_until_utc": "2026-07-21T20:00:00+00:00",
+        "status": status,
+        "actionability": actionability,
+        "strategy_summary": "test",
+        "actions": list(actions or []),
+        "positions": [],
+        "capacity": {
+            "sell_put": {"contracts_available": 2},
+            "covered_call": {"contracts_available": 0},
+        },
+        "candidates": {"sell_put": [], "covered_call": [], "combo_yield": []},
+        "rejections": {},
+        "events": [],
+        "data_gaps": [],
+        "source_artifacts": [],
+    }
+
+
+def _persist(tmp_path: Path, *, run_id: str = "run-1", actions: list[dict] | None = None) -> dict:
+    from src.application.daily_decision_brief_repository import persist_daily_decision_brief_success
+
+    return persist_daily_decision_brief_success(
+        base=tmp_path,
+        brief=_brief(run_id=run_id, actions=actions),
+    )
+
+
+def _record_candidates(tmp_path: Path, **overrides: object) -> dict:
+    """Record delivery candidates for the ``lx``/``US`` market date this module uses.
+
+    Call sites spell out only the kwargs that differ from that envelope.
+    """
+    from src.application.daily_decision_brief_repository import (
+        record_daily_decision_brief_candidates,
+    )
+
+    base: dict[str, object] = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+    }
+    base.update(overrides)
+    return record_daily_decision_brief_candidates(**base)
+
+
+def _read_state(tmp_path: Path, **overrides: object) -> dict:
+    """Read the ``lx``/``US`` daily brief delivery state."""
+    from src.application.daily_decision_brief_repository import (
+        read_daily_decision_brief_delivery_state,
+    )
+
+    base: dict[str, object] = {"base": tmp_path, "account": "lx", "market": "US"}
+    base.update(overrides)
+    return read_daily_decision_brief_delivery_state(**base)
+
+
+def _retry(tmp_path: Path, **overrides: object) -> dict:
+    """Read the retryable fixed delivery for the market date this module uses."""
+    from src.application.daily_decision_brief_repository import (
+        read_retryable_daily_decision_brief_delivery,
+    )
+
+    base: dict[str, object] = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+    }
+    base.update(overrides)
+    return read_retryable_daily_decision_brief_delivery(**base)
+
+
+def _prepare(tmp_path: Path, **overrides: object) -> dict:
+    """Prepare a daily brief delivery for the ``lx``/``US`` market date this module uses."""
+    from src.application.daily_decision_brief_repository import (
+        prepare_daily_decision_brief_delivery,
+    )
+
+    base: dict[str, object] = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+    }
+    base.update(overrides)
+    return prepare_daily_decision_brief_delivery(**base)
+
+
+def _prepare_fixed(tmp_path: Path, persisted: dict, *, message: str = "# lx · 美股期权监控") -> dict:
+    return _prepare(
+        tmp_path,
+        run_id=persisted["brief"]["run_id"],
+        delivery_kind="fixed_report",
+        source_kind="successful_brief",
+        revision=persisted["current_revision"],
+        source_digest=persisted["current_brief_digest"],
+        scheduled_target_market=TARGET_1000,
+        candidate_identities=persisted["current_candidate_identities"],
+        rendered_message=message,
+        render_context={"projection": "fixed_report"},
+        prepared_at_utc="2026-07-21T14:00:02+00:00",
+    )
+
+
+def _legacy_combo_brief(*, run_id: str = "run-1") -> dict:
+    from datetime import datetime, timezone
+
+    from domain.domain.combo_candidate_evidence import build_combo_candidate_occurrence
+
+    row = {
+        "symbol": "NVDA",
+        "candidate_pair_id": "pair-nvda-100-110",
+        "structure_mode": "same_expiry_pair",
+        "put_expiration": "2026-08-21",
+        "put_strike": 100,
+        "put_contract_symbol": "NVDA260821P00100000",
+        "call_expiration": "2026-08-21",
+        "call_strike": 110,
+        "call_contract_symbol": "NVDA260821C00110000",
+        "currency": "USD",
+        "multiplier": 100,
+    }
+    row.update(
+        build_combo_candidate_occurrence(
+            row,
+            account="lx",
+            market="US",
+            run_id=run_id,
+            generated_at_utc=datetime(2026, 7, 21, 14, 0, tzinfo=timezone.utc),
+        )
+    )
+    action = {
+        "action_id": "action-6f70388725ffbc618358812c",
+        "priority": "P1",
+        "state": "active",
+        "action_type": "open_combo_yield",
+        "strategy_family": "combo_yield",
+        "account": "lx",
+        "symbol": "NVDA",
+        "option_type": "",
+        "side": "",
+        "expiration": "2026-08-21",
+        "strike": 100,
+        "contract_symbol": "NVDA260821P00100000",
+        "strategy_group_id": "pair-nvda-100-110",
+        "leg_role": "pair",
+        "metrics": {
+            "put_contract_symbol": "NVDA260821P00100000",
+            "call_contract_symbol": "NVDA260821C00110000",
+            "capacity": {"contracts_available": 1},
+        },
+    }
+    source = _brief(run_id=run_id, actions=[action])
+    source["revision"] = 0
+    source["candidates"]["combo_yield"] = [row]
+    source["candidate_index"] = [
+        {
+            "identity": "candidate:v1:lx:US:NVDA:combo_yield",
+            "symbol": "NVDA",
+            "strategy_family": "combo_yield",
+            "representative": {
+                **row,
+                "strategy_group_id": "pair-nvda-100-110",
+                "capacity": {"contracts_available": 1},
+            },
+            "contract_count": 1,
+        }
+    ]
+    return source
+
+
+def _install_legacy_combo_revision(tmp_path: Path) -> tuple[dict, str, dict]:
+    from domain.domain.daily_decision_brief import (
+        daily_brief_digest,
+        normalize_persisted_daily_decision_brief,
+    )
+
+    seeded = _persist(tmp_path, run_id="run-1", actions=[_action()])
+    legacy = normalize_persisted_daily_decision_brief(_legacy_combo_brief())
+    digest = daily_brief_digest(legacy)
+    assert digest == LEGACY_COMBO_DIGEST
+    for key in ("revision", "current", "run_brief"):
+        seeded["paths"][key].write_text(
+            json.dumps(legacy, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    shared = json.loads(seeded["paths"]["shared_index"].read_text(encoding="utf-8"))
+    shared["items"]["US/lx"]["brief_digest"] = digest
+    seeded["paths"]["shared_index"].write_text(
+        json.dumps(shared, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    replace_history_payload(tmp_path, legacy)
+    return legacy, digest, seeded
+
+
+def test_success_persistence_advances_only_reliable_current_and_returns_identity_delta(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import (
+        persist_daily_decision_brief_success,
+        read_latest_daily_decision_brief,
+    )
+
+    first = _persist(tmp_path, run_id="run-1", actions=[_action()])
+    second = _persist(tmp_path, run_id="run-2", actions=[_action(), _action(symbol="AMD")])
+
+    assert first["current_revision"] == 0
+    assert first["newly_detected_candidate_identities"] == [IDENTITY_NVDA]
+    assert second["previous_candidate_identities"] == [IDENTITY_NVDA]
+    assert second["newly_detected_candidate_identities"] == [IDENTITY_AMD]
+    current_before = second["paths"]["current"].read_bytes()
+
+    with pytest.raises(ValueError, match="only ready or degraded"):
+        persist_daily_decision_brief_success(
+            base=tmp_path,
+            brief=_brief(run_id="run-blocked", status="blocked", actionability="blocked"),
+        )
+
+    assert second["paths"]["current"].read_bytes() == current_before
+    assert read_latest_daily_decision_brief(base=tmp_path, account="lx", market="US")["brief"]["revision"] == 1
+
+
+def test_v2_delivery_reads_existing_legacy_delivery_candidate(tmp_path: Path) -> None:
+    persisted = _persist(tmp_path, actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=[IDENTITY_NVDA],
+        observed_at_utc="2026-07-21T14:00:01+00:00",
+    )
+    state_path = tmp_path / "output_accounts/lx/state/daily_decision_brief.US.delivery.json"
+    raw = json.loads(state_path.read_text(encoding="utf-8"))
+    day = raw["days"][MARKET_DATE]
+    day["pending_candidates"] = {}
+    day["alerted_candidates"] = {
+        IDENTITY_NVDA: {
+            "revision": persisted["current_revision"],
+            "brief_digest": persisted["current_brief_digest"],
+            "delivery_key": "legacy:daily-report:lx:US:2026-07-21",
+            "confirmed_at_utc": "2026-07-21T14:00:02+00:00",
+            "via": "legacy_delivery",
+        }
+    }
+    state_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    state = _read_state(tmp_path)["state"]
+
+    assert state["days"][MARKET_DATE]["alerted_candidates"][IDENTITY_NVDA]["via"] == "legacy_delivery"
+
+
+def test_success_persistence_uses_empty_candidate_baseline_on_new_market_date(tmp_path: Path) -> None:
+    first = _persist(tmp_path, run_id="day-1", actions=[_action()])
+    from src.application.daily_decision_brief_repository import persist_daily_decision_brief_success
+
+    second = persist_daily_decision_brief_success(
+        base=tmp_path,
+        brief=_brief(
+            run_id="day-2",
+            market_date="2026-07-22",
+            actions=[_action()],
+        ),
+    )
+
+    assert first["newly_detected_candidate_identities"] == [IDENTITY_NVDA]
+    assert second["previous_successful_brief"]["market_trading_date"] == MARKET_DATE
+    assert second["previous_candidate_identities"] == []
+    assert second["newly_detected_candidate_identities"] == [IDENTITY_NVDA]
+
+
+def test_v2_candidate_state_fixed_envelope_and_retry_read_round_trip(tmp_path: Path) -> None:
+    persisted = _persist(tmp_path, actions=[_action(), _action(symbol="AMD")])
+    recorded = _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=persisted["current_candidate_identities"],
+        observed_at_utc="2026-07-21T14:00:01+00:00",
+    )
+    assert recorded["pending_candidate_identities"] == [IDENTITY_AMD, IDENTITY_NVDA]
+
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    assert envelope["delivery_key"] == f"option-report:US:{MARKET_DATE}:lx:{TARGET_1000}"
+    assert envelope["message_sha256"] == hashlib.sha256(envelope["rendered_message"].encode()).hexdigest()
+    assert prepared["paths"]["run_plan"].name == "daily_decision_brief_delivery_plan.US.json"
+    assert prepared["paths"]["run_plan"].parent == (
+        tmp_path / "output_runs" / "run-1" / "accounts" / "lx" / "state"
+    )
+
+    before = prepared["paths"]["delivery"].read_bytes()
+    read = _read_state(tmp_path)
+    retry = _retry(tmp_path)
+    assert read["available"] is True
+    assert retry["reason"] == "pending_fixed"
+    assert retry["envelope"] == envelope
+    assert prepared["paths"]["delivery"].read_bytes() == before
+
+
+def test_candidate_delivery_key_is_stable_and_pending_content_can_rotate(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import (
+        DailyDecisionBriefStateError,
+        prepare_daily_decision_brief_delivery,
+    )
+
+    persisted = _persist(tmp_path, actions=[_action(), _action(symbol="AMD")])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=persisted["current_candidate_identities"],
+    )
+    common = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+        "run_id": "run-1",
+        "delivery_kind": "candidate_alert",
+        "source_kind": "successful_brief",
+        "revision": persisted["current_revision"],
+        "source_digest": persisted["current_brief_digest"],
+        "render_context": {"projection": "candidate_alert"},
+        "prepared_at_utc": "2026-07-21T14:30:02+00:00",
+    }
+    first = prepare_daily_decision_brief_delivery(
+        **common,
+        candidate_identities=[IDENTITY_NVDA],
+        rendered_message="# 新增候选\nNVDA",
+    )
+    same = prepare_daily_decision_brief_delivery(
+        **common,
+        candidate_identities=[IDENTITY_NVDA],
+        rendered_message="# 新增候选\nNVDA",
+    )
+    with pytest.raises(DailyDecisionBriefStateError, match="cannot change content"):
+        prepare_daily_decision_brief_delivery(
+            **common,
+            candidate_identities=[IDENTITY_NVDA],
+            rendered_message="# 新增候选\nNVDA changed",
+        )
+    rotated = prepare_daily_decision_brief_delivery(
+        **{**common, "prepared_at_utc": "2026-07-21T14:30:12+00:00"},
+        candidate_identities=[IDENTITY_AMD, IDENTITY_NVDA],
+        rendered_message="# 新增候选\nAMD / NVDA",
+    )
+
+    assert first["prepared"] is True
+    assert same["prepared"] is False
+    assert rotated["prepared"] is True
+    assert first["envelope"]["delivery_key"] != rotated["envelope"]["delivery_key"]
+    assert rotated["envelope"]["candidate_identities"] == [IDENTITY_AMD, IDENTITY_NVDA]
+    assert rotated["envelope"]["first_prepared_at_utc"] == "2026-07-21T14:30:12+00:00"
+    assert rotated["envelope"]["last_attempt_at_utc"] is None
+
+
+def test_candidate_retry_stops_after_later_success_removes_identity_from_pending(tmp_path: Path) -> None:
+    first = _persist(tmp_path, run_id="run-1", actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=first["current_revision"],
+        brief_digest=first["current_brief_digest"],
+        candidate_identities=[IDENTITY_NVDA],
+    )
+    _prepare(
+        tmp_path,
+        run_id="run-1",
+        delivery_kind="candidate_alert",
+        source_kind="successful_brief",
+        revision=first["current_revision"],
+        source_digest=first["current_brief_digest"],
+        candidate_identities=[IDENTITY_NVDA],
+        rendered_message="# 新增候选\nNVDA",
+        render_context={"projection": "candidate_alert"},
+    )
+
+    second = _persist(tmp_path, run_id="run-2", actions=[])
+    _record_candidates(
+        tmp_path,
+        revision=second["current_revision"],
+        brief_digest=second["current_brief_digest"],
+        candidate_identities=[],
+    )
+
+    retry = _retry(tmp_path)
+    assert retry["reason"] == "stale_candidate_envelope"
+    assert retry["envelope"] is None
+
+
+def test_fixed_failure_validates_source_once_then_retries_from_durable_envelope(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import DailyDecisionBriefStateError
+
+    artifact = tmp_path / "output_runs" / "run-fail" / "accounts" / "lx" / "state" / "pipeline_failure.US.json"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"reason":"pipeline_failed"}\n', encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    source_reference = artifact.relative_to(tmp_path).as_posix()
+
+    with pytest.raises(DailyDecisionBriefStateError, match="source digest mismatch"):
+        _prepare(
+            tmp_path,
+            run_id="run-fail",
+            delivery_kind="fixed_failure",
+            source_kind="scan_failure",
+            source_digest="0" * 64,
+            source_reference=source_reference,
+            scheduled_target_market=TARGET_1000,
+            rendered_message="# 本轮扫描失败",
+            render_context={"projection": "fixed_failure"},
+        )
+
+    prepared = _prepare(
+        tmp_path,
+        run_id="run-fail",
+        delivery_kind="fixed_failure",
+        source_kind="scan_failure",
+        source_digest=digest,
+        source_reference=source_reference,
+        scheduled_target_market=TARGET_1000,
+        rendered_message="# 本轮扫描失败",
+        render_context={"projection": "fixed_failure"},
+    )
+    artifact.unlink()
+
+    retry = _retry(tmp_path)
+    assert retry["envelope"] == prepared["envelope"]
+    assert retry["envelope"]["source_reference"] == source_reference
+
+
+def test_pending_fixed_failure_can_upgrade_but_confirmed_failure_cannot(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import confirm_daily_decision_brief_delivery_v2
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    artifact = (
+        tmp_path
+        / "output_runs"
+        / "run-fail"
+        / "accounts"
+        / "lx"
+        / "state"
+        / "pipeline_failure.US.json"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"reason":"pipeline_failed"}\n', encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    _prepare(
+        tmp_path,
+        run_id="run-fail",
+        delivery_kind="fixed_failure",
+        source_kind="scan_failure",
+        source_digest=digest,
+        source_reference=artifact.relative_to(tmp_path).as_posix(),
+        scheduled_target_market=TARGET_1000,
+        rendered_message="# 本轮扫描失败",
+        render_context={"projection": "fixed_failure"},
+    )
+
+    upgraded = _prepare_fixed(tmp_path, persisted)
+    assert upgraded["prepared"] is True
+    assert upgraded["envelope"]["delivery_kind"] == "fixed_report"
+    assert upgraded["envelope"]["status"] == "pending"
+
+    other_root = tmp_path / "confirmed"
+    confirmed_persisted = _persist(
+        other_root,
+        actions=[_action()],
+    )
+    confirmed_artifact = (
+        other_root
+        / "output_runs"
+        / "run-fail"
+        / "accounts"
+        / "lx"
+        / "state"
+        / "pipeline_failure.US.json"
+    )
+    confirmed_artifact.parent.mkdir(parents=True)
+    confirmed_artifact.write_text(
+        '{"reason":"pipeline_failed"}\n',
+        encoding="utf-8",
+    )
+    confirmed_digest = hashlib.sha256(
+        confirmed_artifact.read_bytes()
+    ).hexdigest()
+    confirmed_failure = _prepare(
+        other_root,
+        run_id="run-fail",
+        delivery_kind="fixed_failure",
+        source_kind="scan_failure",
+        source_digest=confirmed_digest,
+        source_reference=confirmed_artifact.relative_to(
+            other_root
+        ).as_posix(),
+        scheduled_target_market=TARGET_1000,
+        rendered_message="# 本轮扫描失败",
+        render_context={"projection": "fixed_failure"},
+    )["envelope"]
+    confirm_daily_decision_brief_delivery_v2(
+        base=other_root,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=confirmed_failure["delivery_key"],
+        source_digest=confirmed_failure["source_digest"],
+        message_sha256=confirmed_failure["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(
+            confirmed_failure["delivery_key"]
+        ),
+    )
+
+    retained = _prepare_fixed(other_root, confirmed_persisted)
+    assert retained["prepared"] is False
+    assert retained["envelope"]["delivery_kind"] == "fixed_failure"
+    assert retained["envelope"]["status"] == "confirmed"
+
+
+def test_ambiguous_fixed_failure_cannot_upgrade_to_normal_report(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import (
+        DailyDecisionBriefStateError,
+        record_daily_decision_brief_delivery_attempt,
+    )
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    artifact = (
+        tmp_path
+        / "output_runs"
+        / "run-fail"
+        / "accounts"
+        / "lx"
+        / "state"
+        / "pipeline_failure.US.json"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"reason":"pipeline_failed"}\n', encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    failure = _prepare(
+        tmp_path,
+        run_id="run-fail",
+        delivery_kind="fixed_failure",
+        source_kind="scan_failure",
+        source_digest=digest,
+        source_reference=artifact.relative_to(tmp_path).as_posix(),
+        scheduled_target_market=TARGET_1000,
+        rendered_message="# 本轮扫描失败",
+        render_context={"projection": "fixed_failure"},
+    )["envelope"]
+    record_daily_decision_brief_delivery_attempt(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=failure["delivery_key"],
+        source_digest=failure["source_digest"],
+        message_sha256=failure["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(
+            failure["delivery_key"]
+        ),
+        ambiguous=True,
+    )
+
+    with pytest.raises(DailyDecisionBriefStateError, match="frozen"):
+        _prepare_fixed(tmp_path, persisted)
+
+
+def test_delivery_identity_validator_returns_persisted_kind_and_status(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import validate_daily_decision_brief_delivery_identity
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    artifact = (
+        tmp_path
+        / "output_runs"
+        / "run-fail"
+        / "accounts"
+        / "lx"
+        / "state"
+        / "pipeline_failure.US.json"
+    )
+    artifact.parent.mkdir(parents=True)
+    artifact.write_text('{"reason":"pipeline_failed"}\n', encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    prepared = _prepare(
+        tmp_path,
+        run_id="run-fail",
+        delivery_kind="fixed_failure",
+        source_kind="scan_failure",
+        source_digest=digest,
+        source_reference=artifact.relative_to(tmp_path).as_posix(),
+        scheduled_target_market=TARGET_1000,
+        rendered_message="# 本轮扫描失败",
+        render_context={"projection": "fixed_failure"},
+    )
+    envelope = prepared["envelope"]
+
+    validated = validate_daily_decision_brief_delivery_identity(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(
+            envelope["delivery_key"]
+        ),
+    )
+
+    assert validated["delivery_kind"] == "fixed_failure"
+    assert validated["status"] == "pending"
+    assert validated["envelope"] == envelope
+
+
+def test_ambiguous_envelope_is_frozen_and_tampered_hash_fails_closed(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import DailyDecisionBriefStateError
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    delivery_path = prepared["paths"]["delivery"]
+    raw = json.loads(delivery_path.read_text(encoding="utf-8"))
+    raw["days"][MARKET_DATE]["fixed_reports"][TARGET_1000]["status"] = "ambiguous"
+    delivery_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(DailyDecisionBriefStateError, match="frozen"):
+        _prepare_fixed(tmp_path, persisted, message="# changed")
+
+    raw = json.loads(delivery_path.read_text(encoding="utf-8"))
+    raw["days"][MARKET_DATE]["fixed_reports"][TARGET_1000]["rendered_message"] = "tampered"
+    delivery_path.write_text(json.dumps(raw), encoding="utf-8")
+    read = _read_state(tmp_path)
+    assert read["available"] is False
+    assert read["reason"] == "state_invalid"
+    assert "message digest mismatch" in read["error"]
+
+
+def test_account_and_market_delivery_states_are_isolated(tmp_path: Path) -> None:
+    us_lx = _persist(tmp_path, run_id="us-lx", actions=[_action()])
+    _prepare_fixed(tmp_path, us_lx)
+    assert _read_state(tmp_path)["available"] is True
+    assert _read_state(tmp_path, account="sy")["available"] is False
+    assert _read_state(tmp_path, market="HK")["available"] is False
+
+
+def test_retired_v1_delivery_schema_fails_closed(tmp_path: Path) -> None:
+    state_dir = tmp_path / "output_accounts" / "lx" / "state"
+    state_dir.mkdir(parents=True)
+    path = state_dir / "daily_decision_brief.US.delivery.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "daily_decision_brief_delivery.v1",
+                "account": "lx",
+                "market": "US",
+                "days": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out = _read_state(tmp_path)
+    assert out["available"] is False
+    assert out["reason"] == "state_invalid"
+
+
+def test_v2_attempt_and_confirmation_advance_exact_envelope_and_candidates(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import (
+        confirm_daily_decision_brief_delivery_v2,
+        record_daily_decision_brief_delivery_attempt,
+    )
+    from src.application.notification_delivery_adapter import build_notification_transport_key
+
+    persisted = _persist(tmp_path, actions=[_action(), _action(symbol="AMD")])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=persisted["current_candidate_identities"],
+    )
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    transport_key = build_notification_transport_key(envelope["delivery_key"])
+
+    attempt = record_daily_decision_brief_delivery_attempt(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=transport_key,
+        ambiguous=False,
+        attempted_at_utc="2026-07-21T14:00:03+00:00",
+    )
+    assert attempt["envelope"]["status"] == "pending"
+    assert attempt["envelope"]["last_attempt_at_utc"] == "2026-07-21T14:00:03+00:00"
+
+    confirmed = confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=transport_key,
+        confirmed_at_utc="2026-07-21T14:00:04+00:00",
+    )
+    assert confirmed["advanced"] is True
+    day = _read_state(tmp_path)["state"]["days"][MARKET_DATE]
+    assert day["fixed_reports"][TARGET_1000]["status"] == "confirmed"
+    assert day["fixed_reports"][TARGET_1000]["last_attempt_at_utc"] == "2026-07-21T14:00:04+00:00"
+    assert day["pending_candidates"] == {}
+    assert set(day["alerted_candidates"]) == {IDENTITY_AMD, IDENTITY_NVDA}
+    assert {item["via"] for item in day["alerted_candidates"].values()} == {"fixed_report"}
+
+
+def test_v2_delivery_accepts_exact_digest_from_retired_ai_overlay_revision(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.daily_decision_brief import daily_brief_compatible_digests
+    from src.application.daily_decision_brief_repository import (
+        confirm_daily_decision_brief_delivery_v2,
+        persist_daily_decision_brief_success,
+    )
+    from src.application.notification_delivery_adapter import build_notification_transport_key
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(envelope["delivery_key"]),
+        confirmed_at_utc="2026-07-21T14:00:04+00:00",
+    )
+
+    for path in (persisted["paths"]["revision"], persisted["paths"]["current"]):
+        historical = json.loads(path.read_text(encoding="utf-8"))
+        historical["ai_decision_advice"] = {
+            "status": "completed",
+            "summary": "historical-overlay",
+        }
+        historical["ai_decision_advice_evidence_index"] = {
+            "source": "historical-evidence",
+        }
+        path.write_text(json.dumps(historical), encoding="utf-8")
+    replace_history_payload(tmp_path, historical)
+    legacy_digest = daily_brief_compatible_digests(historical)[-1]
+    assert legacy_digest != persisted["current_brief_digest"]
+
+    delivery_path = prepared["paths"]["delivery"]
+    delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+    day = delivery["days"][MARKET_DATE]
+    day["fixed_reports"][TARGET_1000]["source_digest"] = legacy_digest
+    for alerted in day["alerted_candidates"].values():
+        alerted["brief_digest"] = legacy_digest
+    delivery_path.write_text(json.dumps(delivery), encoding="utf-8")
+
+    inspected = _read_state(tmp_path)
+    assert inspected["available"] is True
+    assert inspected["state"]["days"][MARKET_DATE]["fixed_reports"][TARGET_1000][
+        "source_digest"
+    ] == legacy_digest
+
+    next_run = persist_daily_decision_brief_success(
+        base=tmp_path,
+        brief=_brief(run_id="run-2", actions=[_action()]),
+    )
+    assert next_run["current_revision"] == 1
+    assert "ai_decision_advice" not in next_run["previous_successful_brief"]
+    assert "ai_decision_advice_evidence_index" not in next_run[
+        "previous_successful_brief"
+    ]
+    assert _read_state(tmp_path)["available"] is True
+
+
+def test_v2_delivery_accepts_pre_wheel_digest_for_non_wheel_candidate(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.daily_decision_brief import (
+        daily_brief_digest,
+        normalize_daily_decision_brief,
+    )
+    from src.application.daily_decision_brief_repository import confirm_daily_decision_brief_delivery_v2
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    source = _brief(run_id="run-1", actions=[_action()])
+    source["revision"] = 0
+    pre_wheel = normalize_daily_decision_brief(source)
+    for item in pre_wheel["candidate_index"]:
+        item["representative"].pop("position_lot_id", None)
+    pre_wheel_digest = daily_brief_digest(pre_wheel)
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(
+            envelope["delivery_key"]
+        ),
+        confirmed_at_utc="2026-07-21T14:00:04+00:00",
+    )
+
+    persisted["paths"]["revision"].write_text(
+        json.dumps(source),
+        encoding="utf-8",
+    )
+    delivery_path = prepared["paths"]["delivery"]
+    delivery = json.loads(delivery_path.read_text(encoding="utf-8"))
+    day = delivery["days"][MARKET_DATE]
+    day["fixed_reports"][TARGET_1000]["source_digest"] = pre_wheel_digest
+    for alerted in day["alerted_candidates"].values():
+        alerted["brief_digest"] = pre_wheel_digest
+    delivery_path.write_text(json.dumps(delivery), encoding="utf-8")
+
+    read = _read_state(tmp_path)
+    assert read["available"] is True
+    assert read["state"]["days"][MARKET_DATE]["fixed_reports"][TARGET_1000][
+        "source_digest"
+    ] == pre_wheel_digest
+
+
+def test_retry_payload_classifier_blocks_retired_source_text_and_card(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.daily_decision_brief import daily_brief_compatible_digests
+    from src.application.channels.feishu_notification_renderer import (
+        feishu_notification_envelope_sha256,
+        render_feishu_notification_card,
+    )
+    from src.application.daily_decision_brief_repository import (
+        classify_retryable_daily_decision_brief_payload,
+    )
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    clean = prepared["envelope"]
+    common = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+    }
+    assert classify_retryable_daily_decision_brief_payload(
+        **common,
+        envelope=clean,
+    ) == "clean"
+
+    message_only = {
+        **clean,
+        "rendered_message": "# AI建议\n旧建议不得重发",
+    }
+    message_only["message_sha256"] = hashlib.sha256(
+        message_only["rendered_message"].encode()
+    ).hexdigest()
+    assert classify_retryable_daily_decision_brief_payload(
+        **common,
+        envelope=message_only,
+    ) == "legacy_ai_payload_retired"
+
+    card = render_feishu_notification_card(
+        markdown="# AI Decision Advice\nretired",
+        fallback_text=clean["rendered_message"],
+    )
+    card_only = {
+        **clean,
+        "rendered_transport": card,
+        "rendered_transport_sha256": feishu_notification_envelope_sha256(card),
+    }
+    assert classify_retryable_daily_decision_brief_payload(
+        **common,
+        envelope=card_only,
+    ) == "legacy_ai_payload_retired"
+
+    revision_path = persisted["paths"]["revision"]
+    historical = json.loads(revision_path.read_text(encoding="utf-8"))
+    historical["ai_decision_advice"] = {"status": "completed"}
+    historical["ai_decision_advice_evidence_index"] = {"symbols": []}
+    revision_path.write_text(json.dumps(historical), encoding="utf-8")
+    replace_history_payload(tmp_path, historical)
+    source_only = {
+        **clean,
+        "source_digest": daily_brief_compatible_digests(historical)[-1],
+    }
+    assert classify_retryable_daily_decision_brief_payload(
+        **common,
+        envelope=source_only,
+    ) == "legacy_ai_payload_retired"
+
+
+def test_retry_payload_classifier_inspects_the_same_raw_revision_it_validates(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import src.application.daily_decision_brief_repository as repository
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    revision_reads = 0
+    original_read = repository._history_raw
+
+    def counted_read(**kwargs):
+        nonlocal revision_reads
+        revision_reads += 1
+        return original_read(**kwargs)
+
+    monkeypatch.setattr(repository, "_history_raw", counted_read)
+
+    assert repository.classify_retryable_daily_decision_brief_payload(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        envelope=prepared["envelope"],
+    ) == "clean"
+    assert revision_reads == 1
+
+
+def test_v2_ambiguous_attempt_freezes_envelope_and_exact_retry_can_confirm(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import (
+        DailyDecisionBriefStateError,
+        confirm_daily_decision_brief_delivery_v2,
+        record_daily_decision_brief_delivery_attempt,
+    )
+    from src.application.notification_delivery_adapter import build_notification_transport_key
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=persisted["current_candidate_identities"],
+    )
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    transport_key = build_notification_transport_key(envelope["delivery_key"])
+    ambiguous = record_daily_decision_brief_delivery_attempt(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=transport_key,
+        ambiguous=True,
+    )
+    assert ambiguous["envelope"]["status"] == "ambiguous"
+
+    with pytest.raises(DailyDecisionBriefStateError, match="frozen"):
+        _prepare(
+            tmp_path,
+            run_id="run-2",
+            delivery_kind="fixed_report",
+            source_kind="successful_brief",
+            revision=persisted["current_revision"],
+            source_digest=persisted["current_brief_digest"],
+            scheduled_target_market=TARGET_1000,
+            candidate_identities=persisted["current_candidate_identities"],
+            rendered_message="# changed",
+        )
+
+    confirmed = confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=transport_key,
+    )
+    assert confirmed["envelope"]["status"] == "confirmed"
+
+
+def test_v2_exact_transition_rejects_mismatched_transport_or_payload(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import (
+        DailyDecisionBriefStateError,
+        record_daily_decision_brief_delivery_attempt,
+    )
+
+    persisted = _persist(tmp_path)
+    envelope = _prepare_fixed(tmp_path, persisted)["envelope"]
+    common = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+        "delivery_key": envelope["delivery_key"],
+        "source_digest": envelope["source_digest"],
+        "message_sha256": envelope["message_sha256"],
+        "transport_idempotency_key": "wrong",
+        "ambiguous": False,
+    }
+    with pytest.raises(DailyDecisionBriefStateError, match="idempotency"):
+        record_daily_decision_brief_delivery_attempt(**common)
+    with pytest.raises(ValueError, match="message_sha256"):
+        record_daily_decision_brief_delivery_attempt(
+            **{**common, "transport_idempotency_key": "om-" + "0" * 32, "message_sha256": "bad"}
+        )
+
+
+def test_operator_resolution_reconciles_exact_daily_brief_envelope(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import (
+        reconcile_daily_decision_brief_delivery_resolution,
+        record_daily_decision_brief_delivery_attempt,
+    )
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    persisted = _persist(tmp_path, actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=persisted["current_candidate_identities"],
+    )
+    envelope = _prepare_fixed(tmp_path, persisted)["envelope"]
+    transport_key = build_notification_transport_key(
+        envelope["delivery_key"]
+    )
+    identity = {
+        "base": tmp_path,
+        "account": "lx",
+        "market": "US",
+        "market_trading_date": MARKET_DATE,
+        "delivery_key": envelope["delivery_key"],
+        "source_digest": envelope["source_digest"],
+        "message_sha256": envelope["message_sha256"],
+        "transport_idempotency_key": transport_key,
+    }
+    record_daily_decision_brief_delivery_attempt(
+        **identity,
+        ambiguous=True,
+    )
+
+    failed = reconcile_daily_decision_brief_delivery_resolution(
+        **identity,
+        resolution="failed",
+        resolved_at_utc="2026-07-21T14:10:00+00:00",
+    )
+    assert failed["envelope"]["status"] == "pending"
+    retry = _retry(tmp_path)
+    assert retry["envelope"]["delivery_key"] == envelope["delivery_key"]
+
+    record_daily_decision_brief_delivery_attempt(
+        **identity,
+        ambiguous=True,
+    )
+    delivered = reconcile_daily_decision_brief_delivery_resolution(
+        **identity,
+        resolution="delivered",
+        resolved_at_utc="2026-07-21T14:20:00+00:00",
+    )
+    assert delivered["envelope"]["status"] == "confirmed"
+    state = _read_state(tmp_path)["state"]
+    day = state["days"][MARKET_DATE]
+    assert day["pending_candidates"] == {}
+    assert IDENTITY_NVDA in day["alerted_candidates"]
+
+
+def test_confirmed_candidate_delivery_rolls_to_later_candidate_batch(tmp_path: Path) -> None:
+    from src.application.daily_decision_brief_repository import confirm_daily_decision_brief_delivery_v2
+    from src.application.notification_delivery_adapter import build_notification_transport_key
+
+    first = _persist(tmp_path, run_id="run-1", actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=first["current_revision"],
+        brief_digest=first["current_brief_digest"],
+        candidate_identities=first["current_candidate_identities"],
+    )
+    first_envelope = _prepare(
+        tmp_path,
+        run_id="run-1",
+        delivery_kind="candidate_alert",
+        source_kind="successful_brief",
+        revision=first["current_revision"],
+        source_digest=first["current_brief_digest"],
+        candidate_identities=[IDENTITY_NVDA],
+        rendered_message="# 新增候选\nNVDA",
+        render_context={"projection": "candidate_alert"},
+    )["envelope"]
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=first_envelope["delivery_key"],
+        source_digest=first_envelope["source_digest"],
+        message_sha256=first_envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(first_envelope["delivery_key"]),
+    )
+
+    second = _persist(
+        tmp_path,
+        run_id="run-2",
+        actions=[_action(), _action(symbol="AMD")],
+    )
+    recorded = _record_candidates(
+        tmp_path,
+        revision=second["current_revision"],
+        brief_digest=second["current_brief_digest"],
+        candidate_identities=second["current_candidate_identities"],
+    )
+    assert recorded["pending_candidate_identities"] == [IDENTITY_AMD]
+
+    prepared = _prepare(
+        tmp_path,
+        run_id="run-2",
+        delivery_kind="candidate_alert",
+        source_kind="successful_brief",
+        revision=second["current_revision"],
+        source_digest=second["current_brief_digest"],
+        candidate_identities=[IDENTITY_AMD],
+        rendered_message="# 新增候选\nAMD",
+        render_context={"projection": "candidate_alert"},
+    )
+    second_envelope = prepared["envelope"]
+    assert prepared["prepared"] is True
+    assert second_envelope["delivery_key"] != first_envelope["delivery_key"]
+    retry = _retry(tmp_path)
+    assert retry["envelope"]["delivery_key"] == second_envelope["delivery_key"]
+    assert retry["envelope"]["candidate_identities"] == [IDENTITY_AMD]
+
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=second_envelope["delivery_key"],
+        source_digest=second_envelope["source_digest"],
+        message_sha256=second_envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(second_envelope["delivery_key"]),
+    )
+    day = _read_state(tmp_path)["state"]["days"][MARKET_DATE]
+    assert set(day["alerted_candidates"]) == {IDENTITY_NVDA, IDENTITY_AMD}
+    assert day["pending_candidates"] == {}
+
+
+def test_legacy_combo_revision_remains_source_for_recovery_delivery_and_exposure(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.combo_candidate_evidence import (
+        combo_exposure_render_context,
+        derive_combo_candidate_exposures,
+    )
+    from src.application.daily_decision_brief_repository import (
+        confirm_daily_decision_brief_delivery_v2,
+        read_combo_candidate_exposures,
+        read_daily_decision_brief,
+        read_daily_decision_brief_fixed_recovery,
+        read_latest_daily_decision_brief,
+        record_daily_decision_brief_fixed_recovery,
+    )
+    from src.application.notification_delivery_adapter import (
+        build_notification_transport_key,
+    )
+
+    legacy, digest, _seeded = _install_legacy_combo_revision(tmp_path)
+    identity = "candidate:v1:lx:US:NVDA:combo_yield"
+    assert read_latest_daily_decision_brief(
+        base=tmp_path,
+        account="lx",
+        market="US",
+    )["brief"]["actions"][0]["action_id"] == "action-6f70388725ffbc618358812c"
+    assert read_daily_decision_brief(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        revision=0,
+    )["brief_digest"] == digest
+
+    record_daily_decision_brief_fixed_recovery(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        scheduled_target_market=TARGET_1000,
+        revision=0,
+        brief_digest=digest,
+        candidate_identities=[identity],
+        recorded_at_utc="2026-07-21T14:00:01+00:00",
+    )
+    recovery = read_daily_decision_brief_fixed_recovery(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+    )
+    assert recovery["reason"] == "recovery_pending"
+    assert recovery["brief"]["actions"][0]["action_id"] == "action-6f70388725ffbc618358812c"
+
+    _record_candidates(
+        tmp_path,
+        revision=0,
+        brief_digest=digest,
+        candidate_identities=[identity],
+        observed_at_utc="2026-07-21T14:00:02+00:00",
+    )
+    exposures = derive_combo_candidate_exposures(
+        legacy,
+        candidate_identities=[identity],
+    )
+    envelope = _prepare(
+        tmp_path,
+        run_id="run-1",
+        delivery_kind="candidate_alert",
+        source_kind="successful_brief",
+        revision=0,
+        source_digest=digest,
+        candidate_identities=[identity],
+        rendered_message="# synthetic legacy Combo candidate",
+        render_context={
+            **combo_exposure_render_context(exposures),
+            "rendered_combo_candidate_identities": [identity],
+        },
+        prepared_at_utc="2026-07-21T14:00:03+00:00",
+    )["envelope"]
+    retry = _retry(tmp_path)
+    assert retry["reason"] == "pending_candidates"
+    assert retry["envelope"] == envelope
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"],
+        source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(envelope["delivery_key"]),
+        confirmed_at_utc="2026-07-21T14:00:04+00:00",
+    )
+    replayed = read_combo_candidate_exposures(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+    )
+    assert replayed["reason"] == "ok"
+    assert len(replayed["exposures"]) == 1
+    assert replayed["exposures"][0]["delivery_confirmed"] is True
+
+
+def test_legacy_combo_hold_survives_two_revisions_then_recovers_to_current_id(
+    tmp_path: Path,
+) -> None:
+    from domain.domain.daily_decision_brief import (
+        daily_brief_digest,
+        diff_daily_decision_briefs,
+    )
+    from src.application.daily_decision_brief_repository import (
+        persist_daily_decision_brief_success,
+        read_daily_decision_brief,
+        read_latest_daily_decision_brief,
+    )
+
+    _legacy, _digest, _seeded = _install_legacy_combo_revision(tmp_path)
+    degraded = _brief(run_id="run-2")
+    degraded["status"] = "degraded"
+    degraded["data_gaps"] = [
+        {
+            "market": "US",
+            "symbol": "NVDA",
+            "strategy_family": "combo_yield",
+            "reason": "snapshot_unavailable",
+        }
+    ]
+    first_hold = persist_daily_decision_brief_success(base=tmp_path, brief=degraded)
+    second_hold = persist_daily_decision_brief_success(
+        base=tmp_path,
+        brief={**degraded, "run_id": "run-3"},
+    )
+    for persisted in (first_hold, second_hold):
+        action = persisted["brief"]["actions"][0]
+        assert action["action_id"] == "action-6f70388725ffbc618358812c"
+        assert action["state"] == "observe"
+    held_readback = read_daily_decision_brief(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        revision=2,
+    )
+    assert held_readback["available"] is True
+    assert held_readback["brief_digest"] == daily_brief_digest(second_hold["brief"])
+    assert read_latest_daily_decision_brief(
+        base=tmp_path,
+        account="lx",
+        market="US",
+    )["brief"]["actions"][0]["action_id"] == "action-6f70388725ffbc618358812c"
+
+    healthy = _legacy_combo_brief(run_id="run-4")
+    healthy["actions"][0].pop("action_id")
+    healthy["actions"][0]["candidate_pair_id"] = "pair-nvda-100-110"
+    healthy["actions"][0]["strategy_group_id"] = ""
+    healthy["candidate_index"][0]["representative"]["strategy_group_id"] = ""
+    recovered = persist_daily_decision_brief_success(base=tmp_path, brief=healthy)
+    changes = diff_daily_decision_briefs(
+        recovered["previous_successful_brief"],
+        recovered["brief"],
+    )["changes"]
+    assert [item["change_type"] for item in changes] == ["candidate_evidence_recovered"]
+    assert changes[0]["before_action_id"] == "action-6f70388725ffbc618358812c"
+    assert changes[0]["after_action_id"] == recovered["brief"]["actions"][0]["action_id"]
+
+
+def test_legacy_combo_id_cannot_be_submitted_without_a_persisted_previous_source(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import (
+        persist_daily_decision_brief_success,
+    )
+
+    source = _legacy_combo_brief()
+    source["legacy_action_ids"] = ["action-6f70388725ffbc618358812c"]
+    with pytest.raises(ValueError, match="candidate_pair_id"):
+        persist_daily_decision_brief_success(base=tmp_path, brief=source)
+    assert not (tmp_path / "output_accounts/lx/state/daily_decision_brief.US.current.json").exists()
+
+
+@pytest.mark.parametrize("tamper", ["action_id", "stable_field"])
+def test_public_revision_read_rejects_tampered_legacy_combo_action(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    from src.application.daily_decision_brief_repository import read_daily_decision_brief
+
+    _legacy, _digest, seeded = _install_legacy_combo_revision(tmp_path)
+    raw = json.loads(seeded["paths"]["revision"].read_text(encoding="utf-8"))
+    if tamper == "action_id":
+        raw["actions"][0]["action_id"] = "action-000000000000000000000000"
+    else:
+        raw["actions"][0]["contract_symbol"] = "NVDA260821P00101000"
+    seeded["paths"]["revision"].write_text(json.dumps(raw), encoding="utf-8")
+    replace_history_payload(tmp_path, raw)
+
+    inspected = read_daily_decision_brief(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        revision=0,
+    )
+    assert inspected["available"] is False
+    assert inspected["reason"] == "state_invalid"
+
+
+def test_legacy_combo_pair_or_digest_tamper_cannot_authorize_fixed_recovery(
+    tmp_path: Path,
+) -> None:
+    from src.application.daily_decision_brief_repository import (
+        DailyDecisionBriefStateError,
+        read_daily_decision_brief_fixed_recovery,
+        record_daily_decision_brief_fixed_recovery,
+    )
+
+    _legacy, digest, seeded = _install_legacy_combo_revision(tmp_path)
+    identity = "candidate:v1:lx:US:NVDA:combo_yield"
+    with pytest.raises(DailyDecisionBriefStateError, match="source digest mismatch"):
+        record_daily_decision_brief_fixed_recovery(
+            base=tmp_path,
+            account="lx",
+            market="US",
+            market_trading_date=MARKET_DATE,
+            scheduled_target_market=TARGET_1000,
+            revision=0,
+            brief_digest="0" * 64,
+            candidate_identities=[identity],
+        )
+    record_daily_decision_brief_fixed_recovery(
+        base=tmp_path,
+        account="lx",
+        market="US",
+        market_trading_date=MARKET_DATE,
+        scheduled_target_market=TARGET_1000,
+        revision=0,
+        brief_digest=digest,
+        candidate_identities=[identity],
+    )
+    raw = json.loads(seeded["paths"]["revision"].read_text(encoding="utf-8"))
+    raw["candidate_index"][0]["representative"]["candidate_pair_id"] = "pair-tampered"
+    seeded["paths"]["revision"].write_text(json.dumps(raw), encoding="utf-8")
+    replace_history_payload(tmp_path, raw)
+    with pytest.raises(DailyDecisionBriefStateError, match="source digest mismatch"):
+        read_daily_decision_brief_fixed_recovery(
+            base=tmp_path,
+            account="lx",
+            market="US",
+            market_trading_date=MARKET_DATE,
+        )
+
+
+def test_delivery_source_run_is_derived_from_validated_revision(tmp_path: Path) -> None:
+    prepared = _prepare_fixed(tmp_path, _persist(tmp_path, run_id='source-scan'))
+    path = prepared['paths']['delivery']
+    raw = json.loads(path.read_text())
+    raw['days'][MARKET_DATE]['fixed_reports'][TARGET_1000]['source_run_id'] = 'forged-attempt'
+    path.write_text(json.dumps(raw))
+    readback = _read_state(tmp_path, account='lx', market='US')
+    envelope = readback['state']['days'][MARKET_DATE]['fixed_reports'][TARGET_1000]
+    assert envelope['source_run_id'] == 'source-scan'
+
+
+def test_persisted_brief_derives_wheel_candidate_identity_with_branch(tmp_path: Path) -> None:
+    """A Wheel candidate reaching the Brief keeps its branch suffix end to end.
+
+    This is the path the HK tick died on: the domain derives the identity from
+    the candidate index, and the repository re-validated it against a strategy
+    family list that had stopped matching the domain.
+    """
+
+    persisted = _persist(tmp_path, actions=[_wheel_action()])
+    assert persisted["current_candidate_identities"] == [IDENTITY_WHEEL]
+    prepared = _prepare_fixed(tmp_path, persisted)
+    assert prepared["envelope"]["candidate_identities"] == [IDENTITY_WHEEL]
+
+
+def test_candidate_identity_accepts_wheel_branch_suffix() -> None:
+    from src.application.daily_decision_brief_repository import _normalize_candidate_identities
+
+    assert _normalize_candidate_identities([IDENTITY_WHEEL], account="lx", market="US") == [IDENTITY_WHEEL]
+    assert _normalize_candidate_identities([IDENTITY_WHEEL_HK], account="lx", market="HK") == [IDENTITY_WHEEL_HK]
+
+
+def test_candidate_identity_rejects_wheel_without_branch_suffix() -> None:
+    from src.application.daily_decision_brief_repository import _normalize_candidate_identities
+
+    with pytest.raises(ValueError, match="incompatible"):
+        _normalize_candidate_identities(["candidate:v1:lx:US:NVDA:wheel"], account="lx", market="US")
+
+
+def test_candidate_identity_rejects_unknown_family() -> None:
+    from src.application.daily_decision_brief_repository import _normalize_candidate_identities
+
+    with pytest.raises(ValueError, match="incompatible"):
+        _normalize_candidate_identities(["candidate:v1:lx:US:NVDA:iron_condor"], account="lx", market="US")
+
+
+def test_candidate_identity_validator_covers_every_domain_strategy_family() -> None:
+    """The validator must accept whatever the domain builder emits.
+
+    It used to enumerate the families itself, so it kept rejecting `wheel`
+    identities long after the domain added that family.
+    """
+
+    from domain.domain.daily_decision_brief import (
+        _CANDIDATE_STRATEGY_FAMILIES,
+        build_daily_brief_candidate_identity,
+    )
+    from src.application.daily_decision_brief_repository import _normalize_candidate_identities
+
+    for family in sorted(_CANDIDATE_STRATEGY_FAMILIES):
+        identity = build_daily_brief_candidate_identity(
+            account="lx",
+            market="US",
+            symbol="NVDA",
+            strategy_family=family,
+            wheel_branch_id=WHEEL_BRANCH_ID,
+        )
+        assert _normalize_candidate_identities([identity], account="lx", market="US") == [identity]
+
+
+def test_record_candidates_round_trips_wheel_identity_through_delivery_state(tmp_path: Path) -> None:
+    persisted = _persist(tmp_path, actions=[_action()])
+    _record_candidates(
+        tmp_path,
+        revision=persisted["current_revision"],
+        brief_digest=persisted["current_brief_digest"],
+        candidate_identities=[IDENTITY_WHEEL],
+        observed_at_utc="2026-07-21T14:00:01+00:00",
+    )
+    readback = _read_state(tmp_path)
+    assert set(readback["state"]["days"][MARKET_DATE]["pending_candidates"]) == {IDENTITY_WHEEL}
+
+
+def _confirmed_repeated_source(tmp_path: Path) -> tuple[dict, Path]:
+    from src.application.daily_decision_brief_repository import confirm_daily_decision_brief_delivery_v2
+    from src.application.notification_delivery_adapter import build_notification_transport_key
+
+    persisted = _persist(tmp_path, actions=[_action(), _action(symbol="AMD")])
+    prepared = _prepare_fixed(tmp_path, persisted)
+    envelope = prepared["envelope"]
+    confirm_daily_decision_brief_delivery_v2(
+        base=tmp_path, account="lx", market="US", market_trading_date=MARKET_DATE,
+        delivery_key=envelope["delivery_key"], source_digest=envelope["source_digest"],
+        message_sha256=envelope["message_sha256"],
+        transport_idempotency_key=build_notification_transport_key(envelope["delivery_key"]),
+        confirmed_at_utc="2026-07-21T14:00:04+00:00",
+    )
+    return persisted, prepared["paths"]["delivery"]
+
+
+@pytest.mark.parametrize("mutation", ["delete", "corrupt", "digest", "account", "market"])
+def test_delivery_normalization_reuses_source_but_independent_read_is_fresh(tmp_path, monkeypatch, mutation):
+    import src.application.daily_decision_brief_repository as repository
+    from src.infrastructure.decision_history_sqlite import history_path
+    persisted, _ = _confirmed_repeated_source(tmp_path)
+    original = repository._history_raw
+    reads = []
+    def counted(**kwargs):
+        reads.append(kwargs["revision"])
+        return original(**kwargs)
+    monkeypatch.setattr(repository, "_history_raw", counted)
+    first = _read_state(tmp_path)
+    assert len(first["state"]["days"][MARKET_DATE]["alerted_candidates"]) == 2
+    assert reads == [0]
+    if mutation == "delete":
+        delete_history_revision(tmp_path)
+        error = "missing revision"
+    elif mutation == "corrupt":
+        history_path(tmp_path).write_bytes(b"broken SQLite")
+        error = "history_database_error"
+    else:
+        raw = dict(persisted["brief"])
+        if mutation == "digest":
+            raw["strategy_summary"] = "changed facts"
+            error = "source digest mismatch"
+        else:
+            raw[mutation] = "sy" if mutation == "account" else "HK"
+            error = "history_identity_corrupt"
+        replace_history_payload(tmp_path, raw)
+    rejected = _read_state(tmp_path)
+    assert rejected["available"] is False and rejected["reason"] == "state_invalid"
+    assert rejected["state"] is None and error in rejected["error"]
+    assert reads == [0, 0]
+
+
+def test_delivery_source_reuse_does_not_hide_different_expected_digest(tmp_path):
+    _, path = _confirmed_repeated_source(tmp_path)
+    raw = json.loads(path.read_text())
+    raw["days"][MARKET_DATE]["alerted_candidates"][IDENTITY_NVDA]["brief_digest"] = "0" * 64
+    path.write_text(json.dumps(raw))
+    rejected = _read_state(tmp_path)
+    assert rejected["available"] is False and rejected["state"] is None
+    assert "source digest mismatch" in rejected["error"]
+
+
+def test_delivery_source_reuse_keeps_candidate_membership_check(tmp_path):
+    _, path = _confirmed_repeated_source(tmp_path)
+    raw = json.loads(path.read_text())
+    alerted = raw["days"][MARKET_DATE]["alerted_candidates"]
+    alerted["candidate:v1:lx:US:TSLA:sell_put"] = alerted.pop(IDENTITY_NVDA)
+    path.write_text(json.dumps(raw))
+    rejected = _read_state(tmp_path)
+    assert rejected["available"] is False and rejected["state"] is None
+    assert "absent from its revision" in rejected["error"]

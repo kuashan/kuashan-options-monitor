@@ -1,0 +1,1645 @@
+from __future__ import annotations
+
+import csv
+from collections import OrderedDict
+from collections.abc import Mapping
+from io import BytesIO
+import json
+import math
+import os
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+import pandas as pd
+
+from domain.domain.expiration_dates import (
+    expiration_timestamp_to_date,
+)
+from domain.domain.decision_state_fingerprint import canonical_sha256
+from domain.domain.close_advice import (
+    CloseAdviceInput,
+    DECISION_EVIDENCE_NOT_EVALUABLE,
+    RECOMMENDATION_NOT_EVALUABLE,
+    STRICT_CLOSE_POLICY_VERSION,
+    evaluate_close_advice,
+    safe_float,
+    safe_int,
+    select_close_advice_notification_rows,
+    sort_advice_rows,
+)
+from domain.domain.fee_calc import (
+    FUTU_HK_OPTION_FEE_BASIS,
+    FUTU_US_OPTION_FEE_BASIS,
+    calc_futu_option_fee,
+)
+from src.infrastructure.io_utils import atomic_write_text, read_json
+from domain.domain.ledger.position_fields import (
+    effective_expiration_ymd,
+    effective_multiplier,
+    normalize_account,
+)
+from domain.domain.option_position_identity import normalize_broker, normalize_currency
+from domain.domain.trade_contract_identity import (
+    canonical_contract_symbol,
+    contract_key,
+    normalize_contract_expiration,
+    normalize_contract_option_type,
+)
+from domain.domain.symbol_identity import symbol_market
+from src.application.expiration_normalization import find_unique_near_miss_expiration
+from src.application.close_advice_report_manifest import (
+    publish_close_advice_report_manifest,
+    publish_close_advice_report_status,
+)
+from src.application.close_advice_required_data import (
+    CloseAdviceRequiredDataPlanError,
+    account_requirement_index,
+    close_advice_market_date,
+    resolve_bound_close_advice_required_data_plan_snapshot,
+)
+from src.application.source_receipts import sha256_bytes
+from src.application.required_data_snapshot import (
+    FrozenRequiredDataBatch,
+    FrozenRequiredDataUnavailable,
+    RequiredDataSnapshotError,
+    resolve_frozen_required_data_csv_bytes_batch,
+)
+from src.application.symbol_aliases import load_runtime_symbol_aliases
+OUTPUT_COLUMNS = [
+    "account",
+    "position_lot_id",
+    "strategy_group_id",
+    "leg_role",
+    "source_stock_lot_id",
+    "quote_mode",
+    "required_data_snapshot_plan_id",
+    "required_data_snapshot_manifest_sha256",
+    "close_advice_required_data_plan_sha256",
+    "required_data_requirement_id",
+    "required_data_binding_id",
+    "required_data_snapshot_id",
+    "required_data_receipt_hash",
+    "required_data_payload_sha256",
+    "required_data_source_observed_at",
+    "required_data_expires_at",
+    "symbol",
+    "option_type",
+    "expiration",
+    "strike",
+    "contracts_open",
+    "multiplier",
+    "spot",
+    "currency",
+    "premium",
+    "bid",
+    "ask",
+    "close_mid",
+    "dte",
+    "delta",
+    "remaining_trading_sessions",
+    "remaining_trading_sessions_min",
+    "remaining_trading_sessions_max",
+    "trading_calendar_status",
+    "trading_calendar_reason",
+    "trading_calendar_market",
+    "trading_calendar_as_of_market_date",
+    "trading_calendar_expiration",
+    "trading_calendar_request_start",
+    "trading_calendar_request_end",
+    "trading_calendar_dates",
+    "trading_calendar_input_hash",
+    "trading_calendar_receipt",
+    "market_state_after_snapshot",
+    "market_state_received_at_utc",
+    "original_dte",
+    "remaining_term_ratio",
+    "spread_ratio",
+    "position_lifecycle_state",
+    "net_capture_ratio",
+    "capital_basis",
+    "remaining_max_annualized_return",
+    "opening_gross_credit",
+    "estimated_open_fee",
+    "opening_net_credit",
+    "all_in_close_cost",
+    "close_cost_ratio",
+    "is_otm",
+    "estimated_close_fee",
+    "fee_calc_status",
+    "fee_calc_basis",
+    "estimated_pnl_if_close_net",
+    "evaluation_status",
+    "quote_status",
+    "reason",
+    "policy_version",
+    "recommendation_state",
+    "decision_basis",
+    "decision_evidence_status",
+    "broker",
+    "position_side",
+    "strategy_family",
+    "strategy_profile",
+    "data_quality_flags",
+]
+
+QUOTE_ISSUE_FLAGS = {
+    "missing_quote",
+    "missing_bid",
+    "missing_ask",
+    "missing_bid_ask",
+    "invalid_bid",
+    "invalid_ask",
+    "invalid_bid_ask",
+    "required_data_missing_expiration",
+    "required_data_missing_contract",
+    "required_data_fetch_error",
+    "required_data_fetch_error_rate_limit",
+    "required_data_fetch_skipped_non_futu_source",
+    "close_advice_plan_unavailable",
+    "required_data_position_not_planned",
+    "required_data_symbol_config_missing",
+    "required_data_symbol_source_unsupported",
+    "required_data_route_conflict",
+    "required_data_symbol_not_planned",
+    "required_data_snapshot_unavailable",
+    "opend_fetch_error",
+    "opend_fetch_no_usable_quote",
+    "spread_too_wide",
+    "invalid_spread",
+}
+
+
+def _norm_symbol(value: Any, *, base_dir: Path | None = None) -> str:
+    aliases = load_runtime_symbol_aliases(base_dir) if base_dir is not None else None
+    return canonical_contract_symbol(value, symbol_aliases=aliases)
+
+
+def _norm_option_type(value: Any) -> str:
+    return normalize_contract_option_type(value, fallback_raw=True)
+
+
+def _market_for_symbol(symbol: Any) -> str:
+    return symbol_market(symbol) or ""
+
+
+def normalize_expiration(value: Any) -> str | None:
+    return normalize_contract_expiration(value, fallback_raw=True)
+
+
+def _row_account(value: Any, *, default: str = "当前账户") -> str:
+    return normalize_account(value) or default
+
+
+def _quote_key(symbol: Any, option_type: Any, expiration: Any, strike: Any, *, base_dir: Path | None = None) -> tuple[str, str, str, str]:
+    aliases = load_runtime_symbol_aliases(base_dir) if base_dir is not None else None
+    return contract_key(
+        symbol,
+        option_type,
+        expiration,
+        strike,
+        symbol_aliases=aliases,
+        option_type_fallback_raw=True,
+        expiration_fallback_raw=True,
+    )
+
+
+def _build_contract_expiration_index(
+    covered_keys: set[tuple[str, str, str, str]],
+) -> dict[tuple[str, str, str], set[str]]:
+    index: dict[tuple[str, str, str], set[str]] = {}
+    for symbol, option_type, expiration, strike in covered_keys:
+        if not (symbol and option_type and expiration and strike):
+            continue
+        index.setdefault((symbol, option_type, strike), set()).add(expiration)
+    return index
+
+
+def _quote_number(value: Any) -> float | None:
+    num = safe_float(value)
+    if num is None:
+        return None
+    if isinstance(num, float) and math.isnan(num):
+        return None
+    return num
+
+
+def _quote_has_usable_price(quote: dict[str, Any] | None) -> bool:
+    if not isinstance(quote, dict):
+        return False
+    bid = _quote_number(quote.get("bid"))
+    ask = _quote_number(quote.get("ask"))
+    return (
+        bid is not None
+        and ask is not None
+        and bid >= 0
+        and ask > 0
+        and ask >= bid
+    )
+
+
+def _classify_required_data_coverage(
+    positions: list[dict[str, Any]],
+    covered_keys: set[tuple[str, str, str, str]],
+    expirations_by_symbol: dict[str, set[str]],
+    *,
+    base_dir: Path,
+) -> tuple[dict[tuple[str, str, str, str], str], dict[tuple[str, str, str, str], dict[str, Any]]]:
+    reasons: dict[tuple[str, str, str, str], str] = {}
+    details: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    contract_expiration_index = _build_contract_expiration_index(covered_keys)
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        key = _quote_key(pos.get("symbol"), pos.get("option_type"), _position_expiration(pos), pos.get("strike"), base_dir=base_dir)
+        if not all(key) or key in covered_keys:
+            continue
+        available_expirations = sorted(expirations_by_symbol.get(key[0]) or set())
+        has_expiration = bool(key[2] and key[2] in (expirations_by_symbol.get(key[0]) or set()))
+        near_miss = find_unique_near_miss_expiration(
+            key[2],
+            contract_expiration_index.get((key[0], key[1], key[3])) or set(),
+        )
+        reasons[key] = "required_data_missing_contract" if has_expiration else "required_data_missing_expiration"
+        details[key] = {
+            "quote_key": "|".join(key),
+            "available_expirations": available_expirations[:5],
+        }
+        if near_miss:
+            details[key]["expiration_near_miss"] = {
+                "requested_expiration": key[2],
+                "matched_expiration": near_miss,
+            }
+    return reasons, details
+
+
+def _quote_observability_flags(
+    key: tuple[str, str, str, str],
+    quote: dict[str, Any] | None,
+    attempted_fetch_reasons: dict[tuple[str, str, str, str], str],
+) -> list[str]:
+    reason = attempted_fetch_reasons.get(key)
+    if not reason:
+        return []
+    if reason in {
+        "close_advice_plan_unavailable",
+        "required_data_position_not_planned",
+        "required_data_symbol_config_missing",
+        "required_data_symbol_source_unsupported",
+        "required_data_route_conflict",
+        "required_data_symbol_not_planned",
+        "required_data_snapshot_unavailable",
+    }:
+        return [reason]
+    if _quote_has_usable_price(quote):
+        return []
+    if reason == "required_data_fetch_error_rate_limit":
+        return ["required_data_fetch_error", reason]
+    if reason in {"required_data_fetch_error", "required_data_fetch_skipped_non_futu_source"}:
+        return [reason]
+    if reason.startswith("opend_fetch_error_"):
+        return ["opend_fetch_error", reason]
+    return [reason]
+
+
+def _filter_positions_by_markets(positions: list[dict[str, Any]], markets_to_run: list[str] | None) -> list[dict[str, Any]]:
+    allow = {str(x).strip().upper() for x in (markets_to_run or []) if str(x).strip()}
+    if not allow:
+        return positions
+    out: list[dict[str, Any]] = []
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        market = _market_for_symbol(pos.get("symbol"))
+        if market and market in allow:
+            out.append(pos)
+    return out
+
+
+def _build_quote_issue_samples(
+    positions: list[dict[str, Any]],
+    issue_reasons: dict[tuple[str, str, str, str], str],
+    issue_details: dict[tuple[str, str, str, str], dict[str, Any]],
+    *,
+    base_dir: Path | None = None,
+    limit: int = 3,
+) -> list[str]:
+    samples: list[str] = []
+    for pos in positions:
+        if not isinstance(pos, dict):
+            continue
+        key = _quote_key(pos.get("symbol"), pos.get("option_type"), _position_expiration(pos), pos.get("strike"), base_dir=base_dir)
+        reason = issue_reasons.get(key)
+        if not reason:
+            continue
+        opt = _norm_option_type(pos.get("option_type")) or "option"
+        exp = _position_expiration(pos) or "-"
+        strike = _num(pos.get("strike"))
+        suffix = "P" if opt == "put" else ("C" if opt == "call" else "")
+        reason_label = {
+            "required_data_missing_expiration": "缺少到期日覆盖",
+            "required_data_missing_contract": "缺少合约覆盖",
+            "required_data_fetch_error": "补拉持仓覆盖失败",
+            "required_data_fetch_error_rate_limit": "OpenD 限频",
+            "required_data_fetch_skipped_non_futu_source": "非 Futu 行情源，无法补拉持仓覆盖",
+            "opend_fetch_no_usable_quote": "无可用报价",
+            "opend_fetch_error_rate_limit": "OpenD 限频",
+            "opend_fetch_error_retry_budget": "OpenD 重试预算耗尽",
+            "opend_fetch_error": "OpenD 拉取失败",
+            "opend_fetch_skipped_non_futu_source": "非 Futu 行情源，跳过补拉",
+            "opend_fetch_skipped_missing_expiration": "缺少到期日，跳过补拉",
+            "opend_fetch_skipped_invalid_strike": "缺少有效行权价，跳过补拉",
+        }.get(reason, reason)
+        detail = issue_details.get(key) or {}
+        diag = ""
+        resolved_underlier = str(detail.get("resolved_underlier") or "").strip()
+        requested_symbol = str(detail.get("requested_symbol") or "").strip()
+        available_expirations = [str(x).strip() for x in (detail.get("available_expirations") or []) if str(x).strip()]
+        near_miss_raw = detail.get("expiration_near_miss")
+        near_miss: dict[str, Any] = near_miss_raw if isinstance(near_miss_raw, dict) else {}
+        matched_expiration = str(near_miss.get("matched_expiration") or "").strip()
+        requested_expiration = str(near_miss.get("requested_expiration") or "").strip()
+        if "rate_limit" in reason and str(detail.get("message") or "").strip():
+            diag = f" | detail={str(detail.get('message')).strip()[:80]}"
+        elif matched_expiration:
+            diag = f" | near_miss={requested_expiration or exp}->{matched_expiration}"
+        elif available_expirations:
+            diag = f" | have={','.join(available_expirations[:3])}"
+        elif str(detail.get("message") or "").strip():
+            diag = f" | detail={str(detail.get('message')).strip()[:80]}"
+        elif resolved_underlier:
+            diag = f" | opend={resolved_underlier}"
+        elif requested_symbol:
+            diag = f" | requested={requested_symbol}"
+        sample = f"{_norm_symbol(pos.get('symbol'), base_dir=base_dir)} {opt} {exp} {strike}{suffix}: {reason_label}{diag}"
+        if sample not in samples:
+            samples.append(sample)
+        if len(samples) >= max(int(limit), 0):
+            break
+    return samples
+
+
+def _mark_not_evaluable(
+    row: dict[str, Any],
+    *,
+    evaluation_status: str,
+    quote_status: str,
+    reason: str,
+) -> dict[str, Any]:
+    row["evaluation_status"] = evaluation_status
+    row["quote_status"] = quote_status
+    row["reason"] = reason
+    row["recommendation_state"] = RECOMMENDATION_NOT_EVALUABLE
+    row["decision_evidence_status"] = DECISION_EVIDENCE_NOT_EVALUABLE
+    row["decision_basis"] = evaluation_status
+    return row
+
+
+def _position_expiration(pos: dict[str, Any]) -> str | None:
+    exp = normalize_expiration(pos.get("expiration_ymd"))
+    if exp:
+        return exp
+    exp = normalize_expiration(effective_expiration_ymd(pos))
+    if exp:
+        return exp
+    return normalize_expiration(pos.get("expiration"))
+
+
+def _position_premium(pos: dict[str, Any]) -> float | None:
+    # ``note`` is not a payload key (``write-side-definition.md`` §2/§7,
+    # 2026-09-20 ruling), so it carries no ``premium_per_share`` to fall back to.
+    return safe_float(pos.get("premium"))
+
+
+def _is_supported_short_option(pos: dict[str, Any]) -> bool:
+    return (
+        str(pos.get("side") or "").strip().lower() == "short"
+        and _norm_option_type(pos.get("option_type")) in {"put", "call"}
+    )
+
+
+def _position_lifecycle(
+    pos: dict[str, Any],
+    *,
+    business_date: date,
+) -> tuple[str, int | None]:
+    expiration = _position_expiration(pos)
+    if not expiration:
+        return "unknown", None
+    try:
+        exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return "unknown", None
+    dte = (exp_date - business_date).days
+    if dte < 0:
+        return "expired_open", dte
+    if dte == 0:
+        return "expiry_day", dte
+    return "active", dte
+
+
+def _calc_dte(expiration: str | None, *, business_date: date) -> int | None:
+    if not expiration:
+        return None
+    try:
+        exp_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (exp_date - business_date).days
+
+
+def _mid_from_quote(quote: dict[str, Any] | None) -> tuple[float | None, list[str]]:
+    if not isinstance(quote, dict):
+        return None, ["missing_quote"]
+    bid = _quote_number(quote.get("bid"))
+    ask = _quote_number(quote.get("ask"))
+    if bid is None or ask is None:
+        return None, ["missing_bid_ask"]
+    if bid < 0 or ask <= 0 or ask < bid:
+        return None, ["invalid_bid_ask"]
+    return round((bid + ask) / 2, 6), ["mid_from_bid_ask"]
+
+
+def _original_dte(pos: dict[str, Any], expiration: str | None) -> int | None:
+    if not expiration:
+        return None
+    opened_at = pos.get("opened_at")
+    if opened_at in (None, ""):
+        return None
+    if isinstance(opened_at, bool):
+        return -1
+    opened_date = expiration_timestamp_to_date(opened_at)
+    if opened_date is None:
+        return -1
+    try:
+        expiration_date = datetime.strptime(expiration[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    return (expiration_date - opened_date).days
+
+
+def _position_multiplier(pos: dict[str, Any]) -> float | None:
+    if isinstance(pos.get("multiplier"), bool):
+        return None
+    return safe_float(effective_multiplier(pos))
+
+
+def _strict_fee_estimates(
+    pos: dict[str, Any],
+    *,
+    ask: float | None,
+) -> tuple[float | None, float | None, str, str | None]:
+    broker = normalize_broker(pos.get("broker"))
+    currency = normalize_currency(pos.get("currency"))
+    premium = _position_premium(pos)
+    contracts = safe_int(pos.get("contracts_open"))
+    multiplier = _position_multiplier(pos)
+    multiplier_int = safe_int(multiplier)
+    if broker != "富途":
+        return None, None, "unsupported_broker", None
+    if currency not in {"USD", "HKD"}:
+        return None, None, "unsupported_currency", None
+    if (
+        premium is None
+        or premium <= 0
+        or ask is None
+        or ask <= 0
+        or contracts is None
+        or contracts <= 0
+        or multiplier_int is None
+        or multiplier_int <= 0
+    ):
+        return None, None, "unavailable", None
+    try:
+        open_fee = calc_futu_option_fee(
+            currency,
+            premium,
+            contracts=contracts,
+            multiplier=multiplier_int,
+            is_sell=True,
+        )
+        close_fee = calc_futu_option_fee(
+            currency,
+            ask,
+            contracts=contracts,
+            multiplier=multiplier_int,
+            is_sell=False,
+        )
+    except (TypeError, ValueError):
+        return None, None, "unavailable", None
+    if currency == "HKD":
+        return (
+            float(open_fee),
+            float(close_fee),
+            "conservative_estimate",
+            FUTU_HK_OPTION_FEE_BASIS,
+        )
+    return (
+        float(open_fee),
+        float(close_fee),
+        "schedule_estimate",
+        FUTU_US_OPTION_FEE_BASIS,
+    )
+
+
+def _close_advice_calendar_evidence(
+    *,
+    requirement: Mapping[str, Any] | None,
+    quote: Mapping[str, Any] | None,
+    market: str,
+    market_date: date,
+    expiration: str | None,
+) -> tuple[dict[str, Any], bool]:
+    evidence = {
+        key: requirement.get(key)
+        for key in (
+            "trading_calendar_status", "trading_calendar_reason", "trading_calendar_market",
+            "trading_calendar_as_of_market_date", "trading_calendar_expiration",
+            "trading_calendar_request_start", "trading_calendar_request_end",
+            "trading_calendar_dates", "trading_calendar_input_hash", "trading_calendar_receipt",
+            "market_state_after_snapshot", "market_state_received_at_utc",
+        )
+    } if requirement else {"trading_calendar_status": "unavailable", "trading_calendar_reason": "calendar_plan_missing"}
+    evidence.update({"remaining_trading_sessions": None, "remaining_trading_sessions_min": None, "remaining_trading_sessions_max": None})
+    if not requirement or not quote:
+        return evidence, False
+    try:
+        snapshot = datetime.fromisoformat(str(quote["snapshot_received_at_utc"]).replace("Z", "+00:00"))
+        if (
+            snapshot.tzinfo is None
+            or str(quote.get("market") or "").upper() != market
+            or close_advice_market_date(snapshot, market) != market_date
+            or requirement.get("market") != market
+            or requirement.get("expiration") != expiration
+        ):
+            raise ValueError("snapshot_market_date_mismatch")
+    except (KeyError, ValueError, TypeError, CloseAdviceRequiredDataPlanError):
+        evidence.update({"trading_calendar_status": "unavailable", "trading_calendar_reason": "snapshot_market_date_mismatch"})
+        return evidence, False
+    if not requirement.get("trading_calendar_status"):
+        evidence.update({"trading_calendar_status": "unavailable", "trading_calendar_reason": "calendar_plan_not_enriched"})
+        return evidence, True
+    if (
+        requirement.get("trading_calendar_market") != market
+        or requirement.get("trading_calendar_as_of_market_date") != market_date.isoformat()
+        or requirement.get("trading_calendar_expiration") != expiration
+    ):
+        evidence.update({"trading_calendar_status": "unavailable", "trading_calendar_reason": "calendar_binding_mismatch"})
+        return evidence, False
+    if requirement.get("trading_calendar_status") != "ok":
+        return evidence, True
+    try:
+        start = date.fromisoformat(str(requirement["trading_calendar_request_start"]))
+        end = date.fromisoformat(str(requirement["trading_calendar_request_end"]))
+        expiry = date.fromisoformat(str(expiration))
+        days = json.loads(str(requirement["trading_calendar_dates"]))
+        receipt = requirement["trading_calendar_receipt"]
+        if (
+            start != market_date or end < expiry or not isinstance(days, list) or not days
+            or days != sorted(set(days))
+            or not isinstance(receipt, Mapping)
+            or receipt.get("retcode") != 0
+            or receipt.get("coverage_complete") is not True
+            or receipt.get("pagination_complete") is not True
+            or receipt.get("page_count") != 1
+            or not isinstance(receipt.get("row_count"), int)
+            or receipt["row_count"] < len(days)
+            or canonical_sha256({
+                "market": market, "start": start.isoformat(), "end": end.isoformat(), "dates": days,
+            }) != requirement["trading_calendar_input_hash"]
+        ):
+            raise ValueError("calendar_receipt_or_hash_mismatch")
+        parsed = [date.fromisoformat(item) for item in days]
+        if any(day.isoformat() != raw or not start <= day <= end for raw, day in zip(days, parsed)):
+            raise ValueError("calendar_date_invalid")
+        future = sum(market_date < day <= expiry for day in parsed)
+        today_in_calendar = market_date in parsed
+        include_today: bool | None = False if not today_in_calendar else None
+        state_time_raw = requirement.get("market_state_received_at_utc")
+        if today_in_calendar and state_time_raw:
+            state_time = datetime.fromisoformat(str(state_time_raw).replace("Z", "+00:00"))
+            state = str(requirement.get("market_state_after_snapshot") or "").upper()
+            if (
+                state_time.tzinfo is not None
+                and state_time >= snapshot
+                and close_advice_market_date(state_time, market) == market_date
+            ):
+                if state in {"MORNING", "AFTERNOON"}:
+                    include_today = True
+                elif state in {"CLOSED", "AFTERNOON_END", "AFTER_HOURS_BEGIN", "AFTER_HOURS_END"}:
+                    include_today = False
+        minimum = future + int(include_today is True)
+        maximum = future + int(include_today is not False and today_in_calendar)
+        evidence["remaining_trading_sessions_min"] = minimum
+        evidence["remaining_trading_sessions_max"] = maximum
+        if minimum == maximum:
+            evidence["remaining_trading_sessions"] = minimum
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError, CloseAdviceRequiredDataPlanError):
+        evidence.update({"trading_calendar_status": "unavailable", "trading_calendar_reason": "calendar_receipt_or_hash_mismatch"})
+        return evidence, False
+    return evidence, True
+
+
+def _position_to_input(
+    pos: dict[str, Any],
+    quote: dict[str, Any] | None,
+    *,
+    business_date: date,
+    calendar_evidence: Mapping[str, Any] | None = None,
+) -> tuple[CloseAdviceInput, list[str]]:
+    expiration = _position_expiration(pos)
+    mid, quote_flags = _mid_from_quote(quote)
+    bid = safe_float((quote or {}).get("bid"))
+    ask = safe_float((quote or {}).get("ask"))
+    open_fee, close_fee, fee_status, fee_basis = _strict_fee_estimates(
+        pos,
+        ask=ask,
+    )
+    return (
+        CloseAdviceInput(
+            account=normalize_account(pos.get("account")),
+            position_lot_id=str(pos.get("lot_id") or pos.get("record_id") or "").strip() or None,
+            symbol=_norm_symbol(pos.get("symbol")),
+            option_type=_norm_option_type(pos.get("option_type")),
+            side=str(pos.get("side") or "").strip().lower(),
+            expiration=expiration,
+            strike=safe_float(pos.get("strike")),
+            contracts_open=safe_int(pos.get("contracts_open")),
+            premium=_position_premium(pos),
+            bid=bid,
+            ask=ask,
+            dte=_calc_dte(expiration, business_date=business_date),
+            delta=safe_float((quote or {}).get("delta")),
+            remaining_trading_sessions=safe_int((calendar_evidence or {}).get("remaining_trading_sessions")),
+            remaining_trading_sessions_min=safe_int((calendar_evidence or {}).get("remaining_trading_sessions_min")),
+            remaining_trading_sessions_max=safe_int((calendar_evidence or {}).get("remaining_trading_sessions_max")),
+            multiplier=_position_multiplier(pos),
+            spot=safe_float((quote or {}).get("spot")),
+            currency=normalize_currency(pos.get("currency") or (quote or {}).get("currency")),
+            original_dte=_original_dte(pos, expiration),
+            estimated_open_fee=open_fee,
+            estimated_close_fee=close_fee,
+            fee_calc_status=fee_status,
+            fee_calc_basis=fee_basis,
+        ),
+        quote_flags,
+    )
+
+
+def _evaluate_position_close_advice(
+    *,
+    inp: CloseAdviceInput,
+    pos: dict[str, Any],
+    quote: dict[str, Any] | None,
+) -> dict[str, Any]:
+    del quote
+    row = evaluate_close_advice(inp)
+    row.update(
+        {
+            "broker": normalize_broker(pos.get("broker")),
+            "position_side": str(pos.get("side") or "").strip().lower(),
+            **_position_relationship_fields(pos),
+            "strategy_family": (
+                "sell_put" if inp.option_type == "put" else "covered_call"
+            ),
+            "strategy_profile": STRICT_CLOSE_POLICY_VERSION,
+        }
+    )
+    return row
+
+
+def _lifecycle_not_evaluable_row(
+    *,
+    inp: CloseAdviceInput,
+    pos: dict[str, Any],
+    config: dict[str, Any],
+    lifecycle_state: str,
+) -> dict[str, Any]:
+    reasons = {
+        "expiry_day": "持仓已到到期日，已离开提前止盈窗口，当前不请求常规平仓报价",
+        "expired_open": "持仓到期日已过但仍标记为 open，需要先核对持仓生命周期；当前不请求行情",
+        "unknown": "持仓缺少可解析到期日，当前无法确定生命周期或评估平仓建议",
+    }
+    flags = {
+        "expiry_day": "expiry_day_lifecycle",
+        "expired_open": "expired_position_marked_open",
+        "unknown": "missing_expiration",
+    }
+    row: dict[str, Any] = {
+        "account": str(inp.account or "").strip().lower(),
+        "position_lot_id": inp.position_lot_id,
+        "symbol": str(inp.symbol or "").strip().upper(),
+        "option_type": str(inp.option_type or "").strip().lower(),
+        "expiration": inp.expiration,
+        "strike": safe_float(inp.strike),
+        "contracts_open": safe_int(inp.contracts_open),
+        "premium": safe_float(inp.premium),
+        "close_mid": None,
+        "bid": None,
+        "ask": None,
+        "dte": safe_int(inp.dte),
+        "position_lifecycle_state": lifecycle_state,
+        "multiplier": safe_float(inp.multiplier),
+        "estimated_close_fee": None,
+        "fee_calc_status": "not_required",
+        "fee_calc_basis": None,
+        "estimated_pnl_if_close_net": None,
+        "spread_ratio": None,
+        "reason": reasons[lifecycle_state],
+        "evaluation_status": "not_evaluable",
+        "quote_status": "not_required" if lifecycle_state != "unknown" else "not_evaluable",
+        "data_quality_flags": flags[lifecycle_state],
+        "currency": str(inp.currency or "").strip().upper() or None,
+        "spot": safe_float(inp.spot),
+        "policy_version": STRICT_CLOSE_POLICY_VERSION,
+        "recommendation_state": RECOMMENDATION_NOT_EVALUABLE,
+        "decision_basis": flags[lifecycle_state],
+        "decision_evidence_status": DECISION_EVIDENCE_NOT_EVALUABLE,
+    }
+    del config
+    row.update(
+        {
+            "broker": normalize_broker(pos.get("broker")),
+            "position_side": str(pos.get("side") or "").strip().lower(),
+            **_position_relationship_fields(pos),
+            "strategy_family": (
+                "sell_put" if inp.option_type == "put" else "covered_call"
+            ),
+            "strategy_profile": STRICT_CLOSE_POLICY_VERSION,
+        }
+    )
+    return row
+
+
+def _position_relationship_fields(pos: dict[str, Any]) -> dict[str, str | None]:
+    return {
+        field: str(pos.get(field) or "").strip() or None
+        for field in ("strategy_group_id", "leg_role", "source_stock_lot_id")
+    }
+
+
+def _with_extra_flags(row: dict[str, Any], flags: list[str]) -> dict[str, Any]:
+    cur = [x for x in str(row.get("data_quality_flags") or "").split(";") if x]
+    for flag in flags:
+        if flag and flag not in cur:
+            cur.append(flag)
+    row["data_quality_flags"] = ";".join(cur)
+    return row
+
+
+def _money(value: Any, currency: Any) -> str:
+    v = safe_float(value)
+    if v is None:
+        return "-"
+    ccy = normalize_currency(currency)
+    prefix = "$" if ccy == "USD" else ("HK$" if ccy == "HKD" else "")
+    abs_v = abs(v)
+    fmt = f"{v:,.2f}" if abs_v < 100 else f"{v:,.0f}"
+    if prefix:
+        return f"{prefix}{fmt}"
+    return f"{fmt} {ccy}".strip()
+
+
+def _pct(value: Any) -> str:
+    v = safe_float(value)
+    if v is None:
+        return "-"
+    return f"{v * 100:.1f}%"
+
+
+def _num(value: Any) -> str:
+    v = safe_float(value)
+    if v is None:
+        return "-"
+    return f"{v:.2f}"
+
+
+def render_markdown(rows: list[dict[str, Any]], *, max_items: int) -> str:
+    selected = select_close_advice_notification_rows(
+        rows,
+        max_items_per_account=max_items,
+    )
+    if not selected:
+        return ""
+
+    grouped: OrderedDict[str, list[dict[str, Any]]] = OrderedDict()
+    for row in selected:
+        acct = _row_account(row.get("account"))
+        grouped.setdefault(acct, []).append(row)
+
+    lines: list[str] = []
+    for acct, acct_rows in grouped.items():
+        if lines:
+            lines.append("")
+        lines.append(f"### [{acct}] 提前止盈提醒")
+        for row in acct_rows:
+            opt = "Put" if str(row.get("option_type")) == "put" else "Call"
+            exp = row.get("expiration") or "-"
+            strike = _num(row.get("strike"))
+            currency = row.get("currency")
+            lines.extend(
+                [
+                    f"- {row.get('symbol')} {opt} {exp} @{strike} · 建议买回平仓",
+                    (
+                        f"- 条件: 净兑现 {_pct(row.get('net_capture_ratio'))} | "
+                        f"剩余最高年化 {_pct(row.get('remaining_max_annualized_return'))} | "
+                        f"{'Put 担保资金代理' if opt == 'Put' else 'Call 标的市值代理'} "
+                        f"{_money(row.get('capital_basis'), currency)}"
+                    ),
+                    (
+                        f"- 价格: 当前 ask={_money(row.get('ask'), currency)} | "
+                        f"全成本={_money(row.get('all_in_close_cost'), currency)} | "
+                        f"预计净锁定={_money(row.get('estimated_pnl_if_close_net'), currency)}"
+                    ),
+                    f"- 理由: {row.get('reason') or '-'}",
+                ]
+            )
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    from io import StringIO
+
+    buf = StringIO()
+    writer = csv.DictWriter(buf, fieldnames=OUTPUT_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        output = dict(row)
+        if isinstance(output.get("trading_calendar_receipt"), Mapping):
+            output["trading_calendar_receipt"] = json.dumps(
+                output["trading_calendar_receipt"], sort_keys=True, separators=(",", ":")
+            )
+        writer.writerow(output)
+    atomic_write_text(path, buf.getvalue(), encoding="utf-8")
+
+
+def _load_context(context_path: Path) -> dict[str, Any]:
+    obj = read_json(context_path, default=None)
+    return _validate_context(obj)
+
+
+def _validate_context(obj: Any) -> dict[str, Any]:
+    if not isinstance(obj, dict):
+        raise ValueError("close_advice position context is missing or malformed")
+    status = str(obj.get("context_status") or "").strip().lower()
+    ledger = obj.get("ledger") if isinstance(obj.get("ledger"), dict) else {}
+    if status == "unavailable" or bool(ledger.get("fail_closed")):
+        raise ValueError("close_advice position context is unavailable")
+    if not isinstance(obj.get("open_positions_min"), list):
+        raise ValueError("close_advice position context has no valid open_positions_min list")
+    return obj
+
+
+def _snapshot_integrity_failure_result(
+    *,
+    output_dir: Path,
+    run_id: str | None,
+    reason: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    manifest = publish_close_advice_report_status(
+        output_dir=output_dir,
+        status="failed",
+        run_id=run_id,
+        quote_mode="frozen_snapshot",
+        reason=reason,
+        evidence=evidence,
+    )
+    return {
+        "enabled": True,
+        "status": "snapshot_integrity_failed",
+        "snapshot_authority": "invalid",
+        "quote_mode": "frozen_snapshot",
+        "rows": 0,
+        "evaluable_rows": 0,
+        "evaluation_gap_rows": 0,
+        "notify_rows": 0,
+        "recommendation_counts": {},
+        "evaluation_status_counts": {},
+        "flag_counts": {"required_data_snapshot_integrity_failed": 1},
+        "quote_issue_rows": 0,
+        "quote_issue_samples": [],
+        "coverage_summary": {},
+        "quote_fetch_diagnostics": {
+            "attempted": 0,
+            "coverage_missing": 0,
+            "coverage_fetch_attempted_symbols": 0,
+            "network_fetch_attempts": 0,
+            "required_data_write_attempts": 0,
+            "position_requirements_total": 0,
+            "position_requirements_planned": 0,
+            "position_requirements_validated": 0,
+            "position_requirements_missing": 0,
+            "binding_ids": [],
+        },
+        "quote_freshness": {
+            "enforced": True,
+            "authority": "required_data_snapshot_manifest",
+            "symbols": {},
+        },
+        "report_manifest": manifest,
+        "integrity_failure": {
+            "reason": reason,
+            "evidence": dict(evidence or {}),
+        },
+        "csv": str(Path(output_dir).resolve() / "close_advice.csv"),
+        "text": str(Path(output_dir).resolve() / "close_advice.txt"),
+        "notification_text": "",
+    }
+
+
+def _frozen_position_plan_reasons(
+    *,
+    positions: list[dict[str, Any]],
+    plan: dict[str, Any] | None,
+    account: str,
+    base_dir: Path,
+) -> tuple[
+    dict[tuple[str, str, str, str], str],
+    set[str],
+]:
+    reasons: dict[tuple[str, str, str, str], str] = {}
+    symbols_to_validate: set[str] = set()
+    requirements: dict[str, dict[str, Any]] = {}
+    requirement_reasons: dict[str, str] = {}
+    account_status = "unavailable"
+    if plan is not None:
+        (
+            requirements,
+            requirement_reasons,
+            account_status,
+        ) = account_requirement_index(
+            payload=plan,
+            account=account,
+        )
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        key = _quote_key(
+            position.get("symbol"),
+            position.get("option_type"),
+            _position_expiration(position),
+            position.get("strike"),
+            base_dir=base_dir,
+        )
+        if not all(key):
+            continue
+        lot_id = str(position.get("lot_id") or position.get("record_id") or "").strip()
+        if plan is None or account_status == "unavailable":
+            reasons[key] = "close_advice_plan_unavailable"
+            continue
+        requirement = requirements.get(lot_id)
+        if requirement is None:
+            reasons[key] = "required_data_position_not_planned"
+            continue
+        if str(requirement.get("quote_key") or "") != "|".join(key):
+            reasons[key] = "required_data_position_not_planned"
+            continue
+        planning_reason = (
+            requirement_reasons.get(lot_id)
+            or str(requirement.get("planning_reason") or "").strip()
+        )
+        if (
+            str(requirement.get("planning_status") or "ready") != "ready"
+            or planning_reason
+        ):
+            reasons[key] = (
+                planning_reason or "required_data_position_not_planned"
+            )
+            continue
+        symbols_to_validate.add(key[0])
+    return reasons, symbols_to_validate
+
+
+def _validate_frozen_symbols(
+    *,
+    batch: FrozenRequiredDataBatch,
+    symbols: set[str],
+    expected_manifest_sha256: str,
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, str],
+    dict[str, bytes],
+]:
+    provenance: dict[str, dict[str, Any]] = {}
+    unavailable: dict[str, str] = {}
+    csv_bytes_by_symbol: dict[str, bytes] = {}
+    for symbol in sorted(symbols):
+        try:
+            (
+                symbol_provenance,
+                symbol_csv_bytes,
+            ) = batch.resolve(symbol)
+            if (
+                str(symbol_provenance.get("manifest_sha256") or "")
+                != expected_manifest_sha256
+            ):
+                raise RequiredDataSnapshotError(
+                    "required-data snapshot manifest changed during Close Advice"
+                )
+            provenance[symbol] = symbol_provenance
+            csv_bytes_by_symbol[symbol] = symbol_csv_bytes
+        except FrozenRequiredDataUnavailable as exc:
+            if exc.reason in {
+                "manifest_invalid",
+                "receipt_or_payload_mismatch",
+            }:
+                raise RequiredDataSnapshotError(str(exc)) from exc
+            unavailable[symbol] = (
+                "required_data_symbol_not_planned"
+                if exc.reason == "symbol_entry_missing"
+                else "required_data_snapshot_unavailable"
+            )
+    return provenance, unavailable, csv_bytes_by_symbol
+
+
+def _load_frozen_required_data_quotes(
+    *,
+    csv_bytes_by_symbol: dict[str, bytes],
+    base_dir: Path,
+) -> dict[tuple[str, str, str, str], dict[str, Any]]:
+    quotes: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for symbol in sorted(csv_bytes_by_symbol):
+        try:
+            frame = pd.read_csv(BytesIO(csv_bytes_by_symbol[symbol]))
+        except (
+            UnicodeDecodeError,
+            ValueError,
+            pd.errors.EmptyDataError,
+            pd.errors.ParserError,
+        ) as exc:
+            raise RequiredDataSnapshotError(
+                f"{symbol} sealed required-data CSV is unreadable"
+            ) from exc
+        for row in frame.to_dict("records"):
+            key = _quote_key(
+                row.get("symbol") or symbol,
+                row.get("option_type"),
+                row.get("expiration"),
+                row.get("strike"),
+                base_dir=base_dir,
+            )
+            if all(key):
+                quotes[key] = row
+    return quotes
+
+
+def _apply_required_data_row_provenance(
+    row: dict[str, Any],
+    *,
+    position: dict[str, Any],
+    quote_key: tuple[str, str, str, str] | None,
+    frozen_manifest: dict[str, Any] | None,
+    frozen_manifest_sha256: str | None,
+    frozen_plan_sha256: str | None,
+    requirements_by_lot: dict[str, dict[str, Any]],
+    provenance_by_symbol: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    row["quote_mode"] = "frozen_snapshot"
+    row["required_data_snapshot_plan_id"] = str((frozen_manifest or {}).get("plan_id") or "") or None
+    row["required_data_snapshot_manifest_sha256"] = frozen_manifest_sha256
+    row["close_advice_required_data_plan_sha256"] = frozen_plan_sha256
+    lot_id = str(position.get("lot_id") or position.get("record_id") or "").strip()
+    requirement = requirements_by_lot.get(lot_id) or {}
+    binding = requirement.get("fetch_binding") if isinstance(requirement.get("fetch_binding"), dict) else {}
+    row["required_data_requirement_id"] = str(requirement.get("requirement_id") or "") or None
+    row["required_data_binding_id"] = str(binding.get("binding_id") or "") or None
+    symbol = quote_key[0] if quote_key and all(quote_key) else ""
+    provenance = provenance_by_symbol.get(symbol) or {}
+    row["required_data_snapshot_id"] = str(provenance.get("snapshot_id") or "") or None
+    row["required_data_receipt_hash"] = str(provenance.get("receipt_hash") or "") or None
+    row["required_data_payload_sha256"] = str(provenance.get("payload_sha256") or "") or None
+    row["required_data_source_observed_at"] = str(provenance.get("source_observed_at") or "") or None
+    row["required_data_expires_at"] = str(provenance.get("expires_at") or "") or None
+    return row
+
+
+def _unlink_if_present(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def run_close_advice(
+    *,
+    config: dict[str, Any],
+    context_path: Path,
+    required_data_root: Path,
+    output_dir: Path,
+    base_dir: Path,
+    markets_to_run: list[str] | None = None,
+    required_data_snapshot_manifest: Path | None = None,
+    required_data_snapshot_run_id: str | None = None,
+    close_advice_required_data_plan: Path | None = None,
+    account: str | None = None,
+    context_override: Mapping[str, Any] | None = None,
+    required_data_snapshot_manifest_sha256: str | None = None,
+) -> dict[str, Any]:
+    advice_cfg_raw = config.get("close_advice") if isinstance(config, dict) else {}
+    advice_cfg = advice_cfg_raw if isinstance(advice_cfg_raw, dict) else {}
+    output_dir = Path(output_dir).resolve()
+    csv_path = output_dir / "close_advice.csv"
+    text_path = output_dir / "close_advice.txt"
+    quote_mode = "frozen_snapshot"
+
+    if not bool(advice_cfg.get("enabled", False)):
+        report_manifest = publish_close_advice_report_status(
+            output_dir=output_dir,
+            status="failed",
+            run_id=required_data_snapshot_run_id,
+            quote_mode=quote_mode,
+            reason="close_advice_disabled",
+        )
+        _write_csv(csv_path, [])
+        atomic_write_text(text_path, "", encoding="utf-8")
+        return {
+            "enabled": False,
+            "status": "disabled",
+            "rows": 0,
+            "notify_rows": 0,
+            "report_manifest": report_manifest,
+            "csv": str(csv_path),
+            "text": str(text_path),
+            "notification_text": "",
+        }
+
+    publish_close_advice_report_status(
+        output_dir=output_dir,
+        status="pending",
+        run_id=required_data_snapshot_run_id,
+        quote_mode=quote_mode,
+    )
+    frozen_manifest_path = (
+        Path(required_data_snapshot_manifest).resolve() if required_data_snapshot_manifest is not None else None
+    )
+    frozen_plan: dict[str, Any] | None = None
+    frozen_plan_path: Path | None = None
+    frozen_manifest_payload: dict[str, Any] | None = None
+    frozen_required_data_batch: FrozenRequiredDataBatch | None = None
+    frozen_manifest_sha256: str | None = None
+    frozen_plan_sha256: str | None = None
+    try:
+        run_id = str(required_data_snapshot_run_id or "").strip()
+        if not run_id or frozen_manifest_path is None:
+            raise RequiredDataSnapshotError("frozen Close Advice run identity is unavailable")
+        frozen_required_data_batch = resolve_frozen_required_data_csv_bytes_batch(
+            manifest_path=frozen_manifest_path,
+            expected_run_id=run_id,
+            required_data_root=Path(required_data_root),
+        )
+        frozen_manifest_payload = frozen_required_data_batch.manifest
+        frozen_manifest_bytes = frozen_required_data_batch.manifest_bytes
+        frozen_manifest_sha256 = sha256_bytes(frozen_manifest_bytes)
+        expected_manifest_sha256 = str(required_data_snapshot_manifest_sha256 or "").strip().lower()
+        if expected_manifest_sha256 and expected_manifest_sha256 != frozen_manifest_sha256:
+            raise RequiredDataSnapshotError("required-data snapshot manifest generation mismatch")
+        bound_plan = resolve_bound_close_advice_required_data_plan_snapshot(
+            manifest_path=frozen_manifest_path,
+            manifest=frozen_manifest_payload,
+            expected_run_id=run_id,
+            expected_plan_path=close_advice_required_data_plan,
+        )
+        if bound_plan is None:
+            raise CloseAdviceRequiredDataPlanError("close-advice required-data plan is unavailable")
+        frozen_plan, frozen_plan_path, frozen_plan_bytes = bound_plan
+        frozen_plan_sha256 = sha256_bytes(frozen_plan_bytes)
+        market_dates = {
+            market: date.fromisoformat(frozen_plan["as_of_market_dates"][market]) for market in ("US", "HK")
+        }
+    except (
+        OSError,
+        ValueError,
+        FrozenRequiredDataUnavailable,
+        RequiredDataSnapshotError,
+        CloseAdviceRequiredDataPlanError,
+    ) as exc:
+        return _snapshot_integrity_failure_result(
+            output_dir=output_dir,
+            run_id=required_data_snapshot_run_id,
+            reason="required_data_snapshot_integrity_failed",
+            evidence={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+    business_date = market_dates["HK"]  # Legacy report metadata; per-lot dates govern decisions.
+    ctx = _validate_context(dict(context_override)) if context_override is not None else _load_context(context_path)
+    account_norm = normalize_account(account) or normalize_account(
+        ((ctx.get("filters") or {}) if isinstance(ctx, dict) else {}).get("account")
+    )
+    positions = ctx.get("open_positions_min") if isinstance(ctx, dict) else []
+    positions = positions if isinstance(positions, list) else []
+    positions = _filter_positions_by_markets(positions, markets_to_run)
+    positions = [pos for pos in positions if isinstance(pos, dict) and _is_supported_short_option(pos)]
+    seen_lots: set[tuple[str, str]] = set()
+    for pos in positions:
+        account_key = normalize_account(pos.get("account"))
+        lot_id = str(pos.get("lot_id") or pos.get("record_id") or "").strip()
+        if not account_key or not lot_id:
+            continue
+        key = (account_key, lot_id)
+        if key in seen_lots:
+            raise ValueError("close_advice position context has duplicate account/lot_id")
+        seen_lots.add(key)
+    position_entries = [
+        (
+            pos,
+            *_position_lifecycle(
+                pos, business_date=market_dates.get(_market_for_symbol(pos.get("symbol")), business_date)
+            ),
+        )
+        for pos in positions
+        if isinstance(pos, dict)
+    ]
+    coverage_positions = [
+        pos for pos, lifecycle_state, _dte in position_entries if lifecycle_state in {"active", "unknown"}
+    ]
+    quote_positions = [pos for pos, lifecycle_state, _dte in position_entries if lifecycle_state == "active"]
+    frozen_plan_reasons: dict[
+        tuple[str, str, str, str],
+        str,
+    ] = {}
+    frozen_provenance: dict[str, dict[str, Any]] = {}
+    frozen_requirements_by_lot: dict[str, dict[str, Any]] = {}
+    frozen_requirements_by_lot, _requirement_reasons, _account_status = account_requirement_index(
+        payload=frozen_plan,
+        account=account_norm or "",
+    )
+    frozen_plan_reasons, symbols_to_validate = _frozen_position_plan_reasons(
+        positions=quote_positions,
+        plan=frozen_plan,
+        account=account_norm or "",
+        base_dir=Path(base_dir),
+    )
+    try:
+        assert frozen_manifest_path is not None
+        assert frozen_required_data_batch is not None
+        (
+            frozen_provenance,
+            frozen_symbol_unavailable,
+            frozen_csv_bytes_by_symbol,
+        ) = _validate_frozen_symbols(
+            batch=frozen_required_data_batch,
+            symbols=symbols_to_validate,
+            expected_manifest_sha256=str(frozen_manifest_sha256),
+        )
+        quotes = _load_frozen_required_data_quotes(
+            csv_bytes_by_symbol=frozen_csv_bytes_by_symbol,
+            base_dir=Path(base_dir),
+        )
+    except RequiredDataSnapshotError as exc:
+        return _snapshot_integrity_failure_result(
+            output_dir=output_dir,
+            run_id=required_data_snapshot_run_id,
+            reason="required_data_snapshot_integrity_failed",
+            evidence={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+    for position in quote_positions:
+        key = _quote_key(
+            position.get("symbol"),
+            position.get("option_type"),
+            _position_expiration(position),
+            position.get("strike"),
+            base_dir=Path(base_dir),
+        )
+        if all(key) and key not in frozen_plan_reasons and key[0] in frozen_symbol_unavailable:
+            frozen_plan_reasons[key] = frozen_symbol_unavailable[key[0]]
+    covered_keys = set(quotes)
+    expirations_by_symbol: dict[str, set[str]] = {}
+    for symbol, _option_type, expiration, _strike in covered_keys:
+        expirations_by_symbol.setdefault(symbol, set()).add(expiration)
+    quote_freshness_by_symbol = {
+        symbol: {
+            "ok": True,
+            "authority": "required_data_snapshot_manifest",
+            **dict(provenance),
+        }
+        for symbol, provenance in frozen_provenance.items()
+    }
+    coverage_reasons, coverage_details = _classify_required_data_coverage(
+        coverage_positions,
+        covered_keys,
+        expirations_by_symbol,
+        base_dir=Path(base_dir),
+    )
+    issue_reasons = {
+        **coverage_reasons,
+        **frozen_plan_reasons,
+    }
+    issue_details = coverage_details
+
+    rows: list[dict[str, Any]] = []
+    evaluation_status_counts: dict[str, int] = {}
+    for pos0, lifecycle_state, _lifecycle_dte in position_entries:
+        exp = _position_expiration(pos0)
+        if lifecycle_state != "active":
+            inp, _quote_flags = _position_to_input(
+                pos0,
+                None,
+                business_date=market_dates.get(_market_for_symbol(pos0.get("symbol")), business_date),
+            )
+            row = _lifecycle_not_evaluable_row(
+                inp=inp,
+                pos=pos0,
+                config=config,
+                lifecycle_state=lifecycle_state,
+            )
+            row = _apply_required_data_row_provenance(
+                row,
+                position=pos0,
+                quote_key=_quote_key(
+                    pos0.get("symbol"),
+                    pos0.get("option_type"),
+                    exp,
+                    pos0.get("strike"),
+                    base_dir=Path(base_dir),
+                ),
+                frozen_manifest=frozen_manifest_payload,
+                frozen_manifest_sha256=frozen_manifest_sha256,
+                frozen_plan_sha256=frozen_plan_sha256,
+                requirements_by_lot=frozen_requirements_by_lot,
+                provenance_by_symbol=frozen_provenance,
+            )
+            status = str(row.get("evaluation_status") or "unknown").strip().lower() or "unknown"
+            evaluation_status_counts[status] = evaluation_status_counts.get(status, 0) + 1
+            rows.append(row)
+            continue
+
+        key = _quote_key(pos0.get("symbol"), pos0.get("option_type"), exp, pos0.get("strike"), base_dir=Path(base_dir))
+        quote = quotes.get(key)
+        lot_id = str(pos0.get("lot_id") or pos0.get("record_id") or "").strip()
+        market = _market_for_symbol(pos0.get("symbol"))
+        calendar_evidence, snapshot_aligned = _close_advice_calendar_evidence(
+            requirement=frozen_requirements_by_lot.get(lot_id),
+            quote=quote,
+            market=market,
+            market_date=market_dates.get(market, business_date),
+            expiration=exp,
+        )
+        inp, quote_flags = _position_to_input(
+            pos0,
+            quote,
+            business_date=market_dates.get(market, business_date),
+            calendar_evidence=calendar_evidence,
+        )
+        row = _evaluate_position_close_advice(
+            inp=inp,
+            pos=pos0,
+            quote=quote,
+        )
+        row["position_lifecycle_state"] = lifecycle_state
+        row.update(calendar_evidence)
+        row = _apply_required_data_row_provenance(
+            row,
+            position=pos0,
+            quote_key=key,
+            frozen_manifest=frozen_manifest_payload,
+            frozen_manifest_sha256=frozen_manifest_sha256,
+            frozen_plan_sha256=frozen_plan_sha256,
+            requirements_by_lot=frozen_requirements_by_lot,
+            provenance_by_symbol=frozen_provenance,
+        )
+        row = _with_extra_flags(row, quote_flags)
+        if not snapshot_aligned:
+            row = _mark_not_evaluable(
+                row,
+                evaluation_status="not_evaluable",
+                quote_status="not_evaluable",
+                reason="当前缺少同次封存且市场日期一致的行情与日历证据",
+            )
+        row = _with_extra_flags(row, _quote_observability_flags(key, quote, issue_reasons))
+        issue_reason = str(issue_reasons.get(key) or "").strip()
+        if issue_reason.startswith("required_data_") or issue_reason == "close_advice_plan_unavailable":
+            row = _mark_not_evaluable(
+                row,
+                evaluation_status="coverage_missing",
+                quote_status="coverage_missing",
+                reason="持仓对应合约未完成行情覆盖，当前无法评估平仓建议",
+            )
+        elif issue_reason:
+            row = _mark_not_evaluable(
+                row,
+                evaluation_status="quote_unusable",
+                quote_status="quote_unusable",
+                reason="持仓对应合约已定位，但当前未取得可用价格，暂无法评估平仓建议",
+            )
+        elif str(row.get("recommendation_state") or "").strip().lower() == RECOMMENDATION_NOT_EVALUABLE:
+            row["evaluation_status"] = "not_evaluable"
+            row["quote_status"] = "not_evaluable"
+        else:
+            row["evaluation_status"] = "priced"
+            row["quote_status"] = "priced"
+        status = str(row.get("evaluation_status") or "unknown").strip().lower() or "unknown"
+        evaluation_status_counts[status] = evaluation_status_counts.get(status, 0) + 1
+        rows.append(row)
+
+    rows = sort_advice_rows(rows)
+    max_items_raw = safe_int(advice_cfg.get("max_items_per_account"))
+    max_items = 5 if max_items_raw is None else max_items_raw
+    text = render_markdown(
+        rows,
+        max_items=max_items,
+    )
+    selected_notify_rows = select_close_advice_notification_rows(
+        rows,
+        max_items_per_account=max_items,
+    )
+    flag_counts: dict[str, int] = {}
+    recommendation_counts: dict[str, int] = {}
+    quote_issue_rows = 0
+    evaluation_gap_rows = 0
+    for row in rows:
+        if str(row.get("evaluation_status") or "").strip().lower() == "priced":
+            recommendation = str(row.get("recommendation_state") or "").strip().lower() or "unknown"
+            recommendation_counts[recommendation] = recommendation_counts.get(recommendation, 0) + 1
+        else:
+            evaluation_gap_rows += 1
+        flags = [x for x in str(row.get("data_quality_flags") or "").split(";") if x]
+        if any(flag in QUOTE_ISSUE_FLAGS for flag in flags):
+            quote_issue_rows += 1
+        for flag in flags:
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    attempt_csv_path: Path | None = None
+    attempt_text_path: Path | None = None
+    write_csv_path = csv_path
+    write_text_path = text_path
+    attempt_id = uuid4().hex
+    attempt_csv_path = output_dir / f".close_advice.{attempt_id}.csv.tmp"
+    attempt_text_path = output_dir / f".close_advice.{attempt_id}.txt.tmp"
+    write_csv_path = attempt_csv_path
+    write_text_path = attempt_text_path
+
+    _write_csv(write_csv_path, rows)
+    atomic_write_text(write_text_path, text, encoding="utf-8")
+    try:
+        assert frozen_manifest_path is not None
+        revalidated_batch = resolve_frozen_required_data_csv_bytes_batch(
+            manifest_path=frozen_manifest_path,
+            expected_run_id=str(required_data_snapshot_run_id or ""),
+            required_data_root=Path(required_data_root),
+        )
+        manifest_now = revalidated_batch.manifest
+        manifest_bytes_now = revalidated_batch.manifest_bytes
+        manifest_hash_now = sha256_bytes(manifest_bytes_now)
+        if manifest_hash_now != frozen_manifest_sha256:
+            raise RequiredDataSnapshotError("required-data snapshot manifest changed during Close Advice")
+        plan_now = resolve_bound_close_advice_required_data_plan_snapshot(
+            manifest_path=frozen_manifest_path,
+            manifest=manifest_now,
+            expected_run_id=str(required_data_snapshot_run_id or ""),
+            expected_plan_path=frozen_plan_path,
+        )
+        if plan_now is None:
+            raise CloseAdviceRequiredDataPlanError("close-advice required-data plan binding changed")
+        plan_payload_now, _plan_path_now, plan_bytes_now = plan_now
+        if (
+            str(plan_payload_now.get("content_sha256") or "") != str(frozen_plan.get("content_sha256") or "")
+            or sha256_bytes(plan_bytes_now) != frozen_plan_sha256
+        ):
+            raise CloseAdviceRequiredDataPlanError("close-advice required-data plan changed during evaluation")
+        (
+            _revalidated,
+            unavailable_now,
+            _revalidated_csv_bytes,
+        ) = _validate_frozen_symbols(
+            batch=revalidated_batch,
+            symbols=symbols_to_validate,
+            expected_manifest_sha256=str(frozen_manifest_sha256),
+        )
+        if unavailable_now != frozen_symbol_unavailable:
+            raise RequiredDataSnapshotError("required-data symbol authority changed during Close Advice")
+        assert attempt_csv_path is not None
+        assert attempt_text_path is not None
+        os.replace(attempt_csv_path, csv_path)
+        os.replace(attempt_text_path, text_path)
+    except (
+        OSError,
+        FrozenRequiredDataUnavailable,
+        RequiredDataSnapshotError,
+        CloseAdviceRequiredDataPlanError,
+    ) as exc:
+        _unlink_if_present(attempt_csv_path)
+        _unlink_if_present(attempt_text_path)
+        return _snapshot_integrity_failure_result(
+            output_dir=output_dir,
+            run_id=required_data_snapshot_run_id,
+            reason="required_data_snapshot_integrity_failed",
+            evidence={
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            },
+        )
+    report_manifest = publish_close_advice_report_manifest(
+        csv_path=csv_path,
+        text_path=text_path,
+        context_path=context_path,
+        context=ctx,
+        rows=rows,
+        markets_to_run=markets_to_run,
+        run_id=required_data_snapshot_run_id,
+        quote_mode=quote_mode,
+        required_data_snapshot_manifest_sha256=(frozen_manifest_sha256),
+        close_advice_required_data_plan_sha256=(frozen_plan_sha256),
+    )
+    quote_issue_samples = _build_quote_issue_samples(
+        coverage_positions,
+        issue_reasons,
+        issue_details,
+        base_dir=Path(base_dir),
+    )
+    coverage_summary = {
+        "covered_contracts": len(covered_keys),
+        "positions_missing_expiration": sum(
+            1 for reason in coverage_reasons.values() if reason == "required_data_missing_expiration"
+        ),
+        "positions_missing_contract": sum(
+            1 for reason in coverage_reasons.values() if reason == "required_data_missing_contract"
+        ),
+        "expiration_near_miss_count": sum(
+            1
+            for detail in coverage_details.values()
+            if isinstance(detail, dict) and isinstance(detail.get("expiration_near_miss"), dict)
+        ),
+        "coverage_fetch_attempted_symbols": 0,
+        "coverage_fetch_errors": 0,
+    }
+    frozen_requirements_validated = 0
+    frozen_binding_ids: set[str] = set()
+    for requirement in frozen_requirements_by_lot.values():
+        binding = requirement.get("fetch_binding") if isinstance(requirement.get("fetch_binding"), dict) else {}
+        binding_id = str(binding.get("binding_id") or "").strip()
+        if binding_id:
+            frozen_binding_ids.add(binding_id)
+    for position in quote_positions:
+        lot_id = str(position.get("lot_id") or position.get("record_id") or "").strip()
+        requirement = frozen_requirements_by_lot.get(lot_id)
+        key = _quote_key(
+            position.get("symbol"),
+            position.get("option_type"),
+            _position_expiration(position),
+            position.get("strike"),
+            base_dir=Path(base_dir),
+        )
+        if (
+            requirement is not None
+            and str(requirement.get("planning_status") or "") == "ready"
+            and all(key)
+            and key in covered_keys
+            and key[0] in frozen_provenance
+        ):
+            frozen_requirements_validated += 1
+
+    return {
+        "enabled": True,
+        "status": ("degraded" if evaluation_gap_rows > 0 else "ok"),
+        "snapshot_authority": "valid",
+        "quote_mode": quote_mode,
+        "rows": len(rows),
+        "evaluable_rows": sum(1 for row in rows if str(row.get("evaluation_status") or "").strip().lower() == "priced"),
+        "evaluation_gap_rows": evaluation_gap_rows,
+        "notify_rows": len(selected_notify_rows),
+        "recommendation_counts": recommendation_counts,
+        "evaluation_status_counts": evaluation_status_counts,
+        "flag_counts": flag_counts,
+        "quote_issue_rows": quote_issue_rows,
+        "quote_issue_samples": quote_issue_samples,
+        "coverage_summary": coverage_summary,
+        "quote_fetch_diagnostics": {
+            "attempted": 0,
+            "coverage_missing": len(coverage_reasons),
+            "coverage_fetch_attempted_symbols": 0,
+            "network_fetch_attempts": 0,
+            "required_data_write_attempts": 0,
+            "position_requirements_total": len(quote_positions),
+            "position_requirements_planned": len(frozen_requirements_by_lot),
+            "position_requirements_validated": frozen_requirements_validated,
+            "position_requirements_missing": max(
+                0,
+                len(quote_positions) - frozen_requirements_validated,
+            ),
+            "binding_ids": sorted(frozen_binding_ids),
+        },
+        "quote_freshness": {
+            "enforced": True,
+            "authority": "required_data_snapshot_manifest",
+            "max_age_sec": None,
+            "symbols": quote_freshness_by_symbol,
+        },
+        "required_data_snapshot_manifest_sha256": (frozen_manifest_sha256),
+        "close_advice_required_data_plan_sha256": frozen_plan_sha256,
+        "business_date": business_date.isoformat(),
+        "as_of_market_dates": {market: day.isoformat() for market, day in market_dates.items()},
+        "report_manifest": report_manifest,
+        "csv": str(csv_path),
+        "text": str(text_path),
+        "notification_text": text,
+    }

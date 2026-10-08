@@ -1,0 +1,104 @@
+name: Reusable Release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      target_commitish:
+        required: false
+        type: string
+        default: ""
+      run_regression_gates:
+        required: false
+        type: boolean
+        default: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          bash scripts/install_agent_plugin.sh
+          ./.venv/bin/pip install pytest
+
+      - name: Python Bot release gate
+        if: ${{ inputs.run_regression_gates }}
+        run: |
+          ./.venv/bin/python -m pytest tests/test_bot_python_runtime.py
+          ./.venv/bin/python -m pytest \
+            tests/test_bot_phase1.py \
+            tests/test_bot_conversation_memory.py \
+            tests/test_bot_p1_eval.py \
+            tests/test_install_script.py \
+            tests/test_release_test_plan.py \
+            tests/bot_eval/test_answer_quality.py
+
+      - name: Validate release metadata
+        run: |
+          chmod +x ./om-agent
+          ./.venv/bin/python scripts/release_check.py --tag "${{ inputs.tag }}" --require-current-taxonomy --require-delta-coverage --render-notes-out /tmp/release-notes.md
+          ./.venv/bin/python scripts/generate_dependency_graph.py --check
+          ./om-agent spec > /tmp/om-agent-spec.json
+
+      - name: Smoke and plugin tests
+        if: ${{ inputs.run_regression_gates }}
+        run: |
+          ./.venv/bin/python tests/run_smoke.py
+          ./.venv/bin/python -m pytest tests/test_agent_plugin_contract.py tests/test_agent_plugin_smoke.py
+          ./.venv/bin/python -m pytest tests/test_release_check.py tests/test_release_delta_coverage.py tests/test_release_version_recommendation.py tests/test_version_check.py
+          ./.venv/bin/python -m pytest tests/test_research.py tests/test_research_archive.py
+
+      - name: Configuration and control-plane release gate
+        if: ${{ inputs.run_regression_gates }}
+        run: |
+          ./.venv/bin/python -m pytest \
+            tests/test_config_yaml.py \
+            tests/test_config_template_inheritance.py \
+            tests/test_config_authoring_transaction.py \
+            tests/test_runtime_config_identity.py \
+            tests/*/test_service_deploy_*.py \
+            tests/test_inbound_control.py \
+            tests/test_setup_check.py \
+            tests/test_cli_operator_commands.py
+
+      - name: Build source archive
+        run: |
+          git archive --format=tar.gz --output options-monitor-${{ inputs.tag }}.tar.gz HEAD
+
+      - name: Verify source archive Python Bot
+        run: |
+          CHECKOUT_PYTHON="${{ github.workspace }}/.venv/bin/python"
+          ARCHIVE_ROOT="$(mktemp -d "${RUNNER_TEMP}/options-monitor-archive.XXXXXX")"
+          tar -xzf "options-monitor-${{ inputs.tag }}.tar.gz" -C "${ARCHIVE_ROOT}"
+          cd "${ARCHIVE_ROOT}"
+          "${CHECKOUT_PYTHON}" -c 'import src.application.bot.host; import src.application.bot.runtime'
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          target_commitish: ${{ inputs.target_commitish || github.sha }}
+          body_path: /tmp/release-notes.md
+          files: |
+            options-monitor-${{ inputs.tag }}.tar.gz
+            /tmp/om-agent-spec.json
+            VERSION

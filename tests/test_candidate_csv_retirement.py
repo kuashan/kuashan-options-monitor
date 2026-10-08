@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import inspect
+from pathlib import Path
+
+import pytest
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PRODUCTION_ROOTS = (ROOT / "src", ROOT / "scripts")
+LEGACY_METADATA_CLASSIFIERS = {
+    ROOT / "src" / "application" / "candidate_evidence_history.py",
+    ROOT / "src" / "application" / "research" / "archive.py",
+}
+LEGACY_STATUS_VERSION_BOUNDARIES = LEGACY_METADATA_CLASSIFIERS | {
+    ROOT / "src" / "application" / "candidate_snapshot_contract.py",
+    ROOT / "src" / "application" / "candidate_snapshot_manifest.py",
+    ROOT / "src" / "application" / "strategy_scan_status.py",
+}
+RETIRED_CANDIDATE_WRITER_NAMES = (
+    "publish_candidate_snapshot_manifest_v3",
+    "publish_strategy_scan_status_index_v2",
+    "publish_strategy_scan_status_index_v4",
+    "seal_experience_candidate_bundle",
+)
+RETIRED_CANDIDATE_CSV_FRAGMENTS = (
+    "_candidates.csv", "_candidates_labeled.csv", "_candidates_reject_log.csv", "_reject_log.csv",
+    "_pair_diagnostics.csv", "_rank_shadow.csv", "_put_universe.csv", "_put_universe_labeled.csv",
+    "_put_universe_cash_filtered.csv", "_put_universe_underwritten.csv", "sell_put_linked_calls.csv",
+)
+
+
+def _output_adapter_params(*extra: str) -> set[str]:
+    """Retired CSV output-adapter parameters that must stay out of a producer signature."""
+    return {"output", "output_path", *extra}
+
+
+def _production_python_files() -> list[Path]:
+    return sorted(
+        path
+        for root in PRODUCTION_ROOTS
+        for path in root.rglob("*.py")
+        if "__pycache__" not in path.parts
+    )
+
+
+def test_retired_candidate_csv_names_exist_only_in_metadata_classifiers() -> None:
+    violations: list[str] = []
+    for path in _production_python_files():
+        text = path.read_text(encoding="utf-8").lower()
+        matches = [item for item in RETIRED_CANDIDATE_CSV_FRAGMENTS if item in text]
+        if matches and path not in LEGACY_METADATA_CLASSIFIERS:
+            violations.append(f"{path.relative_to(ROOT)}: {', '.join(matches)}")
+
+    assert violations == []
+
+
+def test_legacy_candidate_metadata_classifiers_never_parse_csv_bytes() -> None:
+    for path in LEGACY_METADATA_CLASSIFIERS:
+        text = path.read_text(encoding="utf-8")
+        assert "read_csv(" not in text
+        assert "to_csv(" not in text
+
+
+def test_candidate_producers_have_no_csv_output_adapter_parameters() -> None:
+    from src.application.cc_lp_steps import run_cc_lp_scan
+    from src.application.combo_yield_steps import (
+        run_cc_lp_variant,
+        run_combo_yield_scan_and_summarize,
+    )
+    from src.application.scan_sell_call import run_sell_call_scan
+    from src.application.scan_sell_put import run_sell_put_scan
+    from src.application.sell_call_steps import run_sell_call_scan_and_summarize
+    from src.application.sell_put_call_helper import find_sell_put_combo_yield_pairs
+    from src.application.sell_put_cash import enrich_sell_put_candidates_with_cash
+    from src.application.sell_put_steps import run_sell_put_scan_and_summarize
+
+    forbidden_by_callable = {
+        run_sell_put_scan: _output_adapter_params("reject_log", "reject_log_output", "reject_log_path"),
+        run_sell_call_scan: _output_adapter_params("reject_log", "reject_log_output", "reject_log_path",
+                                                   "shares_available_for_cover"),
+        run_sell_put_scan_and_summarize: {
+            "base",
+            "report_dir",
+            "symbol_lower",
+            "yield_enhancement_sell_put_cfg",
+        },
+        run_sell_call_scan_and_summarize: {"base", "report_dir", "symbol_lower"},
+        run_combo_yield_scan_and_summarize: {
+            "sell_put_labeled_path",
+            "label_put_candidates_fn",
+            "attach_calls_fn",
+        },
+        run_cc_lp_variant: {"report_dir", "output", "output_path"},
+        run_cc_lp_scan: {"report_dir", "output", "output_path"},
+        find_sell_put_combo_yield_pairs: {"output", "output_path"},
+        enrich_sell_put_candidates_with_cash: {"out_path", "output", "output_path"},
+    }
+    for callable_obj, forbidden in forbidden_by_callable.items():
+        parameters = set(inspect.signature(callable_obj).parameters)
+        assert parameters.isdisjoint(forbidden), callable_obj.__qualname__
+
+
+@pytest.mark.parametrize(
+    ("module_name", "argv"),
+    (
+        (
+            "src.application.scan_sell_put",
+            ["--symbols", "NVDA", "--min-annualized-net-return", "0.1"],
+        ),
+        (
+            "src.application.scan_sell_call",
+            ["--symbols", "NVDA", "--avg-cost", "100", "--shares", "100", "--shares-can-sell", "100",
+             "--shares-locked", "0", "--min-annualized-net-return", "0.1"],
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "retired_args",
+    (
+        ("--output", "retired.csv"),
+        ("--reject-log-output", "retired.csv"),
+        ("--quiet",),
+    ),
+)
+def test_scanner_cli_rejects_retired_candidate_csv_flags(
+    module_name: str,
+    argv: list[str],
+    retired_args: tuple[str, ...],
+) -> None:
+    module = __import__(module_name, fromlist=["parse_args"])
+    with pytest.raises(SystemExit):
+        module.parse_args([*argv, *retired_args])
+
+
+def test_removed_csv_only_adapters_stay_absent() -> None:
+    for relative in (
+        "src/application/render_sell_put_alerts.py",
+        "src/application/render_sell_call_alerts.py",
+        "src/application/portfolio_capacity_shadow.py",
+    ):
+        assert not (ROOT / relative).exists()
+
+
+def test_combo_output_mode_exists_only_as_a_targeted_validation_error() -> None:
+    matches = []
+    for path in (ROOT / "src" / "application").rglob("*.py"):
+        if "output_mode" in path.read_text(encoding="utf-8"):
+            matches.append(path.relative_to(ROOT).as_posix())
+    assert matches == ["src/application/config_validator.py"]
+
+
+def test_allow_stale_config_cannot_revive_removed_combo_output_mode() -> None:
+    from src.application.config_validator import (
+        validate_resolved_watchlist_item_runtime_config,
+    )
+
+    resolved = {
+        "symbol": "NVDA",
+        "sell_put": {"enabled": True},
+        "sell_call": {"enabled": False},
+        "combo_yield": {"enabled": True, "output_mode": "separate"},
+    }
+    with pytest.raises(SystemExit, match="output_mode has been removed"):
+        validate_resolved_watchlist_item_runtime_config(resolved)
+
+
+def test_v1_strategy_status_name_exists_only_in_history_or_rejection_boundaries() -> None:
+    matches = []
+    for path in (ROOT / "src" / "application").rglob("*.py"):
+        if "strategy_scan_status_index.v1" in path.read_text(encoding="utf-8"):
+            matches.append(path)
+    assert set(matches) == LEGACY_STATUS_VERSION_BOUNDARIES
+
+
+def test_retired_candidate_writers_are_absent_from_production() -> None:
+    violations: list[str] = []
+    for path in _production_python_files():
+        text = path.read_text(encoding="utf-8")
+        for name in RETIRED_CANDIDATE_WRITER_NAMES:
+            if name in text:
+                violations.append(f"{path.relative_to(ROOT)}: {name}")
+    assert violations == []
+
+
+def test_candidate_producers_do_not_delete_versioned_artifacts() -> None:
+    producer_paths = (
+        ROOT / "src" / "application" / "candidate_snapshot_manifest.py",
+        ROOT / "src" / "application" / "strategy_scan_status.py",
+        ROOT / "src" / "application" / "opening_candidate_snapshot.py",
+        ROOT / "src" / "application" / "combo_yield_candidate_snapshot.py",
+        ROOT / "src" / "application" / "cc_lp_candidate_snapshot.py",
+        ROOT / "src" / "application" / "experience_candidate_snapshot.py",
+        ROOT / "src" / "application" / "wheel" / "candidate_snapshot.py",
+    )
+    for path in producer_paths:
+        text = path.read_text(encoding="utf-8")
+        assert ".unlink(" not in text, path.relative_to(ROOT)
+        assert "os.remove(" not in text, path.relative_to(ROOT)

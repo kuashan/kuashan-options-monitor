@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+import re
+from typing import Any
+
+
+OPTION_CODE_RE = re.compile(
+    r"^(?P<market>[A-Z]{2})\.(?P<root>[A-Z0-9]+)(?P<yy>\d{2})(?P<mm>\d{2})(?P<dd>\d{2})(?P<cp>[CP])(?P<strike>\d+)$"
+)
+OPTION_COMPACT_RE = re.compile(r"\d{6}[CP]\d{5,}")
+OPTION_DISPLAY_RE = re.compile(
+    r"(?:^|\s)(?:[A-Z][A-Z0-9.\-]*\s+)?\d{6}\s+\d+(?:\.\d+)?\s*[CP](?:\s|$)"
+)
+_US_SYMBOL_RE = re.compile(r"^[A-Z][A-Z0-9\.-]{0,10}$")
+_UNDERLIER_ALIAS_FALLBACKS = {
+    "TCH": "0700.HK",
+    "腾讯": "0700.HK",
+    "腾讯控股": "0700.HK",
+    "POP": "9992.HK",
+    "泡泡玛特": "9992.HK",
+    "MET": "3690.HK",
+    "美团": "3690.HK",
+    "美团W": "3690.HK",
+    "美团-W": "3690.HK",
+    "HK.CNC": "0883.HK",
+    "中海油": "0883.HK",
+    "中国海洋石油": "0883.HK",
+}
+SymbolAliases = Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class SymbolIdentity:
+    raw: str
+    canonical: str
+    market: str
+    currency: str
+    futu_code: str
+    source_kind: str
+
+
+def _explicit_alias_value(symbol_aliases: SymbolAliases, candidate: str) -> str | None:
+    if not isinstance(symbol_aliases, Mapping):
+        return None
+    raw = str(candidate or "").strip()
+    if not raw:
+        return None
+    keys = (raw, raw.upper())
+    for key in keys:
+        value = symbol_aliases.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    upper = raw.upper()
+    for key, value in symbol_aliases.items():
+        if str(key or "").strip().upper() == upper and value not in (None, ""):
+            return str(value).strip()
+    return None
+
+
+def _normalize_hk_symbol(raw: str) -> str | None:
+    upper = str(raw or "").strip().upper()
+    if not upper:
+        return None
+    if upper.endswith(".HK"):
+        num = upper[:-3]
+        if num.isdigit():
+            return f"{int(num):04d}.HK"
+    if upper.startswith("HK."):
+        num = upper[3:]
+        if num.isdigit():
+            return f"{int(num):04d}.HK"
+    if upper.isdigit() and len(upper) <= 5:
+        return f"{int(upper):04d}.HK"
+    return None
+
+
+def _display_name_candidates(raw: str) -> list[str]:
+    out: list[str] = []
+    text = str(raw or "").strip()
+    if not text:
+        return out
+
+    token = re.split(r"[\s,，]+", text, maxsplit=1)[0].strip()
+    if token:
+        out.append(token)
+
+    date_match = re.search(r"(?:20)?\d{6}", text)
+    if date_match:
+        prefix = text[: date_match.start()].strip(" -_/，,")
+        if prefix:
+            out.append(prefix)
+
+    return list(dict.fromkeys(out))
+
+
+def looks_like_option_contract_label(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    upper = text.upper()
+    return bool(
+        OPTION_CODE_RE.match(upper)
+        or OPTION_COMPACT_RE.search(upper)
+        or OPTION_DISPLAY_RE.search(upper)
+    )
+
+
+def _identity_from_canonical(*, raw: str, candidate: str, source_kind: str) -> SymbolIdentity | None:
+    upper = str(candidate or "").strip().upper()
+    if not upper:
+        return None
+
+    hk = _normalize_hk_symbol(upper)
+    if hk:
+        num = hk[:-3].zfill(5)
+        return SymbolIdentity(
+            raw=raw,
+            canonical=hk,
+            market="HK",
+            currency="HKD",
+            futu_code=f"HK.{num}",
+            source_kind=source_kind,
+        )
+
+    if upper.startswith("SH.") or upper.startswith("SZ."):
+        prefix = upper[:2]
+        num = upper[3:]
+        if num:
+            return SymbolIdentity(
+                raw=raw,
+                canonical=f"{prefix}.{num}",
+                market="CN",
+                currency="CNY",
+                futu_code=f"{prefix}.{num}",
+                source_kind=source_kind,
+            )
+
+    if _US_SYMBOL_RE.fullmatch(upper):
+        return SymbolIdentity(
+            raw=raw,
+            canonical=upper,
+            market="US",
+            currency="USD",
+            futu_code=f"US.{upper}",
+            source_kind=source_kind,
+        )
+    return None
+
+
+def _identity_from_alias(
+    *,
+    raw: str,
+    candidate: str,
+    symbol_aliases: SymbolAliases,
+    source_kind: str,
+) -> SymbolIdentity | None:
+    alias_key = str(candidate or "").strip().upper()
+    mapped = (
+        _explicit_alias_value(symbol_aliases, candidate)
+        or _UNDERLIER_ALIAS_FALLBACKS.get(candidate)
+        or _UNDERLIER_ALIAS_FALLBACKS.get(alias_key)
+    )
+    if not mapped:
+        return None
+    return _identity_from_canonical(raw=raw, candidate=str(mapped), source_kind=source_kind)
+
+
+def _explicit_us_identity(
+    raw: str, root: str, symbol_aliases: SymbolAliases, source_kind: str,
+) -> SymbolIdentity | None:
+    identity = _identity_from_alias(
+        raw=raw, candidate=f"US.{root}", symbol_aliases=symbol_aliases, source_kind=source_kind
+    )
+    if identity is None or identity.market != "US":
+        identity = _identity_from_alias(
+            raw=raw, candidate=root, symbol_aliases=symbol_aliases, source_kind=source_kind
+        )
+    if identity is None or identity.market != "US":
+        identity = _identity_from_canonical(raw=raw, candidate=root, source_kind=source_kind)
+    if identity is None or identity.market != "US":
+        return None
+    bare_alias = _identity_from_alias(
+        raw=raw, candidate=identity.canonical, symbol_aliases=symbol_aliases, source_kind=source_kind
+    )
+    if bare_alias and bare_alias.canonical != identity.canonical:
+        # Retain the existing explicit suffix when bare spelling is an HK alias.
+        identity = replace(identity, canonical=f"{identity.canonical}.US")
+    return identity
+
+
+def resolve_symbol_identity(value: Any, *, symbol_aliases: SymbolAliases = None) -> SymbolIdentity | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    upper = raw.upper()
+    option_code_match = OPTION_CODE_RE.match(upper)
+    if option_code_match:
+        root = option_code_match.group("root")
+        market = option_code_match.group("market")
+        if market == "US":
+            return _explicit_us_identity(raw, root, symbol_aliases, "option_code")
+        identity = (
+            _identity_from_alias(raw=raw, candidate=f"{market}.{root}", symbol_aliases=symbol_aliases, source_kind="option_code")
+            or _identity_from_alias(raw=raw, candidate=root, symbol_aliases=symbol_aliases, source_kind="option_code")
+        )
+        if not identity or identity.market != market:
+            identity = _identity_from_canonical(raw=raw, candidate=root, source_kind="option_code")
+        return identity if identity and identity.market == market else None
+    if upper.startswith("US."):
+        return _explicit_us_identity(raw, upper[3:], symbol_aliases, "futu_code")
+    if upper.startswith("HK."):
+        identity = _identity_from_alias(
+            raw=raw, candidate=upper, symbol_aliases=symbol_aliases, source_kind="futu_code"
+        ) or _identity_from_alias(
+            raw=raw, candidate=upper[3:], symbol_aliases=symbol_aliases, source_kind="futu_code"
+        ) or _identity_from_canonical(raw=raw, candidate=upper, source_kind="futu_code")
+        return identity if identity and identity.market == "HK" else None
+
+    if upper.endswith(".US"):
+        return _explicit_us_identity(raw, upper[:-3], symbol_aliases, "market_suffix")
+
+    alias = _identity_from_alias(raw=raw, candidate=raw, symbol_aliases=symbol_aliases, source_kind="alias")
+    if alias:
+        return alias
+
+    direct = _identity_from_canonical(raw=raw, candidate=raw, source_kind="canonical")
+    if direct:
+        return direct
+
+    for candidate in _display_name_candidates(raw):
+        alias = _identity_from_alias(
+            raw=raw,
+            candidate=candidate,
+            symbol_aliases=symbol_aliases,
+            source_kind="display_name",
+        )
+        if alias:
+            return alias
+    return None
+
+
+def canonical_symbol(value: Any, *, symbol_aliases: SymbolAliases = None) -> str | None:
+    identity = resolve_symbol_identity(value, symbol_aliases=symbol_aliases)
+    return identity.canonical if identity else None
+
+
+def futu_underlier_code(value: Any, *, symbol_aliases: SymbolAliases = None) -> str | None:
+    identity = resolve_symbol_identity(value, symbol_aliases=symbol_aliases)
+    return identity.futu_code if identity else None
+
+
+def symbol_market(value: Any, *, symbol_aliases: SymbolAliases = None) -> str | None:
+    identity = resolve_symbol_identity(value, symbol_aliases=symbol_aliases)
+    return identity.market if identity else None
+
+
+def symbol_currency(value: Any, *, symbol_aliases: SymbolAliases = None) -> str | None:
+    identity = resolve_symbol_identity(value, symbol_aliases=symbol_aliases)
+    return identity.currency if identity else None
+
+
+def is_hk_symbol(value: Any, *, symbol_aliases: SymbolAliases = None) -> bool:
+    return symbol_market(value, symbol_aliases=symbol_aliases) == "HK"
+
+
+def canonical_symbol_aliases(value: Any, *, symbol_aliases: SymbolAliases = None) -> list[str]:
+    identity = resolve_symbol_identity(value, symbol_aliases=symbol_aliases)
+    if identity is None:
+        raw = str(value or "").strip().upper()
+        return [raw] if raw else []
+    out = [identity.canonical]
+    if identity.market == "HK":
+        code = identity.canonical[:-3]
+        if code.isdigit():
+            out.append(f"{int(code):05d}.HK")
+    return list(dict.fromkeys(out))
+
+
+def resolve_underlier_alias(symbol: str, *, symbol_aliases: SymbolAliases = None) -> str:
+    raw = str(symbol or "").strip()
+    if not raw:
+        return ""
+    return canonical_symbol(raw, symbol_aliases=symbol_aliases) or raw.upper()
+
+
+def normalize_symbol_candidate(value: Any, *, symbol_aliases: SymbolAliases = None) -> str | None:
+    return canonical_symbol(value, symbol_aliases=symbol_aliases)
+
+
+def pick_first_normalized_symbol(
+    src: dict[str, Any],
+    *keys: str,
+    symbol_aliases: SymbolAliases = None,
+) -> str | None:
+    for key in keys:
+        value = normalize_symbol_candidate(src.get(key), symbol_aliases=symbol_aliases)
+        if value:
+            return value
+    return None

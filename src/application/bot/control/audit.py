@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable
+from uuid import uuid4
+
+from src.application.agent_tool_contracts import AgentToolError, mask_path
+from src.application.agent_tool_config import repo_base
+from src.application.settings import build_effective_env
+from src.infrastructure.private_storage import connect_private_sqlite, private_path
+from src.infrastructure.io_utils import utc_now as utc_now_iso
+from src.application.payload_helpers import optional_text as _optional_str
+
+
+def default_audit_db_path() -> Path:
+    raw = str(build_effective_env().get("OM_INBOUND_AUDIT_DB") or "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        return private_path(path if path.is_absolute() else repo_base() / path)
+    return private_path(repo_base() / "output_shared" / "state" / "inbound_control.sqlite3")
+
+
+def build_command_id(*, channel: str, sender_id: str, message_id: str | None, text: str) -> str:
+    message_ref = str(message_id or "").strip() or f"local:{uuid4().hex}"
+    source = "\x1f".join(
+        [
+            str(channel or "").strip().lower(),
+            str(sender_id or "").strip(),
+            message_ref,
+            str(text or "").strip(),
+        ]
+    )
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    return f"in_{digest}"
+
+
+class InboundAuditStore:
+    def __init__(self, path: str | Path | None = None, *, deadline_monotonic: float | None = None) -> None:
+        self.path = private_path(path) if path else default_audit_db_path()
+        self.deadline_monotonic = deadline_monotonic
+
+    def find_by_message(self, *, channel: str, message_id: str | None, command_id: str | None = None) -> dict[str, Any] | None:
+        normalized_message_id = str(message_id or "").strip()
+        normalized_channel = str(channel or "").strip().lower() or "local"
+        if normalized_message_id:
+            self._ensure_schema()
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM inbound_command_audit
+                    WHERE channel = ? AND message_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (normalized_channel, normalized_message_id),
+                ).fetchone()
+            return _row_to_dict(row)
+        normalized_command_id = str(command_id or "").strip()
+        if not normalized_command_id:
+            return None
+        self._ensure_schema()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM inbound_command_audit
+                WHERE channel = ? AND command_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (normalized_channel, normalized_command_id),
+            ).fetchone()
+        return _row_to_dict(row)
+
+    def list_recent(
+        self,
+        *,
+        channel: str | None = None,
+        sender_id: str | None = None,
+        conversation_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        self._ensure_schema()
+        where: list[str] = []
+        params: list[Any] = []
+        normalized_channel = str(channel or "").strip().lower()
+        normalized_sender = str(sender_id or "").strip()
+        normalized_conversation = str(conversation_id or "").strip()
+        if normalized_channel:
+            where.append("channel = ?")
+            params.append(normalized_channel)
+        if normalized_sender:
+            where.append("sender_id = ?")
+            params.append(normalized_sender)
+        if normalized_conversation:
+            where.append("conversation_id = ?")
+            params.append(normalized_conversation)
+        params.append(max(1, min(int(limit or 20), 200)))
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM inbound_command_audit
+                {where_sql}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = _row_to_dict(row)
+            if item is not None:
+                out.append(item)
+        return out
+
+    def record_result(self, record: dict[str, Any]) -> None:
+        self._ensure_schema()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO inbound_command_audit (
+                    command_id,
+                    channel,
+                    sender_id,
+                    conversation_id,
+                    message_id,
+                    raw_text,
+                    parser,
+                    intent_name,
+                    tool_name,
+                    tool_payload_json,
+                    control_json,
+                    decision,
+                    result_ok,
+                    error_code,
+                    response_json,
+                    created_at,
+                    finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(record.get("command_id") or ""),
+                    str(record.get("channel") or ""),
+                    str(record.get("sender_id") or ""),
+                    _optional_str(record.get("conversation_id")),
+                    _optional_str(record.get("message_id")),
+                    str(record.get("raw_text") or ""),
+                    _optional_str(record.get("parser")),
+                    _optional_str(record.get("intent_name")),
+                    _optional_str(record.get("tool_name")),
+                    _json(record.get("tool_payload")),
+                    _json(record.get("control")),
+                    str(record.get("decision") or ""),
+                    1 if bool(record.get("result_ok")) else 0,
+                    _optional_str(record.get("error_code")),
+                    _json(record.get("response")),
+                    str(record.get("created_at") or utc_now_iso()),
+                    str(record.get("finished_at") or utc_now_iso()),
+                ),
+            )
+
+    def record_analysis_control_once(
+        self, *, channel: str, sender_id: str, conversation_id: str | None,
+        message_id: str, text: str, scope: str,
+        resolve: Callable[[sqlite3.Connection], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Bind one provider message to its cancellation target and CAS outcome."""
+        self._ensure_schema()
+        control_channel = f"{channel}:analysis_control"
+        command_id = build_command_id(channel=control_channel, sender_id=sender_id,
+            message_id=message_id, text=text)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
+                raise AgentToolError(code="BUDGET_EXHAUSTED", message="analysis control deadline exceeded")
+            row = conn.execute("SELECT sender_id, conversation_id, response_json FROM inbound_command_audit "
+                "WHERE channel = ? AND message_id = ?", (control_channel, message_id)).fetchone()
+            if row is not None:
+                result = json.loads(row["response_json"])
+                if row["sender_id"] != sender_id or row["conversation_id"] != conversation_id or result.get("scope") != scope:
+                    raise AgentToolError(code="PERMISSION_DENIED", message="analysis control identity conflict")
+                return {**result, "duplicate": True}
+            original = conn.execute("SELECT sender_id FROM inbound_command_audit WHERE channel=? AND message_id=?",
+                (channel, message_id)).fetchone()
+            if original is not None:
+                if original["sender_id"] != sender_id:
+                    raise AgentToolError(code="PERMISSION_DENIED", message="analysis control identity conflict")
+                return {"status": "already_processed", "target_run_id": None, "scope": scope, "duplicate": True}
+            result = {**resolve(conn), "scope": scope}
+            now = utc_now_iso()
+            conn.execute("""INSERT INTO inbound_command_audit
+                (command_id, channel, sender_id, conversation_id, message_id, raw_text,
+                 decision, result_ok, response_json, created_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'analysis_control', 1, ?, ?, ?)""",
+                (command_id, control_channel, sender_id, conversation_id, message_id, text,
+                 _json(result), now, now))
+            if self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic:
+                raise AgentToolError(code="BUDGET_EXHAUSTED", message="analysis control deadline exceeded")
+            return {**result, "duplicate": False}
+
+    def update_response(self, *, command_id: str, response: dict[str, Any]) -> None:
+        normalized_command_id = str(command_id or "").strip()
+        if not normalized_command_id:
+            return
+        self._ensure_schema()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE inbound_command_audit
+                SET response_json = ?,
+                    finished_at = ?
+                WHERE command_id = ?
+                """,
+                (_json(response), utc_now_iso(), normalized_command_id),
+            )
+
+    def merge_response_data(self, *, command_id: str, data: dict[str, Any]) -> bool:
+        normalized_command_id = str(command_id or "").strip()
+        if not normalized_command_id or not isinstance(data, dict) or not data:
+            return False
+        if not self.path.exists():
+            return False
+        self._ensure_schema()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT response_json
+                FROM inbound_command_audit
+                WHERE command_id = ?
+                LIMIT 1
+                """,
+                (normalized_command_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            response = _loads_object(row["response_json"])
+            response_data_raw = response.get("data")
+            response_data: dict[str, Any] = dict(response_data_raw) if isinstance(response_data_raw, dict) else {}
+            response_data.update(data)
+            response["data"] = response_data
+            conn.execute(
+                """
+                UPDATE inbound_command_audit
+                SET response_json = ?
+                WHERE command_id = ?
+                """,
+                (_json(response), normalized_command_id),
+            )
+        return True
+
+    def mark_duplicate(self, *, command_id: str, sender_id: str | None = None, decision: str = "idempotent_replay") -> None:
+        self._ensure_schema()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE inbound_command_audit
+                SET duplicate_count = duplicate_count + 1,
+                    last_duplicate_at = ?,
+                    last_duplicate_sender_id = ?,
+                    last_duplicate_decision = ?
+                WHERE command_id = ?
+                """,
+                (utc_now_iso(), _optional_str(sender_id), str(decision or "idempotent_replay"), str(command_id)),
+            )
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = connect_inbound_sqlite(self.path, deadline_monotonic=self.deadline_monotonic)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_schema(self) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS inbound_command_audit (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        command_id TEXT NOT NULL UNIQUE,
+                        channel TEXT NOT NULL,
+                        sender_id TEXT NOT NULL,
+                        conversation_id TEXT,
+                        message_id TEXT,
+                        raw_text TEXT NOT NULL,
+                        parser TEXT,
+                        intent_name TEXT,
+                        tool_name TEXT,
+                        tool_payload_json TEXT,
+                        control_json TEXT,
+                        decision TEXT NOT NULL,
+                        result_ok INTEGER NOT NULL DEFAULT 0,
+                        error_code TEXT,
+                        response_json TEXT,
+                        duplicate_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TEXT NOT NULL,
+                        finished_at TEXT NOT NULL,
+                        last_duplicate_at TEXT,
+                        last_duplicate_sender_id TEXT,
+                        last_duplicate_decision TEXT
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_inbound_audit_message
+                    ON inbound_command_audit(channel, message_id)
+                    WHERE message_id IS NOT NULL AND message_id != ''
+                    """
+                )
+                _ensure_column(conn, "last_duplicate_sender_id", "TEXT")
+                _ensure_column(conn, "last_duplicate_decision", "TEXT")
+                _ensure_column(conn, "conversation_id", "TEXT")
+                _ensure_column(conn, "control_json", "TEXT")
+        except sqlite3.Error as exc:
+            raise inbound_sqlite_error(self.path, exc) from exc
+
+
+def connect_inbound_sqlite(path: Path, *, deadline_monotonic: float | None = None) -> sqlite3.Connection:
+    try:
+        timeout = 5.0 if deadline_monotonic is None else max(0.0, min(5.0, deadline_monotonic - time.monotonic()))
+        return connect_private_sqlite(path, timeout=timeout)
+    except (OSError, sqlite3.Error) as exc:
+        raise inbound_sqlite_error(path, exc) from exc
+
+
+def inbound_sqlite_error(path: Path, exc: BaseException) -> AgentToolError:
+    return AgentToolError(
+        code="CONFIG_ERROR",
+        message="failed to open inbound audit SQLite database",
+        hint="Set OM_INBOUND_AUDIT_DB to a writable SQLite path, or pass --audit-db for local one-shot testing.",
+        details={
+            "audit_db": mask_path(path),
+            "error_type": type(exc).__name__,
+        },
+    )
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value if value is not None else {}, ensure_ascii=False, sort_keys=True)
+
+
+def _loads_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    try:
+        loaded = json.loads(str(value or "{}"))
+    except Exception:
+        return {}
+    return dict(loaded) if isinstance(loaded, dict) else {}
+
+
+def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+def _ensure_column(conn: sqlite3.Connection, name: str, column_type: str) -> None:
+    rows = conn.execute("PRAGMA table_info(inbound_command_audit)").fetchall()
+    existing = {str(row[1]) for row in rows}
+    if name not in existing:
+        conn.execute(f"ALTER TABLE inbound_command_audit ADD COLUMN {name} {column_type}")

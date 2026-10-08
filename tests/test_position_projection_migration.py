@@ -1,0 +1,861 @@
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import Path
+import shutil
+import sqlite3
+import subprocess
+import threading
+
+import pytest
+
+from domain.domain.ledger import ContractKey, TradeEvent
+from src.application.ledger import position_projection_migration as module
+from src.application.ledger import repository_core
+from src.application.ledger.repository import SQLiteOptionPositionsRepository
+
+
+_REAL_SOURCE_COMMIT = module._source_commit
+
+
+@pytest.fixture(autouse=True)
+def _stable_source_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "_source_commit", lambda: "a" * 40)
+
+
+def _event(event_id: str = "open-1", *, event_time_ms: int = 1_000) -> dict[str, object]:
+    return TradeEvent(
+        event_id=event_id,
+        event_type="open",
+        event_time_ms=event_time_ms,
+        contract_key=ContractKey.from_values(
+            broker="futu",
+            account="lx",
+            underlying_symbol="NVDA",
+            option_type="put",
+            strike=100,
+            expiration_ymd="2028-12-15",
+                ),
+        contracts=1,
+        price=2,
+        currency="USD",
+        source="test",
+        multiplier=100,
+        lot_id="lot-1",
+        raw_payload={"source_type": "test", "side": "sell"},
+    ).to_dict()
+
+
+def _legacy_store(tmp_path: Path, *, name: str = "ledger.sqlite3") -> Path:
+    path = tmp_path / name
+    event = _event()
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE trade_events (
+              event_id TEXT PRIMARY KEY,
+              event_json TEXT NOT NULL,
+              trade_time_ms INTEGER NOT NULL,
+              created_at_ms INTEGER NOT NULL,
+              updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE position_lots (
+              lot_id TEXT NOT NULL PRIMARY KEY,
+              account TEXT,
+              fields_json TEXT NOT NULL,
+              source_event_id TEXT,
+              strike REAL,
+              multiplier REAL,
+              updated_at_ms INTEGER NOT NULL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO trade_events (
+              event_id,event_json,trade_time_ms,created_at_ms,updated_at_ms
+            ) VALUES (?,?,?,?,?)
+            """,
+            (
+                event["event_id"],
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+                event["event_time_ms"],
+                1,
+                1,
+            ),
+        )
+    return path
+
+
+def _persistent_artifact_sizes(path: Path) -> dict[str, int]:
+    return {
+        suffix or "db": Path(f"{path}{suffix}").stat().st_size
+        if Path(f"{path}{suffix}").exists()
+        else 0
+        for suffix in ("", "-wal")
+    }
+
+
+def _apply(path: Path) -> dict[str, object]:
+    inventory = module.build_position_projection_migration_inventory(path)
+    return module.apply_position_projection_migration(path, inventory)
+
+
+def _acceptance(shadow: dict[str, object]) -> dict[str, object]:
+    return module._manifest(
+        {
+            "schema_version": module.ACCEPTANCE_SCHEMA,
+            "generated_at_utc": "2026-08-14T00:00:00+00:00",
+            "status": "pass",
+            "readiness": "ready",
+            "store_binding": shadow["store_binding"],
+            "reference_host": {
+                "comparable": True,
+                "current_fingerprint": "b" * 64,
+                "expected_fingerprint": "b" * 64,
+            },
+            "components": {
+                "lot_diff_publication": {"status": "pass"},
+                "checkpoint_tail": {"status": "pass"},
+                "combined": {"status": "ready"},
+            },
+            "resource_failures": [],
+            "parity_failures": [],
+            "retained_lots_10x_guarantee": False,
+        }
+    )
+
+
+def _migrated(tmp_path: Path) -> Path:
+    path = _legacy_store(tmp_path)
+    _apply(path)
+    return path
+
+
+def _shadow(path: Path) -> dict[str, object]:
+    return module.verify_position_projection_migration(path, shadow=True)
+
+
+def _activate(
+    path: Path,
+    *,
+    acceptance: dict[str, object],
+    shadow: dict[str, object],
+) -> dict[str, object]:
+    return module.activate_position_projection_checkpoints(
+        path,
+        acceptance_manifest=acceptance,
+        shadow_manifest=shadow,
+    )
+
+
+def test_migration_write_connection_fails_closed_when_wal_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Cursor:
+        def fetchone(self) -> tuple[str]:
+            return ("delete",)
+
+    class Connection:
+        closed = False
+
+        def execute(self, _sql: str) -> Cursor:
+            return Cursor()
+
+        def close(self) -> None:
+            self.closed = True
+
+    path = _legacy_store(tmp_path)
+    connection = Connection()
+    monkeypatch.setattr(module, "connect_private_sqlite", lambda _path: connection)
+    monkeypatch.setattr(module, "initialize_ledger_connection", lambda _conn: None)
+
+    with pytest.raises(RuntimeError, match="SQLite WAL mode is required"):
+        with module._write_connection(path):
+            raise AssertionError("migration writer body must not start")
+
+    assert connection.closed is True
+
+
+def test_migration_writer_waits_for_repository_connection_lifecycle(
+    tmp_path: Path,
+) -> None:
+    path = _legacy_store(tmp_path)
+    repo = module._repository(path)
+    repository_entered = threading.Event()
+    release_repository = threading.Event()
+    migration_entered = threading.Event()
+
+    def _repository_writer() -> None:
+        with repo._writer_connection():
+            repository_entered.set()
+            assert release_repository.wait(2)
+
+    def _migration_writer() -> None:
+        with module._write_connection(path):
+            migration_entered.set()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        repository = executor.submit(_repository_writer)
+        assert repository_entered.wait(1)
+        migration = executor.submit(_migration_writer)
+        try:
+            assert not migration_entered.wait(0.1)
+        finally:
+            release_repository.set()
+        repository.result(timeout=1)
+        migration.result(timeout=1)
+
+    assert migration_entered.is_set()
+
+
+def test_inventory_and_shadow_are_read_only_and_apply_verifies(tmp_path: Path) -> None:
+    path = _legacy_store(tmp_path)
+    before = _persistent_artifact_sizes(path)
+
+    inventory = module.build_position_projection_migration_inventory(path)
+
+    assert inventory["schema_version"] == module.INVENTORY_SCHEMA
+    assert inventory["read_only"] is True
+    assert inventory["counts"] == {"trade_events": 1, "position_lots": 0}
+    assert inventory["assigned_stock_events_present"] is False
+    assert _persistent_artifact_sizes(path) == before
+    with sqlite3.connect(path) as conn:
+        assert "account" not in {row[1] for row in conn.execute("PRAGMA table_info(trade_events)")}
+
+    applied = module.apply_position_projection_migration(path, inventory)
+    assert applied["write_applied"] is True
+    assert applied["checkpoint_mode"] == "disabled"
+    assert applied["projection"]["checkpoint_written"] is True
+    assert "idx_trade_events_execution_identity_v1" in applied["indexes_created"]
+
+    after_apply = _persistent_artifact_sizes(path)
+    verified = module.verify_position_projection_migration(path, shadow=True)
+    assert verified["status"] == "pass"
+    assert verified["readiness"] == "ready"
+    assert verified["runtime_shadow"]["status"] == "pass"
+    assert verified["checkpoint"]["k_within_bound"] is True
+    assert _persistent_artifact_sizes(path) == after_apply
+    status = module.position_projection_migration_status(path)
+    assert status["readiness"] == "ready"
+    assert status["fingerprint_scope"]["rows"] == 1
+    assert status["fingerprint_scope"]["fields_json_bytes"] > 0
+    assert status["runtime_telemetry"]["sample_count"] >= 1
+    assert status["runtime_telemetry"]["sample_count"] <= status["runtime_telemetry"][
+        "sample_limit"
+    ]
+    assert status["runtime_telemetry"]["mode_counts"]["full"] >= 1
+
+
+@pytest.mark.parametrize("stock", [False, True])
+def test_execution_index_builder_rejects_bad_identity_and_preserves_safe_legacy_read(tmp_path, stock):
+    from src.application.ledger.api import execution_identity_from_input
+    from src.application.ledger.repository_trade_schema import EXECUTION_IDENTITY_INDEXES
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    execution = {"broker_account_ref": {"broker_id": "futu", "external_account_id": "123", "environment": "REAL"},
+                 "external_id_namespace": "futu.deal", "external_execution_id": "old-fill"}
+    identity = execution_identity_from_input(execution)
+    metadata = {"execution_input": execution, "execution_id": identity}
+    event = ({"stock_event_id": "old", "account": "lx", "trade_time_ms": 1_000, **metadata}
+             if stock else {**_event("old"), "raw_payload": metadata})
+    table, key = ("assigned_stock_events", "stock_event_id") if stock else ("trade_events", "event_id")
+    put = repo.upsert_assigned_stock_event if stock else repo.upsert_trade_event
+    read = repo.list_assigned_stock_events_for_execution if stock else repo.list_trade_events_for_execution
+    put(event)
+    bad_metadata = [
+        {"execution_id": identity}, {"execution_id": identity, "execution_input": {}},
+        {"execution_id": "wrong", "execution_input": execution},
+        {"execution_id": 0}, {"execution_id": []}, {"execution_id": True},
+    ]
+    for raw in bad_metadata:
+        bad = {**event, **raw} if stock else {**event, "raw_payload": raw}
+        if stock and "execution_input" not in raw:
+            bad.pop("execution_input", None)
+        with pytest.raises(ValueError, match="identity_metadata_mismatch"):
+            put(bad)
+    # An old store may contain metadata accepted before the lookup invariant existed.
+    corrupt = {**metadata, "execution_id": "wrong"}
+    old = {**event, **corrupt} if stock else {**event, "raw_payload": corrupt}
+    with repo._writer_connection(begin_immediate=True) as conn:
+        conn.execute(f"DROP INDEX {EXECUTION_IDENTITY_INDEXES[table][0]}")
+        conn.execute(f"UPDATE {table} SET event_json=? WHERE {key}=?", (json.dumps(old), "old"))
+    assert len(read(identity)) == 1
+    inventory = module.build_position_projection_migration_inventory(repo.db_path)
+    for apply in (lambda: repo.build_position_projection_indexes(),
+                  lambda: module.apply_position_projection_migration(repo.db_path, inventory)):
+        with pytest.raises(ValueError, match="identity_metadata_mismatch"):
+            apply()
+        with repo._connect() as conn:
+            assert conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (EXECUTION_IDENTITY_INDEXES[table][0],)).fetchone() is None
+            assert json.loads(conn.execute(f"SELECT event_json FROM {table} WHERE {key}='old'").fetchone()[0]) == old
+        assert len(read(identity)) == 1
+
+
+def test_execution_index_builder_owns_atomicity_and_requires_outer_transaction(tmp_path, monkeypatch):
+    from src.application.ledger.repository_trade_schema import EXECUTION_IDENTITY_INDEXES
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    with repo._writer_connection(begin_immediate=True) as conn:
+        for name, _path in EXECUTION_IDENTITY_INDEXES.values():
+            conn.execute(f"DROP INDEX {name}")
+    with repo._connect() as conn:
+        with pytest.raises(ValueError, match="active transaction"):
+            repo.build_position_projection_indexes(conn=conn)
+    original = repo._connect
+
+    def failing_connection():
+        conn = original()
+        conn.set_authorizer(lambda action, name, *_args: sqlite3.SQLITE_DENY
+                            if action == sqlite3.SQLITE_CREATE_INDEX and name == EXECUTION_IDENTITY_INDEXES["assigned_stock_events"][0]
+                            else sqlite3.SQLITE_OK)
+        return conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(repo, "_connect", failing_connection)
+        with pytest.raises(sqlite3.DatabaseError):
+            repo.build_position_projection_indexes()
+    with repo._connect() as conn:
+        names = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert not names.intersection(name for name, _path in EXECUTION_IDENTITY_INDEXES.values())
+    assert len(repo.build_position_projection_indexes()) == 2
+    assert repo.build_position_projection_indexes() == ()
+
+
+def test_migration_manifest_and_activation_bind_assigned_stock_facts_and_keep_disabled(tmp_path):
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    repo.upsert_trade_event(_event())
+    inventory = module.build_position_projection_migration_inventory(repo.db_path)
+    repo.upsert_assigned_stock_event({"stock_event_id": "stock-1", "account": "lx", "trade_time_ms": 1_000})
+    with pytest.raises(ValueError, match="stale"):
+        module.apply_position_projection_migration(repo.db_path, inventory)
+    applied = module.apply_position_projection_migration(repo.db_path, module.build_position_projection_migration_inventory(repo.db_path))
+    assert applied["checkpoint_mode"] == "disabled"
+    shadow = module.verify_position_projection_migration(repo.db_path, shadow=True)
+    assert shadow["status"] == "pass"
+    module.activate_position_projection_checkpoints(repo.db_path, acceptance_manifest=_acceptance(shadow), shadow_manifest=shadow)
+    inventory = module.build_position_projection_migration_inventory(repo.db_path)
+
+    def fail_before_commit(stage):
+        if stage == "before_commit":
+            raise RuntimeError("injected maintenance failure")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        module.apply_position_projection_migration(repo.db_path, inventory, failure_hook=fail_before_commit)
+    assert module.position_projection_migration_status(repo.db_path)["checkpoint_mode"] == "enabled"
+    assert module.verify_position_projection_migration(repo.db_path, shadow=True)["status"] == "pass"
+    applied = module.apply_position_projection_migration(repo.db_path, module.build_position_projection_migration_inventory(repo.db_path))
+    assert applied["checkpoint_mode"] == "disabled"
+    shadow = module.verify_position_projection_migration(repo.db_path, shadow=True)
+    assert shadow["status"] == "pass", shadow["reasons"]
+    repo.upsert_assigned_stock_event({"stock_event_id": "stock-2", "account": "lx", "trade_time_ms": 2_000})
+    with pytest.raises(ValueError, match="stale|binding"):
+        module.activate_position_projection_checkpoints(repo.db_path, acceptance_manifest=_acceptance(shadow), shadow_manifest=shadow)
+    assert module.position_projection_migration_status(repo.db_path)["checkpoint_mode"] == "disabled"
+
+
+@pytest.mark.parametrize("table", ["trade_events", "assigned_stock_events"])
+def test_execution_candidate_and_writer_queries_use_same_nonunique_index(tmp_path, table):
+    from src.application.ledger.repository_trade_schema import EXECUTION_IDENTITY_INDEXES, _execution_candidate_rows
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    name, path = EXECUTION_IDENTITY_INDEXES[table]
+    with repo._connect() as conn:
+        statements = []
+        conn.set_trace_callback(statements.append)
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") == []
+        assert len(statements) == 2
+        assert not any("PRAGMA database_list" in sql for sql in statements)
+        query = next(sql for sql in statements if sql.startswith("SELECT event_json"))
+        plans = [conn.execute("EXPLAIN QUERY PLAN " + query).fetchall(), conn.execute(
+            f"EXPLAIN QUERY PLAN SELECT event_json FROM {table} WHERE json_extract(event_json, '{path}')=?",
+            ("execution:v1:target",),
+        ).fetchall()]
+        for plan in plans:
+            assert any("SEARCH" in row[3] and name in row[3] for row in plan)
+            assert not any(f"SCAN {table}" in row[3] for row in plan)
+        assert next(row[2] for row in conn.execute(f"PRAGMA index_list({table})") if row[1] == name) == 0
+
+
+@pytest.mark.parametrize("table", ["trade_events", "assigned_stock_events"])
+@pytest.mark.parametrize("cause", ["missing", "definition_mismatch"])
+def test_execution_index_fallback_warns_and_status_reports_gap(tmp_path, caplog, monkeypatch, table, cause):
+    from src.application.ledger import repository_trade_schema as schema
+
+    monkeypatch.setattr(schema, "_warned_execution_identity_index_gaps", set())
+    EXECUTION_IDENTITY_INDEXES = schema.EXECUTION_IDENTITY_INDEXES
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    event = (
+        {"stock_event_id": "stock-1", "account": "lx", "trade_time_ms": 1_000}
+        if table == "assigned_stock_events" else _event()
+    )
+    put = repo.upsert_assigned_stock_event if table == "assigned_stock_events" else repo.upsert_trade_event
+    read = (
+        repo.list_assigned_stock_events_for_execution
+        if table == "assigned_stock_events" else repo.list_trade_events_for_execution
+    )
+    full_read = repo.list_assigned_stock_events if table == "assigned_stock_events" else repo.list_trade_events
+    put(event)
+    before = module.position_projection_migration_status(repo.db_path)
+    name = EXECUTION_IDENTITY_INDEXES[table][0]
+    with repo._writer_connection(begin_immediate=True) as conn:
+        conn.execute(f"DROP INDEX {name}")
+        if cause == "definition_mismatch":
+            conn.execute(f"CREATE INDEX {name} ON {table}(trade_time_ms)")
+
+    with caplog.at_level("WARNING", logger="src.application.ledger.repository_trade_schema"):
+        for _ in range(3):
+            assert read("execution:v1:target") == full_read()
+        reopened = SQLiteOptionPositionsRepository(repo.db_path, initialize=False)
+        reopened_read = (
+            reopened.list_assigned_stock_events_for_execution
+            if table == "assigned_stock_events" else reopened.list_trade_events_for_execution
+        )
+        assert reopened_read("execution:v1:target") == full_read()
+        other = SQLiteOptionPositionsRepository(tmp_path / "other.sqlite3")
+        other_read = (
+            other.list_assigned_stock_events_for_execution
+            if table == "assigned_stock_events" else other.list_trade_events_for_execution
+        )
+        with other._writer_connection(begin_immediate=True) as conn:
+            conn.execute(f"DROP INDEX {name}")
+            if cause == "definition_mismatch":
+                conn.execute(f"CREATE INDEX {name} ON {table}(trade_time_ms)")
+        assert other_read("execution:v1:target") == []
+    warnings = [
+        record.message for record in caplog.records
+        if record.name == "src.application.ledger.repository_trade_schema"
+    ]
+    assert warnings == [
+        f"execution_identity_index_fallback store_key={repo.db_path} table={table} cause={cause} rows=1",
+        f"execution_identity_index_fallback store_key={other.db_path} table={table} cause={cause} rows=0",
+    ]
+    status = module.position_projection_migration_status(repo.db_path)
+    assert status["execution_identity_index_gaps"] == [
+        {"table": table, "cause": cause, "rows": 1}
+    ]
+    assert module.position_projection_migration_status(other.db_path)["execution_identity_index_gaps"] == [
+        {"table": table, "cause": cause, "rows": 0}
+    ]
+    assert (status["readiness"], status["reasons"]) == (before["readiness"], before["reasons"])
+
+
+@pytest.mark.parametrize("table", ["trade_events", "assigned_stock_events"])
+def test_execution_index_ready_and_gap_agree_across_three_states(tmp_path, monkeypatch, caplog, table):
+    from src.application.ledger import repository_trade_schema as schema
+    from src.application.ledger.repository_trade_schema import (
+        EXECUTION_IDENTITY_INDEXES,
+        _execution_candidate_rows,
+        _execution_identity_index_gap,
+        _execution_identity_index_ready,
+        _execution_identity_index_sql,
+    )
+
+    monkeypatch.setattr(schema, "_warned_execution_identity_index_gaps", set())
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    name = EXECUTION_IDENTITY_INDEXES[table][0]
+    with repo._writer_connection(begin_immediate=True) as conn:
+        assert _execution_identity_index_ready(conn, table)
+        assert _execution_identity_index_gap(conn, table) is None
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") == []
+
+        conn.execute(f"DROP INDEX {name}")
+        assert not _execution_identity_index_ready(conn, table)
+        assert _execution_identity_index_gap(conn, table) == {"table": table, "cause": "missing", "rows": 0}
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") is None
+
+        conn.execute(_execution_identity_index_sql(table))
+        assert _execution_identity_index_ready(conn, table)
+        assert _execution_identity_index_gap(conn, table) is None
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") == []
+
+        conn.execute(f"DROP INDEX {name}")
+        conn.execute(f"CREATE INDEX {name} ON {table}(trade_time_ms)")
+        assert not _execution_identity_index_ready(conn, table)
+        assert _execution_identity_index_gap(conn, table) == {
+            "table": table, "cause": "definition_mismatch", "rows": 0,
+        }
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") is None
+
+        conn.execute(f"DROP INDEX {name}")
+        assert not _execution_identity_index_ready(conn, table)
+        assert _execution_identity_index_gap(conn, table) == {"table": table, "cause": "missing", "rows": 0}
+        assert _execution_candidate_rows(conn, table, "execution:v1:target") is None
+
+    assert [record.message for record in caplog.records if record.name == schema.__name__] == [
+        f"execution_identity_index_fallback store_key=None table={table} cause=missing rows=0",
+        f"execution_identity_index_fallback store_key=None table={table} cause=definition_mismatch rows=0",
+    ]
+
+
+def test_execution_index_status_omits_ready_and_absent_optional_tables(tmp_path):
+    repo = SQLiteOptionPositionsRepository(tmp_path / "current.sqlite3")
+    assert module.position_projection_migration_status(repo.db_path)["execution_identity_index_gaps"] == []
+
+    legacy = _legacy_store(tmp_path, name="legacy.sqlite3")
+    assert module.position_projection_migration_status(legacy)["execution_identity_index_gaps"] == [
+        {"table": "trade_events", "cause": "missing", "rows": 1}
+    ]
+
+
+def test_populated_execution_index_maintenance_repairs_both_missing_indexes(tmp_path):
+    from src.application.ledger.repository_trade_schema import (
+        EXECUTION_IDENTITY_INDEXES,
+        _execution_identity_index_sql,
+    )
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    repo.upsert_trade_event(_event())
+    repo.upsert_assigned_stock_event(
+        {"stock_event_id": "stock-1", "account": "lx", "trade_time_ms": 1_000}
+    )
+    with repo._writer_connection(begin_immediate=True) as conn:
+        for name, _path in EXECUTION_IDENTITY_INDEXES.values():
+            conn.execute(f"DROP INDEX {name}")
+    before = (
+        repo.list_trade_events_for_execution("execution:v1:target"),
+        repo.list_assigned_stock_events_for_execution("execution:v1:target"),
+    )
+    created = repo.build_position_projection_indexes()
+    assert set(created) == {name for name, _path in EXECUTION_IDENTITY_INDEXES.values()}
+    assert repo.build_position_projection_indexes() == ()
+    with repo._connect() as conn:
+        for table, (name, _path) in EXECUTION_IDENTITY_INDEXES.items():
+            assert conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (name,)).fetchone()[0] == (
+                _execution_identity_index_sql(table)
+            )
+    assert (
+        repo.list_trade_events_for_execution("execution:v1:target"),
+        repo.list_assigned_stock_events_for_execution("execution:v1:target"),
+    ) == before
+    assert module.position_projection_migration_status(repo.db_path)["execution_identity_index_gaps"] == []
+
+
+def test_execution_index_maintenance_refuses_mismatch_and_rolls_back(tmp_path):
+    from src.application.ledger.repository_trade_schema import EXECUTION_IDENTITY_INDEXES
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    repo.upsert_trade_event(_event())
+    repo.upsert_assigned_stock_event(
+        {"stock_event_id": "stock-1", "account": "lx", "trade_time_ms": 1_000}
+    )
+    trade_index = EXECUTION_IDENTITY_INDEXES["trade_events"][0]
+    stock_index = EXECUTION_IDENTITY_INDEXES["assigned_stock_events"][0]
+    with repo._writer_connection(begin_immediate=True) as conn:
+        conn.execute(f"DROP INDEX {trade_index}")
+        conn.execute(f"DROP INDEX {stock_index}")
+        conn.execute(f"CREATE INDEX {stock_index} ON assigned_stock_events(trade_time_ms)")
+    with pytest.raises(ValueError, match="execution identity index definition mismatch"):
+        repo.build_position_projection_indexes()
+    with repo._connect() as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (trade_index,)).fetchone() is None
+        assert conn.execute("SELECT sql FROM sqlite_master WHERE name=?", (stock_index,)).fetchone()[0] == (
+            f"CREATE INDEX {stock_index} ON assigned_stock_events(trade_time_ms)"
+        )
+
+
+def test_position_projection_tail_seek_preserves_exclusive_ordered_boundary(tmp_path):
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    for event_id, at_ms in (
+        ("e-01", 1_000), ("e-02", 1_000), ("e-03", 1_000), ("e-00", 2_000)
+    ):
+        repo.upsert_trade_event(_event(event_id, event_time_ms=at_ms))
+
+    def ids(after):
+        return [row["event_id"] for row in repo.list_position_projection_event_rows(after=after)]
+
+    assert ids(None) == ["e-01", "e-02", "e-03", "e-00"]
+    assert ids((1_000, "e-02")) == ["e-03", "e-00"]
+    assert ids((1_000, "e-03")) == ["e-00"]
+    assert ids((2_000, "e-00")) == []
+
+    with repo._connect() as conn:
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT event_id, account, event_json, trade_time_ms "
+            "FROM trade_events WHERE (trade_time_ms, event_id) > (?, ?) "
+            "ORDER BY trade_time_ms ASC, event_id ASC",
+            (1_000, "e-02"),
+        ).fetchall()
+    assert any(
+        "SEARCH" in row[3] and "idx_trade_events_trade_time" in row[3]
+        for row in plan
+    )
+
+
+def test_apply_rejects_stale_and_wrong_store_manifests(tmp_path: Path) -> None:
+    first = _legacy_store(tmp_path, name="first.sqlite3")
+    second = _legacy_store(tmp_path, name="second.sqlite3")
+    first_manifest = module.build_position_projection_migration_inventory(first)
+
+    with sqlite3.connect(first) as conn:
+        event = _event("open-2", event_time_ms=2_000)
+        conn.execute(
+            "INSERT INTO trade_events VALUES (?,?,?,?,?)",
+            (
+                event["event_id"],
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+                event["event_time_ms"],
+                2,
+                2,
+            ),
+        )
+
+    with pytest.raises(ValueError, match="stale"):
+        module.apply_position_projection_migration(first, first_manifest)
+    with pytest.raises(ValueError, match="stale|identity"):
+        module.apply_position_projection_migration(second, first_manifest)
+
+
+@pytest.mark.parametrize("failure_stage", ["after_backfill", "after_indexes", "projection:after_checkpoint_insert"])
+def test_apply_failure_rolls_back_schema_backfill_and_projection(tmp_path: Path, failure_stage: str) -> None:
+    path = _legacy_store(tmp_path)
+    inventory = module.build_position_projection_migration_inventory(path)
+
+    def fail(stage: str) -> None:
+        if stage == failure_stage:
+            raise RuntimeError("injected")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        module.apply_position_projection_migration(path, inventory, failure_hook=fail)
+
+    with sqlite3.connect(path) as conn:
+        assert "account" not in {row[1] for row in conn.execute("PRAGMA table_info(trade_events)")}
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='position_projection_checkpoints'"
+        ).fetchone() is None
+
+
+def test_apply_fails_closed_on_stored_event_account_conflict(
+    tmp_path: Path,
+) -> None:
+    path = _legacy_store(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE trade_events ADD COLUMN account TEXT")
+        conn.execute("UPDATE trade_events SET account = 'sy'")
+    inventory = module.build_position_projection_migration_inventory(path)
+
+    with pytest.raises(ValueError, match="account conflicts with JSON"):
+        module.apply_position_projection_migration(path, inventory)
+
+    with sqlite3.connect(path) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(trade_events)")}
+        assert "ingest_seq" not in columns
+        assert conn.execute("SELECT account FROM trade_events").fetchone()[0] == "sy"
+
+
+def test_verify_detects_lot_drift(tmp_path: Path) -> None:
+    path = _migrated(tmp_path)
+    with sqlite3.connect(path) as conn:
+        row = conn.execute(
+            "SELECT fields_json FROM position_lots WHERE lot_id='lot-1'"
+        ).fetchone()
+        fields = json.loads(row[0])
+        fields["contracts_open"] = 99
+        conn.execute(
+            "UPDATE position_lots SET fields_json=? WHERE lot_id='lot-1'",
+            (json.dumps(fields, ensure_ascii=False, sort_keys=True),),
+        )
+
+    result = module.verify_position_projection_migration(path, shadow=True)
+    assert result["status"] == "fail"
+    assert "full_oracle_parity_mismatch" in result["reasons"]
+
+
+def test_activation_binds_exact_store_and_deactivate_preserves_rows(tmp_path: Path) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+    acceptance = _acceptance(shadow)
+
+    activated = _activate(path, acceptance=acceptance, shadow=shadow)
+    assert activated["checkpoint_mode"] == "enabled"
+    status = module.position_projection_migration_status(path)
+    assert status["checkpoint_mode"] == "enabled"
+    before_counts = (status["checkpoint_count"], status["head_count"])
+
+    deactivated = module.deactivate_position_projection_checkpoints(path)
+    assert deactivated["write_applied"] is True
+    assert deactivated["preserved"] == [
+        "trade_events",
+        "position_lots",
+        "heads",
+        "checkpoints",
+    ]
+    after = module.position_projection_migration_status(path)
+    assert after["checkpoint_mode"] == "disabled"
+    assert (after["checkpoint_count"], after["head_count"]) == before_counts
+
+
+def test_activation_rejects_incomplete_acceptance_components(tmp_path: Path) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+    acceptance = _acceptance(shadow)
+    acceptance.pop("manifest_hash")
+    acceptance["components"]["lot_diff_publication"] = {"status": "fail"}
+    acceptance = module._manifest(acceptance)
+
+    with pytest.raises(ValueError, match="component gates"):
+        _activate(path, acceptance=acceptance, shadow=shadow)
+
+
+def test_activation_rejects_malformed_component_and_reference_host_evidence(
+    tmp_path: Path,
+) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+
+    malformed = _acceptance(shadow)
+    malformed.pop("manifest_hash")
+    malformed["components"]["lot_diff_publication"] = "pass"
+    with pytest.raises(ValueError, match="component gates"):
+        _activate(path, acceptance=module._manifest(malformed), shadow=shadow)
+
+    wrong_host = _acceptance(shadow)
+    wrong_host.pop("manifest_hash")
+    wrong_host["reference_host"]["expected_fingerprint"] = "c" * 64
+    with pytest.raises(ValueError, match="reference host"):
+        _activate(path, acceptance=module._manifest(wrong_host), shadow=shadow)
+
+
+def test_activation_rejects_loaded_source_commit_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+    acceptance = _acceptance(shadow)
+    monkeypatch.setattr(module, "_source_commit", lambda: "different-source-commit")
+
+    with pytest.raises(ValueError, match="loaded source commit"):
+        _activate(path, acceptance=acceptance, shadow=shadow)
+
+
+def test_activation_rejects_stale_generation_binding(tmp_path: Path) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+    acceptance = _acceptance(shadow)
+    event = _event("open-2", event_time_ms=2_000)
+    repo = SQLiteOptionPositionsRepository(path)
+    assert repo.upsert_trade_event(event) is True
+
+    with pytest.raises(ValueError, match="verification|stale"):
+        _activate(path, acceptance=acceptance, shadow=shadow)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "UPDATE position_projection_source_state SET projector_schema='wrong'",
+        "UPDATE position_projection_source_state "
+        "SET projector_implementation_fingerprint='wrong'",
+        "CREATE TABLE phase_3a_schema_drift (id INTEGER PRIMARY KEY)",
+    ),
+)
+def test_activation_rejects_projector_implementation_and_schema_cookie_drift(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    path = _migrated(tmp_path)
+    shadow = _shadow(path)
+    acceptance = _acceptance(shadow)
+    with sqlite3.connect(path) as conn:
+        conn.execute(mutation)
+
+    with pytest.raises(ValueError, match="verification|stale"):
+        _activate(path, acceptance=acceptance, shadow=shadow)
+
+
+def test_status_reports_generation_mismatch_and_fails_closed(tmp_path: Path) -> None:
+    path = _migrated(tmp_path)
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "UPDATE position_projection_heads SET built_source_generation=-1 "
+            "WHERE account='lx'"
+        )
+
+    status = module.position_projection_migration_status(path)
+
+    assert status["readiness"] == "not_ready"
+    assert "source_generation_mismatch:lx" in status["reasons"]
+
+
+def test_status_reports_unmigrated_projection_store_without_querying_rows(
+    tmp_path: Path,
+) -> None:
+    status = module.position_projection_migration_status(_legacy_store(tmp_path))
+
+    assert status["readiness"] == "not_ready"
+    assert status["reasons"] == ["source_state_missing", "trusted_checkpoint_missing"]
+    assert status["fingerprint_scope"] == {"rows": 0, "fields_json_bytes": 0}
+
+
+@pytest.mark.parametrize(
+    ("status_output", "expected"),
+    (("", "d" * 40), (" M src/application/example.py\n", None)),
+)
+def test_source_commit_requires_clean_production_source(
+    monkeypatch: pytest.MonkeyPatch,
+    status_output: str,
+    expected: str | None,
+) -> None:
+    def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        output = status_output if command[1] == "status" else "d" * 40 + "\n"
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert _REAL_SOURCE_COMMIT() == expected
+
+
+def test_source_commit_accepts_clean_archived_release_and_rejects_drift(
+    tmp_path: Path,
+) -> None:
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=origin, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=origin, check=True)
+    (origin / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+    (origin / "VERSION").write_text("1.2.3\n", encoding="utf-8")
+    for name in ("domain", "src", "scripts"):
+        path = origin / name
+        path.mkdir()
+        (path / "example.py").write_text(f"NAME = {name!r}\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=origin, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=origin, check=True)
+    subprocess.run(["git", "tag", "v1.2.3"], cwd=origin, check=True)
+    expected = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=origin,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    install = tmp_path / "install"
+    release = install / "releases" / "1.2.3"
+    release.parent.mkdir(parents=True)
+    shutil.copytree(origin, release, ignore=shutil.ignore_patterns(".git"))
+    cache_repo = install / "_cache" / "git" / "options-monitor.git"
+    cache_repo.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", "--mirror", str(origin), str(cache_repo)], check=True)
+
+    assert _REAL_SOURCE_COMMIT(release) == expected
+    (release / "src" / "example.py").write_text("NAME = 'drift'\n", encoding="utf-8")
+    assert _REAL_SOURCE_COMMIT(release) is None
+
+
+def test_read_only_size_guard_ignores_ephemeral_shm_resize_only() -> None:
+    module._assert_read_only_persistent_sizes(
+        {"db_bytes": 10, "wal_bytes": 20, "shm_bytes": 65_536},
+        {"db_bytes": 10, "wal_bytes": 20, "shm_bytes": 32_768},
+        operation="test",
+    )
+    with pytest.raises(RuntimeError, match="changed persistent SQLite sizes"):
+        module._assert_read_only_persistent_sizes(
+            {"db_bytes": 10, "wal_bytes": 20, "shm_bytes": 65_536},
+            {"db_bytes": 10, "wal_bytes": 21, "shm_bytes": 32_768},
+            operation="test",
+        )

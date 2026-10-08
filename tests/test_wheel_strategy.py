@@ -1,0 +1,905 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+
+import src.application.ledger.manual_trades as ledger_manual_trades
+from domain.domain.ledger import ContractKey, TradeEvent
+from domain.domain.wheel import (
+    WHEEL_EVENT_TYPES,
+    build_legacy_wheel_event,
+    build_wheel_call_rank_key,
+    build_wheel_put_rank_key,
+    build_wheel_event,
+    evaluate_wheel_call_candidate,
+    evaluate_wheel_put_candidate,
+    normalize_persisted_wheel_event,
+    normalize_wheel_event,
+    plan_wheel_manual_end,
+    project_wheel_call_intents,
+    project_wheel_call_linkage_candidates,
+    project_wheel_branches,
+    project_wheel_lifecycles,
+    wheel_event_payload_hash,
+)
+from src.application.ledger.commands import record_manual_assignment
+from src.application.ledger.repository import SQLiteOptionPositionsRepository
+from src.application.wheel import build_wheel_read_model, build_wheel_read_model_from_rows
+
+
+def _started_event(*, source_trade_event_id: str = "assign-put") -> dict:
+    return build_legacy_wheel_event(
+        event_id="wheel-start-1",
+        account="lx",
+        lot_id="assigned-stock-assign-put",
+        event_type="wheel_started",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        source_trade_event_id=source_trade_event_id,
+        payload={"request_id": "assignment:assign-put"},
+    )
+
+
+def _assignment_trade() -> dict:
+    return {
+        "event_id": "assign-put",
+        "event_type": "assignment",
+        "event_time_ms": 2_000,
+        "account": "lx",
+        "symbol": "NVDA",
+        "option_type": "put",
+        "position_side": "short",
+        "multiplier": 100,
+    }
+
+
+def test_current_wheel_event_requires_version_and_persisted_history_is_explicit() -> None:
+    current = build_wheel_event(
+        event_id="current-v2",
+        account="lx",
+        lot_id="assigned-stock-current",
+        event_type="wheel_manual_ended",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        payload={"request_id": "current"},
+    )
+    legacy = _started_event()
+    versionless = dict(legacy)
+    versionless.pop("event_schema_version")
+
+    assert current["event_schema_version"] == "wheel_event.v2"
+    assert legacy["event_schema_version"] == "wheel_event.v1"
+    assert wheel_event_payload_hash(legacy) == (
+        "7c415b447b4938866c6e0e0a0c964be534564d59e98644f66f3a95786948a60c"
+    )
+    with pytest.raises(ValueError, match="requires event_schema_version"):
+        normalize_wheel_event(versionless)
+    with pytest.raises(ValueError, match="requires event_schema_version"):
+        wheel_event_payload_hash(versionless)
+    assert normalize_persisted_wheel_event(versionless) == legacy
+
+    legacy_branch = project_wheel_branches(
+        [legacy], [_assignment_trade()], [], _assigned_stock(), 3_000
+    )[0]
+    legacy_continuation = plan_wheel_manual_end(
+        legacy_branch,
+        "legacy-end",
+        "tester",
+        occurred_at_ms=3_000,
+        recorded_at_ms=3_001,
+        account="lx",
+    )
+    assert legacy_branch["legacy_call_adapter"] is True
+    assert legacy_continuation["event_schema_version"] == "wheel_event.v1"
+
+
+def _call_lot(*, status: str = "open", contracts_open: int = 1) -> dict:
+    return {
+        "record_id": "call-lot-1",
+        "fields": {
+            "account": "lx",
+            "symbol": "NVDA",
+            "option_type": "call",
+            "side": "short",
+            "status": status,
+            "contracts_open": contracts_open,
+            "multiplier": 100,
+            "strategy": "wheel",
+            "leg_role": "wheel_call",
+            "source_stock_lot_id": "assigned-stock-assign-put",
+            "source_event_id": "open-call-1",
+        },
+    }
+
+
+def _legacy_wheel_start(event_id: str) -> dict:
+    return build_legacy_wheel_event(
+        event_id=event_id,
+        account="lx",
+        lot_id="assigned-stock-legacy",
+        event_type="wheel_started",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        payload={"request_id": "legacy-assignment"},
+    )
+
+
+def _assigned_stock(*, remaining: int = 100) -> dict:
+    return {
+        "_all_assigned_stock_lots": [
+            {
+                "stock_lot_id": "assigned-stock-assign-put",
+                "source_assignment_event_id": "assign-put",
+                "account": "lx",
+                "symbol": "NVDA",
+                "shares_opened": 100,
+                "shares_remaining": remaining,
+                "shares_sold": 100 - remaining,
+                "assignment_price": 100,
+                "assignment_fees": 0,
+                "stock_cost_basis_total": 10_000,
+                "sale_event_ids": [],
+            }
+        ],
+        "assigned_stock_review_rows": [],
+    }
+
+
+def _call_lot_fields(*, status: str, contracts_open: int) -> dict:
+    """A stored Call lot payload in the converged shape.
+
+    The contract travels under ``contract_key`` and the strategy-metadata family
+    is not in the payload at all (design §7.5); the fixtures below declare it on
+    the trade events instead, which is where the read side resolves it from.
+    """
+    return {
+        "lot_id": "call-lot-1",
+        "open_event_id": "open-call-1",
+        "contract_key": {
+            "broker": "富途",
+            "account": "lx",
+            "underlying_symbol": "NVDA",
+            "option_type": "call",
+            "strike": "110",
+            "expiration_ymd": "2026-08-21",
+            "asset_type": "option",
+        },
+        "position_side": "short",
+        "status": status,
+        "contracts_open": contracts_open,
+        "contracts_opened": 1,
+        "multiplier": 100,
+    }
+
+
+#: The Wheel Call linkage the retired payload used to carry, declared on the
+#: event that created the lot.
+WHEEL_CALL_STRATEGY = {
+    "strategy": "wheel",
+    "leg_role": "wheel_call",
+    "source_stock_lot_id": "assigned-stock-assign-put",
+}
+
+
+def _call_open_trade() -> dict:
+    return {
+        "event_id": "open-call-1",
+        "event_type": "open",
+        "event_time_ms": 2_500,
+        "lot_id": "call-lot-1",
+        "account": "lx",
+        "symbol": "NVDA",
+        "option_type": "call",
+        "position_side": "short",
+        "multiplier": 100,
+        "raw_payload": dict(WHEEL_CALL_STRATEGY),
+    }
+
+
+def test_wheel_projection_is_order_independent_and_tracks_linked_call() -> None:
+    call_lot = {
+        "record_id": "call-lot-1",
+        "fields": _call_lot_fields(status="open", contracts_open=1),
+    }
+    call_trade = _call_open_trade()
+    first = project_wheel_lifecycles(
+        [_started_event()],
+        [_assignment_trade(), call_trade],
+        [call_lot],
+        _assigned_stock(),
+        3_000,
+    )[0]
+    replay = project_wheel_lifecycles(
+        [_started_event(), _started_event()],
+        [call_trade, _assignment_trade()],
+        [call_lot],
+        _assigned_stock(),
+        3_000,
+    )[0]
+
+    assert first == replay
+    assert first["lifecycle_status"] == "active"
+    assert first["phase"] == "call_open"
+    assert first["integrity_status"] == "trusted"
+    assert first["active_call_lot_ids"] == ["call-lot-1"]
+
+
+def test_durable_attribution_conflict_rejects_incomplete_legacy_proof() -> None:
+    from domain.domain.trade_execution import execution_identity_from_input
+    execution = {"external_id_namespace": "futu.deal", "external_execution_id": "call-fill",
+                 "broker_account_ref": {"broker_id": "futu", "external_account_id": "1001", "environment": "REAL"}}
+    call = _call_open_trade()
+    call["raw_payload"] = {**call.get("raw_payload", {}), "execution_input": execution}
+    common = dict(account="lx", lot_id="assigned-stock-assign-put", occurred_at_ms=2500, recorded_at_ms=2500)
+    conflict = build_wheel_event(event_id="conflict", event_type="wheel_attribution_conflict", **common,
+        payload={"actor": "intake", "request_id": "conflict:1", "branch_generation_hash": "generation",
+                 "input_hash": "input", "execution_keys": [execution_identity_from_input(execution)]})
+    def project(events, evidence=()):
+        return project_wheel_lifecycles(events, [_assignment_trade(), call, *evidence],
+            [{"record_id": "call-lot-1", "fields": _call_lot_fields(status="open", contracts_open=1)}],
+            _assigned_stock(), 4000)[0]
+    blocked = project([_started_event(), conflict])
+    assert blocked["integrity_status"] != "trusted"
+    assert "strategy_attribution_conflict" in blocked["reason_codes"]
+    assert blocked["active_call_lot_ids"] == ["call-lot-1"]
+    resolution = build_wheel_event(event_id="resolved", event_type="wheel_attribution_conflict_resolved", **common,
+        payload={"actor": "operator", "request_id": "resolve:1", "branch_generation_hash": "generation",
+                 "input_hash": "input", "conflict_event_id": "conflict", "resolution_evidence_event_id": "manual-decision"})
+    assert project([resolution, conflict, _started_event()])["integrity_status"] != "trusted"
+    unrelated = {"event_id": "manual-decision", "event_type": "adjust", "event_time_ms": 2500}
+    assert project([resolution, conflict, _started_event()], [unrelated])["integrity_status"] != "trusted"
+    proof = {**unrelated, "source": "wheel_linkage", "target_lot_id": call["lot_id"], "contract_key": {"account": "lx"},
+             "raw_payload": {"actor": "operator", "attribution_request_id": "control:keep-wheel", "attribution_origin": "manual",
+                             "attribution_candidate_id": "wheel:assigned-stock-assign-put"}}
+    still_blocked = project([resolution, conflict, _started_event()], [proof])
+    assert still_blocked["integrity_status"] != "trusted"
+    assert "strategy_attribution_conflict" in still_blocked["reason_codes"]
+    wrong = build_wheel_event(event_id="wrong-resolution", event_type="wheel_attribution_conflict_resolved",
+        **common, payload={**resolution["payload"], "conflict_event_id": "unknown"})
+    assert "invalid_attribution_conflict_resolution" in project([_started_event(), conflict, wrong])["reason_codes"]
+
+
+def test_wheel_projection_fails_closed_when_called_away_event_is_missing() -> None:
+    closed_call = {
+        "record_id": "call-lot-1",
+        "fields": _call_lot_fields(status="close", contracts_open=0),
+    }
+    call_assignment = {
+        "event_id": "assign-call",
+        "event_type": "assignment",
+        "event_time_ms": 3_000,
+        "target_lot_id": "call-lot-1",
+        "account": "lx",
+        "symbol": "NVDA",
+        "option_type": "call",
+        "position_side": "short",
+        "multiplier": 100,
+    }
+
+    batch = project_wheel_lifecycles(
+        [_started_event()],
+        [_assignment_trade(), _call_open_trade(), call_assignment],
+        [closed_call],
+        _assigned_stock(remaining=0),
+        4_000,
+    )[0]
+
+    assert batch["integrity_status"] == "conflict"
+    assert batch["phase"] is None
+    assert "called_away_event_missing" in batch["reason_codes"]
+
+
+def test_repository_appends_wheel_event_once_and_reads_it_in_same_snapshot(
+    tmp_path: Path,
+) -> None:
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    ledger_manual_trades.persist_manual_open_event(
+        repo,
+        broker="富途",
+        account="lx",
+        symbol="NVDA",
+        option_type="put",
+        side="short",
+        contracts=1,
+        currency="USD",
+        strike=100,
+        multiplier=100,
+        expiration_ymd="2026-08-21",
+        premium_per_share=2.5,
+        opened_at_ms=1_000,
+    )
+    lot = repo.list_position_lots()[0]
+    record_manual_assignment(
+        repo,
+        lot_id=lot["record_id"],
+        contracts_to_close=1,
+        stock_side="buy",
+        stock_qty=100,
+        stock_price=100,
+        as_of_ms=2_000,
+    )
+    assignment = next(
+        item for item in repo.list_trade_events() if item["event_type"] == "assignment"
+    )
+    lot_id = f"assigned-stock-{assignment['event_id']}"
+    event = build_legacy_wheel_event(
+        event_id=f"wheel-start-{assignment['event_id']}",
+        account="lx",
+        lot_id=lot_id,
+        event_type="wheel_started",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        source_trade_event_id=assignment["event_id"],
+        payload={"request_id": f"assignment:{assignment['event_id']}"},
+    )
+    with repo._connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        assert repo.append_wheel_event_once(event, conn=conn) is True
+        assert repo.append_wheel_event_once(event, conn=conn) is False
+        conn.commit()
+
+    rows = repo.read_decision_state_rows_many(accounts=["lx"])["lx"]
+    model = build_wheel_read_model(repo, "lx", 3_000)
+
+    assert rows["account_wheel_events"] == [event]
+    assert event["event_schema_version"] == "wheel_event.v1"
+    assert event["wheel_branch_id"] == lot_id
+    assert model["batches"][0]["stock_lot_id"] == lot_id
+    assert model["batches"][0]["phase"] == "ready"
+    with repo._connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE wheel_events SET occurred_at_ms = 9 WHERE event_id = ?",
+            (event["event_id"],),
+        )
+    with repo._connect() as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute("DELETE FROM wheel_events WHERE event_id = ?", (event["event_id"],))
+
+
+def test_read_model_reprojects_position_lots_from_same_as_of_trade_subset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = ContractKey.from_values(
+        broker="富途",
+        account="lx",
+        underlying_symbol="NVDA",
+        option_type="put",
+        strike=100,
+        expiration_ymd="2026-08-21",
+        )
+    events = [
+        TradeEvent(
+            event_id="put-open",
+            event_type="open",
+            event_time_ms=1_000,
+            contract_key=key,
+            contracts=1,
+            price=2,
+            currency="USD",
+            source="test",
+            multiplier=100,
+            lot_id="put-lot",
+            # §9.2 step 3: the short put side travels as the trade side.
+            raw_payload={"side": "sell"},
+        ),
+        TradeEvent(
+            event_id="put-close",
+            event_type="close",
+            event_time_ms=2_000,
+            contract_key=key,
+            contracts=1,
+            price=1,
+            currency="USD",
+            source="test",
+            multiplier=100,
+            target_lot_id="put-lot",
+            # §9.2 step 3: closing the short put is a buy.
+            raw_payload={"side": "buy"},
+        ),
+        TradeEvent(
+            event_id="void-put-close",
+            event_type="void",
+            event_time_ms=3_000,
+            contract_key=key,
+            contracts=0,
+            price=0,
+            currency="USD",
+            source="test",
+            multiplier=100,
+            target_event_id="put-close",
+        ),
+    ]
+    captured = []
+
+    def _capture(_wheel_events, trade_events, position_lots, _stock, _instant):
+        captured.append(
+            (
+                [item["event_id"] for item in trade_events],
+                [
+                    (
+                        item["record_id"],
+                        item["fields"]["status"],
+                        item["fields"]["contracts_open"],
+                    )
+                    for item in position_lots
+                ],
+            )
+        )
+        return []
+
+    monkeypatch.setattr(
+        "src.application.wheel.read_model.project_wheel_branches",
+        _capture,
+    )
+    rows = {"trade_events": [event.to_dict() for event in events]}
+
+    for instant in (1_500, 2_500, 3_500):
+        build_wheel_read_model_from_rows(rows, account="lx", as_of_ms=instant)
+
+    assert captured == [
+        (["put-open"], [("put-lot", "open", 1)]),
+        (["put-open", "put-close"], [("put-lot", "close", 0)]),
+        (
+            ["put-open", "put-close", "void-put-close"],
+            [("put-lot", "open", 1)],
+        ),
+    ]
+
+
+def test_repository_rejects_wheel_event_v1_without_changing_facts(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ledger.sqlite3"
+    repo = SQLiteOptionPositionsRepository(db_path)
+    event = _legacy_wheel_start("legacy-wheel-start")
+    payload_json = json.dumps(event["payload"], ensure_ascii=False, sort_keys=True)
+    with repo._connect() as conn:
+        conn.execute("DROP TABLE wheel_events")
+        conn.execute(
+            """
+            CREATE TABLE wheel_events (
+              event_id TEXT PRIMARY KEY,
+              account TEXT NOT NULL CHECK(
+                typeof(account) = 'text' AND account != '' AND account = lower(account)
+              ),
+              stock_lot_id TEXT NOT NULL CHECK(stock_lot_id != ''),
+              event_type TEXT NOT NULL CHECK(event_type IN (
+                'wheel_started', 'wheel_manual_ended', 'wheel_called_away',
+                'wheel_call_intent_created', 'wheel_call_intent_cancelled',
+                'wheel_call_intent_consumed', 'wheel_call_linkage_rejected',
+                'wheel_event_voided'
+              )),
+              occurred_at_ms INTEGER NOT NULL CHECK(occurred_at_ms > 0),
+              recorded_at_ms INTEGER NOT NULL CHECK(recorded_at_ms > 0),
+              intent_id TEXT,
+              source_trade_event_id TEXT,
+              payload_json TEXT NOT NULL CHECK(
+                json_valid(payload_json) AND json_type(payload_json) = 'object'
+              ),
+              payload_hash TEXT NOT NULL CHECK(
+                length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'
+              ),
+              FOREIGN KEY(source_trade_event_id) REFERENCES trade_events(event_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO wheel_events (
+              event_id, account, stock_lot_id, event_type, occurred_at_ms,
+              recorded_at_ms, intent_id, source_trade_event_id, payload_json,
+              payload_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["event_id"],
+                event["account"],
+                event["stock_lot_id"],
+                event["event_type"],
+                event["occurred_at_ms"],
+                event["recorded_at_ms"],
+                event["intent_id"],
+                event["source_trade_event_id"],
+                payload_json,
+                event["payload_hash"],
+            ),
+        )
+        conn.commit()
+
+    before = db_path.read_bytes()
+    with pytest.raises(RuntimeError, match="wheel_events has a legacy schema") as error:
+        SQLiteOptionPositionsRepository(db_path)
+    assert "lot-identity-migration inventory" in str(error.value)
+    assert "separately authorized historical migration code" in str(error.value)
+    assert "apply" not in str(error.value)
+    assert db_path.read_bytes() == before
+
+
+def test_repository_appends_nullable_stock_wheel_event_v2_and_rejects_tamper(
+    tmp_path: Path,
+) -> None:
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    event = build_wheel_event(
+        event_id="wheel-put-branch-created",
+        account="lx",
+        wheel_branch_id="wheel-put:branch-1",
+        lot_id=None,
+        event_type="wheel_branch_created",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        payload={"direction": "put", "parent_branch_id": "wheel-call:parent-1"},
+    )
+    with repo._writer_connection(begin_immediate=True) as conn:
+        assert repo.append_wheel_event_once(event, conn=conn) is True
+    assert repo.list_wheel_events(account="lx") == [event]
+
+    tampered = {**event, "payload": {**event["payload"], "direction": "call"}}
+    with repo._writer_connection(begin_immediate=True) as conn, pytest.raises(
+        ValueError, match="payload hash mismatch"
+    ):
+        repo.append_wheel_event_once(tampered, conn=conn)
+
+
+def test_repository_rejects_wheel_v1_migration_when_hash_does_not_recompute(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "ledger.sqlite3"
+    repo = SQLiteOptionPositionsRepository(db_path)
+    event = _legacy_wheel_start("legacy-invalid-hash")
+    with repo._connect() as conn:
+        conn.execute("DROP TABLE wheel_events")
+        conn.execute(
+            """
+            CREATE TABLE wheel_events (
+              event_id TEXT PRIMARY KEY,
+              account TEXT NOT NULL,
+              stock_lot_id TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              occurred_at_ms INTEGER NOT NULL,
+              recorded_at_ms INTEGER NOT NULL,
+              intent_id TEXT,
+              source_trade_event_id TEXT,
+              payload_json TEXT NOT NULL,
+              payload_hash TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO wheel_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["event_id"],
+                event["account"],
+                event["stock_lot_id"],
+                event["event_type"],
+                event["occurred_at_ms"],
+                event["recorded_at_ms"],
+                None,
+                None,
+                json.dumps(event["payload"]),
+                "0" * 64,
+            ),
+        )
+        conn.commit()
+
+    with pytest.raises(RuntimeError, match="wheel_events has a legacy schema"):
+        SQLiteOptionPositionsRepository(db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(wheel_events)")]
+    assert "event_schema_version" not in columns
+
+
+def test_position_lot_patch_accepts_first_class_stock_lot_link() -> None:
+    from domain.domain.ledger.position_fields import build_open_adjustment_patch
+
+    patch = build_open_adjustment_patch(
+        {
+            "symbol": "NVDA",
+            "option_type": "call",
+            "side": "short",
+            "status": "open",
+            "contracts": 1,
+            "contracts_closed": 0,
+            "strike": 110,
+            "multiplier": 100,
+            "expiration_ymd": "2026-08-21",
+        },
+        strategy="wheel",
+        leg_role="wheel_call",
+        source_lot_id="assigned-stock-assign-put",
+        as_of_ms=3_000,
+    )
+
+    assert patch["source_stock_lot_id"] == "assigned-stock-assign-put"
+
+
+def test_wheel_candidate_uses_batch_cost_floor_and_lifecycle_pnl() -> None:
+    batch = {
+        "shares_remaining": 100,
+        "remaining_stock_cost_basis": 10_010,
+        "realized_sell_put_net_pnl": 240,
+        "realized_prior_call_net_pnl": 100,
+        "realized_prior_stock_sale_net_pnl": 0,
+    }
+    candidate = {
+        "symbol": "NVDA",
+        "contract_symbol": "NVDA-CALL-102",
+        "strike": 102,
+        "spot": 100,
+        "delta": 0.31,
+        "multiplier": 100,
+        "net_income": 190,
+        "net_income_cny": 1_350,
+        "period_net_premium_return": 0.019,
+        "annualized_net_premium_return": 0.16,
+        "spread_ratio": 0.1,
+        "open_interest": 500,
+    }
+
+    policy = {"min_abs_delta": 0.25, "max_abs_delta": 0.35}
+    fee_fact = {"basis": "estimated", "amount": 15}
+    accepted = evaluate_wheel_call_candidate(batch, candidate, policy, fee_fact, 1)
+    below_cost = evaluate_wheel_call_candidate(batch, {**candidate, "strike": 100}, policy, fee_fact, 1)
+    negative_delta = evaluate_wheel_call_candidate(batch, {**candidate, "delta": -0.31}, policy, fee_fact, 1)
+
+    assert accepted["accepted"] is True
+    assert accepted["projected_lifecycle_net_pnl_if_called"] == 705
+    assert accepted["projected_lifecycle_pnl_scope"] == "final_total_if_called"
+    assert below_cost["wheel_candidate_status"] == "rejected"
+    assert "wheel_call_strike_below_cost_floor" in below_cost["reason_codes"]
+    assert negative_delta["wheel_candidate_status"] == "accepted"
+
+
+def test_wheel_candidate_rank_uses_lifecycle_pnl_before_covered_call_ties() -> None:
+    higher_lifecycle = build_wheel_call_rank_key(
+        {
+            "projected_lifecycle_net_pnl_if_called": 500,
+            "period_net_premium_return": 0.01,
+            "strike": 105,
+            "contract_symbol": "LOW-PREMIUM",
+        }
+    )
+    lower_lifecycle = build_wheel_call_rank_key(
+        {
+            "projected_lifecycle_net_pnl_if_called": 400,
+            "period_net_premium_return": 0.03,
+            "strike": 120,
+            "contract_symbol": "HIGH-PREMIUM",
+        }
+    )
+
+    assert higher_lifecycle["sort_tuple"] < lower_lifecycle["sort_tuple"]
+
+
+def test_void_removes_intent_and_linkage_rejection_from_standalone_projections() -> None:
+    intent = build_wheel_event(
+        event_id="intent-created-1",
+        account="lx",
+        lot_id="stock-1",
+        event_type="wheel_call_intent_created",
+        occurred_at_ms=2_000,
+        recorded_at_ms=2_001,
+        intent_id="intent-1",
+        payload={"contracts": 1, "multiplier": 100, "expires_at_ms": 9_000},
+    )
+    rejection = build_wheel_event(
+        event_id="linkage-rejected-1",
+        account="lx",
+        lot_id="stock-1",
+        event_type="wheel_call_linkage_rejected",
+        occurred_at_ms=2_100,
+        recorded_at_ms=2_101,
+        payload={"call_open_event_id": "call-open-1"},
+    )
+    void_intent = build_wheel_event(
+        event_id="void-intent-1",
+        account="lx",
+        lot_id="stock-1",
+        event_type="wheel_event_voided",
+        occurred_at_ms=2_200,
+        recorded_at_ms=2_201,
+        payload={"target_wheel_event_id": intent["event_id"]},
+    )
+    void_rejection = build_wheel_event(
+        event_id="void-rejection-1",
+        account="lx",
+        lot_id="stock-1",
+        event_type="wheel_event_voided",
+        occurred_at_ms=2_300,
+        recorded_at_ms=2_301,
+        payload={"target_wheel_event_id": rejection["event_id"]},
+    )
+
+    assert project_wheel_call_intents(
+        [intent, void_intent],
+        account="lx",
+        lot_id="stock-1",
+        as_of_ms=3_000,
+    ) == []
+    candidates = project_wheel_call_linkage_candidates(
+        [
+            {
+                "account": "lx",
+                "symbol": "NVDA",
+                "stock_lot_id": "stock-1",
+                "lifecycle_status": "active",
+                "integrity_status": "trusted",
+                "active_call_lot_ids": [],
+                "shares_remaining": 100,
+                "batch_generation_hash": "generation-1",
+            }
+        ],
+        [
+            {
+                "record_id": "call-lot-1",
+                "fields": {
+                    "lot_id": "call-lot-1",
+                    "open_event_id": "call-open-1",
+                    "contract_key": {
+                        "broker": "富途",
+                        "account": "lx",
+                        "underlying_symbol": "NVDA",
+                        "option_type": "call",
+                        "strike": "110",
+                        "expiration_ymd": "2026-08-21",
+                        "asset_type": "option",
+                    },
+                    "position_side": "short",
+                    "status": "open",
+                    "contracts_open": 1,
+                    "multiplier": 100,
+                },
+            }
+        ],
+        [rejection, void_rejection],
+    )
+    assert len(candidates) == 1
+
+
+def test_wheel_put_candidate_enforces_principal_spot_and_abs_delta() -> None:
+    branch = {
+        "remaining_contracts": 1,
+        "multiplier": 100,
+        "principal_anchor": 10_010,
+        "realized_put_net_pnl_in_current_stage": 0,
+        "currency": "USD",
+    }
+    candidate = {
+        "symbol": "NVDA",
+        "contract_symbol": "NVDA-PUT-99",
+        "strike": 99,
+        "spot": 100,
+        "delta": -0.30,
+        "multiplier": 100,
+        "currency": "USD",
+        "net_income": 180,
+        "period_net_premium_return": 0.018,
+        "annualized_net_premium_return": 0.15,
+        "spread_ratio": 0.1,
+        "open_interest": 500,
+    }
+    policy = {"min_abs_delta": 0.25, "max_abs_delta": 0.35}
+
+    fee_fact = {"basis": "estimated", "amount": 10}
+    accepted = evaluate_wheel_put_candidate(branch, candidate, policy, fee_fact, 1)
+    over_anchor = evaluate_wheel_put_candidate({**branch, "principal_anchor": 9_900}, candidate, policy, fee_fact, 1)
+    above_spot = evaluate_wheel_put_candidate(branch, {**candidate, "strike": 101}, policy, fee_fact, 1)
+
+    assert accepted["accepted"] is True
+    assert accepted["projected_assignment_total"] == 9_910
+    assert accepted["replenishment_cash_remainder"] == 280
+    assert accepted["cash_reservation_amount"] == 9_900
+    assert "wheel_put_principal_anchor_exceeded" in over_anchor["reason_codes"]
+    assert "wheel_put_strike_above_spot" in above_spot["reason_codes"]
+
+
+def test_wheel_put_candidate_fails_closed_and_ranks_remainder_first() -> None:
+    unavailable = evaluate_wheel_put_candidate(
+        {
+            "remaining_contracts": 1,
+            "multiplier": 100,
+            "principal_anchor": 10_010,
+            "realized_put_net_pnl_in_current_stage": 0,
+            "currency": "USD",
+        },
+        {
+            "strike": 99,
+            "spot": None,
+            "delta": -0.30,
+            "multiplier": 100,
+            "currency": "USD",
+            "net_income": 180,
+        },
+        {"min_abs_delta": 0.25, "max_abs_delta": 0.35},
+        {"basis": "estimated", "amount": 10},
+        1,
+    )
+    higher = build_wheel_put_rank_key(
+        {
+            "replenishment_cash_remainder": 300,
+            "period_net_premium_return": 0.01,
+            "strike": 99,
+            "contract_symbol": "HIGH-REMAINDER",
+        }
+    )
+    lower = build_wheel_put_rank_key(
+        {
+            "replenishment_cash_remainder": 200,
+            "period_net_premium_return": 0.02,
+            "strike": 98,
+            "contract_symbol": "LOW-REMAINDER",
+        }
+    )
+
+    assert unavailable["wheel_candidate_status"] == "data_unavailable"
+    assert "spot_unavailable" in unavailable["reason_codes"]
+    assert tuple(higher["sort_tuple"]) < tuple(lower["sort_tuple"])
+
+
+def test_wheel_assignment_requires_exact_event_units_without_lot_fallback():
+    from domain.domain.wheel import build_legacy_wheel_started_event_from_assignment
+
+    event = {**_assignment_trade(), "contracts": 1, "raw_payload": {
+        "stock_settlement": {"side": "buy", "shares": 100, "price": 10},
+    }}
+    lot = {"fields": {"contract_key": {"option_type": "put"}, "position_side": "short", "multiplier": 100}}
+    assert build_legacy_wheel_started_event_from_assignment(
+        event, lot, recorded_at_ms=3000
+    )
+    for patch in (
+        {"multiplier": "100.5"},
+        {"multiplier": None},
+        {"raw_payload": {"stock_settlement": {"side": "buy", "shares": 100.5, "price": 10}}},
+        {"raw_payload": {"stock_settlement": {"side": "buy", "shares": 0, "stock_qty": 100, "price": 10}}},
+    ):
+        with pytest.raises(ValueError):
+            build_legacy_wheel_started_event_from_assignment(
+                {**event, **patch}, lot, recorded_at_ms=3000
+            )
+
+
+def test_wheel_invalid_intent_units_are_unknown_and_block_the_batch():
+    intent = build_legacy_wheel_event(
+        event_id="invalid-units", account="lx", lot_id="assigned-stock-assign-put",
+        event_type="wheel_call_intent_created", occurred_at_ms=2100, recorded_at_ms=2101,
+        intent_id="intent-invalid-units",
+        payload={"contracts": 1, "multiplier": "100.5", "expires_at_ms": 9000},
+    )
+    batch = project_wheel_lifecycles(
+        [_started_event(), intent], [_assignment_trade()], [], _assigned_stock(), 3000,
+    )[0]
+    assert batch["integrity_status"] == "conflict"
+    assert batch["phase"] is None
+    assert batch["active_intent_reserved_shares"] is None
+    assert "wheel_intent_units_invalid" in batch["reason_codes"]
+    from domain.domain.wheel import project_wheel_coverage
+    coverage = project_wheel_coverage(batch)
+    assert coverage["status"] == "unavailable"
+    assert coverage["reserved_shares"] is None and coverage["available_shares"] is None
+
+
+@pytest.mark.parametrize("direction", ["call", "put"])
+@pytest.mark.parametrize("committed,reserved,status,available", [(0,0,"none",300),(100,0,"partial",200),
+    (300,0,"full",0),(0,300,"none",0),(300,100,"overallocated",0)])
+def test_wheel_coverage_separates_actual_options_and_reservations(direction, committed, reserved, status, available):
+    from domain.domain.wheel import project_wheel_coverage
+    branch = {"direction": direction, "integrity_status": "trusted", "shares_remaining": 300,
+        "remaining_contracts": 3, "multiplier": 100, "active_option_committed_shares": committed,
+        "active_intent_reserved_shares": reserved}
+    result = project_wheel_coverage(branch)
+    assert result["status"] == status and result["available_shares"] == available
+    assert result["committed_shares"] == committed and result["reserved_shares"] == reserved
+    assert project_wheel_coverage({**branch, "multiplier": None})["status"] == "unavailable"
+    assert project_wheel_coverage({**branch, "shares_remaining": 0, "remaining_contracts": 0,
+        "active_option_committed_shares": 0, "active_intent_reserved_shares": 0})["status"] == "not_applicable"
+
+
+def test_known_overallocation_stays_visible_on_conflicted_branch():
+    from domain.domain.wheel import project_wheel_coverage
+    coverage = project_wheel_coverage({"direction": "call", "integrity_status": "conflict", "multiplier": 100,
+        "shares_remaining": 100, "active_option_committed_shares": 200, "active_intent_reserved_shares": 0})
+    assert coverage["status"] == "overallocated" and coverage["committed_shares"] == 200

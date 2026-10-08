@@ -1,0 +1,823 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timezone
+from typing import Any
+
+import pytest
+
+
+from domain.domain.expiration_dates import expiration_market_date
+from src.application.ledger.api import RiskPositionView, position_lot_risk_view, position_lot_snapshot
+from src.application.ledger.read_model import (
+    list_open_short_assignment_rows,
+    load_position_lot_records,
+    list_position_rows,
+)
+from src.application.positions.context_builder import (
+    build_context,
+    build_shared_context,
+    validate_option_positions_context_account,
+)
+
+
+def _lot(**overrides: object) -> dict:
+    """A position-lot record with the common short-option field defaults.
+
+    ``record_id`` selects the record id; every other keyword replaces the
+    matching field verbatim.
+    """
+    record_id = overrides.pop("record_id", "rec_1")
+    return {
+        "record_id": record_id,
+        "fields": {
+            "broker": "富途",
+            "account": "lx",
+            "symbol": "NVDA",
+            "status": "open",
+            "side": "short",
+            "option_type": "put",
+            "contracts": 1,
+            "contracts_open": 1,
+            **overrides,
+        },
+    }
+
+
+def test_raw_option_context_validator_accepts_explicit_trusted_empty_slice() -> None:
+    validate_option_positions_context_account(
+        {
+            "filters": {"broker": "富途", "account": "lx"},
+            "open_positions_min": [],
+        },
+        account="lx",
+        broker="富途",
+    )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        {"filters": {"broker": "富途"}, "open_positions_min": []},
+        {
+            "filters": {"broker": "富途", "account": "sy"},
+            "open_positions_min": [],
+        },
+        {
+            "filters": {"broker": "富途", "account": "lx"},
+            "open_positions_min": [{"record_id": "missing-account"}],
+        },
+        {
+            "filters": {"broker": "富途", "account": "lx"},
+            "open_positions_min": [
+                {"record_id": "foreign", "account": "sy"}
+            ],
+        },
+    ],
+)
+def test_raw_option_context_validator_rejects_missing_or_foreign_account(
+    context: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="account"):
+        validate_option_positions_context_account(
+            context,
+            account="lx",
+            broker="富途",
+        )
+
+
+def test_build_context_preserves_record_id_without_position_key() -> None:
+    records = [_lot(broker="富途证券（香港）", account="LX", status="OPEN", side="Sell To Open", option_type="认沽",
+                    cash_secured_amount=1000, currency="美元", premium=1.23)]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["open_positions_min"][0]["lot_id"] == "rec_1"
+    assert ctx["open_positions_min"][0]["position_key"] is None
+    assert ctx["open_positions_min"][0]["broker"] == "富途"
+    assert ctx["open_positions_min"][0]["account"] == "lx"
+    assert ctx["open_positions_min"][0]["option_type"] == "put"
+    assert ctx["open_positions_min"][0]["side"] == "short"
+    assert ctx["open_positions_min"][0]["currency"] == "USD"
+    assert ctx["open_positions_min"][0]["premium"] == 1.23
+    assert ctx["open_positions_min"][0]["expiration_ymd"] is None
+    assert ctx["open_positions_min"][0]["days_to_expiration"] is None
+    assert ctx["open_positions_min"][0]["source_stock_lot_id"] is None
+    validate_option_positions_context_account(
+        ctx,
+        account="lx",
+        broker="富途",
+    )
+
+
+def test_position_lot_risk_view_is_typed_context_read_model() -> None:
+    record = {
+        "record_id": "rec_1",
+        "fields": {
+            "broker": "富途",
+            "account": "LX",
+            "symbol": "700.HK",
+            "status": "open",
+            "side": "short",
+            "option_type": "put",
+            "contracts": 1,
+            "contracts_open": 1,
+            "cash_secured_amount": 1000,
+            "currency": "HKD",
+        },
+    }
+
+    snapshot = position_lot_snapshot(record)
+    view = position_lot_risk_view(record)
+
+    assert snapshot.lot_id == "rec_1"
+    assert isinstance(view, RiskPositionView)
+    assert view.as_shadow_record() == {"lot_id": "rec_1", "fields": snapshot.fields}
+    assert view.as_open_position_min(as_of_date=datetime(2026, 5, 1).date())["symbol"] == "0700.HK"
+
+
+def test_build_context_preserves_strategy_metadata_for_close_advice() -> None:
+    records = [_lot(account="sy", symbol="9992.HK", currency="HKD", strike=167.5, multiplier=200, premium=6.38,
+                    strategy="yield_enhancement", leg_role="sell_put",
+                    yield_enhancement_mode="vol_convexity_enhancement")]
+
+    ctx = build_context(records, broker="富途", account="sy", rates={"HKDCNY": 0.92})
+
+    row = ctx["open_positions_min"][0]
+    assert row["strategy"] == "yield_enhancement"
+    assert row["leg_role"] == "sell_put"
+    assert row["yield_enhancement_mode"] == "vol_convexity_enhancement"
+    assert row["strategy_group_id"] is None
+    from src.application.strategy_policy import resolve_position_strategy
+
+    assert resolve_position_strategy(
+        position=row,
+        config={"symbols": [{"symbol": "9992.HK", "sell_put": {"strategy": "return_first"}}]},
+    ).strategy_profile == "short_vol"
+
+
+@pytest.mark.parametrize(
+    ("relationship_fields", "expected"),
+    [
+        (
+            {
+                "option_type": "put",
+                "strategy": "combo_yield",
+                "strategy_group_id": "combo-group-1",
+                "leg_role": "funding_put",
+            },
+            ("combo-group-1", "funding_put", None),
+        ),
+        (
+            {
+                "option_type": "call",
+                "strategy": "wheel",
+                "leg_role": "wheel_call",
+                "source_stock_lot_id": "stock-lot-1",
+            },
+            (None, "wheel_call", "stock-lot-1"),
+        ),
+    ],
+)
+def test_build_context_preserves_canonical_strategy_relationships(
+    relationship_fields: dict[str, str],
+    expected: tuple[str | None, str, str | None],
+) -> None:
+    ctx = build_context(
+        [
+            {
+                "record_id": "option-lot-1",
+                "fields": {
+                    "broker": "富途",
+                    "account": "lx",
+                    "symbol": "NVDA",
+                    "status": "open",
+                    "side": "short",
+                    "contracts": 1,
+                    "contracts_open": 1,
+                    "currency": "USD",
+                    **relationship_fields,
+                },
+            }
+        ],
+        broker="富途",
+        account="lx",
+    )
+
+    row = ctx["open_positions_min"][0]
+    assert (
+        row["strategy_group_id"],
+        row["leg_role"],
+        row["source_stock_lot_id"],
+    ) == expected
+
+
+def test_build_context_reads_premium_from_its_key_and_not_from_the_note() -> None:
+    """§2/§7: ``note`` is not a payload key, so it supplies no ``premium``.
+
+    ``premium_per_share=`` in the note used to be the last-resort fallback for a
+    lot whose payload had no ``premium``. The write side never publishes ``note``
+    (``PositionLot.to_dict()`` has no such key), so the fallback could only serve
+    rows the convergence batch retired; the premium is read from its own key.
+    """
+    fields = {
+        "broker": "富途",
+        "account": "lx",
+        "symbol": "NVDA",
+        "status": "open",
+        "side": "short",
+        "option_type": "put",
+        "contracts": 1,
+        "contracts_open": 1,
+        "cash_secured_amount": 1000,
+        "currency": "USD",
+        "premium_open": "0.88",
+        # Deliberately a different number: reading it would show up as ``1.23``.
+        "note": "premium_per_share=1.23",
+    }
+
+    ctx = build_context(
+        [{"record_id": "rec_1", "fields": fields}],
+        broker="富途",
+        account="lx",
+        rates={"USDCNY": 7.2},
+    )
+
+    assert ctx["open_positions_min"][0]["premium"] == "0.88"
+
+    # And with no premium key at all, the note supplies nothing.
+    del fields["premium_open"]
+    ctx = build_context(
+        [{"record_id": "rec_1", "fields": fields}],
+        broker="富途",
+        account="lx",
+        rates={"USDCNY": 7.2},
+    )
+
+    assert ctx["open_positions_min"][0]["premium"] is None
+
+
+def test_build_context_exposes_expiration_ymd_and_days_to_expiration() -> None:
+    expiration_ms = int(datetime(2026, 5, 3, tzinfo=timezone.utc).timestamp() * 1000)
+    observed_at = datetime(2026, 5, 1, 17, tzinfo=timezone.utc)
+    as_of_days = (datetime(2026, 5, 3, tzinfo=timezone.utc).date() - expiration_market_date(observed_at, "US")).days
+    records = [_lot(cash_secured_amount=1000, currency="USD", strike=120.0, multiplier=100, expiration=expiration_ms,
+                    opened_at=1, premium=1.0)]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2}, observed_at=observed_at)
+
+    row = ctx["open_positions_min"][0]
+    # §7.2: the ms ``expiration`` is no longer a read-model field; the legacy ms
+    # input above is still read through into ``expiration_ymd``.
+    assert "expiration" not in row
+    assert row["expiration_ymd"] == "2026-05-03"
+    assert row["days_to_expiration"] == as_of_days
+    assert row["strike"] == 120.0
+    assert row["multiplier"] == 100
+    assert ctx["ledger"]["status"] == "ok"
+    assert ctx["ledger"]["fail_closed"] is False
+
+
+def test_build_context_fail_closed_on_ledger_identity_conflict() -> None:
+    expiration_ms = int(datetime(2026, 5, 3, tzinfo=timezone.utc).timestamp() * 1000)
+    records = [
+        _lot(record_id="dup_lot", cash_secured_amount=12000, currency="USD", strike=120.0, multiplier=100,
+             expiration=expiration_ms),
+        _lot(record_id="dup_lot", cash_secured_amount=12000, currency="USD", strike=120.0, multiplier=100,
+             expiration=expiration_ms),
+    ]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["ledger"]["status"] == "blocked"
+    assert ctx["ledger"]["fail_closed"] is True
+    assert ctx["open_positions_min"] == []
+    assert ctx["locked_shares_status"] == "unavailable"
+    assert ctx["locked_shares_unavailable_reason"] == "option_position_ledger_unavailable"
+
+
+def test_build_context_requires_broker_on_persisted_rows() -> None:
+    records = [
+        {
+            "record_id": "rec_1",
+            "fields": {
+                "market": "富途证券（香港）",
+                "account": "lx",
+                "symbol": "NVDA",
+                "status": "open",
+                "side": "short",
+                "option_type": "put",
+                "contracts": 1,
+                "contracts_open": 1,
+                "cash_secured_amount": 1000,
+                "currency": "USD",
+            },
+        }
+    ]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["raw_selected_count"] == 0
+    assert ctx["open_positions_min"] == []
+
+
+def test_build_shared_context_requires_broker_on_persisted_rows() -> None:
+    shared = build_shared_context(
+        [
+            {
+                "record_id": "rec_1",
+                "fields": {
+                    "market": "富途",
+                    "account": "lx",
+                    "symbol": "NVDA",
+                    "status": "open",
+                    "side": "short",
+                    "option_type": "call",
+                    "contracts": 1,
+                    "contracts_open": 1,
+                    "underlying_share_locked": 100,
+                },
+            }
+        ],
+        broker="富途",
+    )
+
+    assert shared["all_accounts"]["raw_selected_count"] == 0
+    assert shared["by_account"] == {}
+
+
+def test_build_context_scales_cash_secured_for_partial_close() -> None:
+    records = [_lot(contracts=4, contracts_closed=3, cash_secured_amount=4000, currency="USD")]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["cash_secured_by_symbol_by_ccy"]["NVDA"]["USD"] == 1000.0
+    assert ctx["cash_secured_total_by_ccy"]["USD"] == 1000.0
+    assert ctx["cash_secured_total_cny"] == 7200.0
+    assert ctx["open_positions_min"][0]["contracts_open"] == 1
+    assert ctx["open_positions_min"][0]["contracts_closed"] == 3
+
+
+def test_build_context_keeps_expired_open_put_collateral_until_evidence() -> None:
+    observed_at = datetime(2026, 9, 4, 1, 40, tzinfo=timezone.utc)
+    records = []
+    for lot_id, expiration, secured in (
+        ("expired", "2026-03-30", 10_000),
+        ("expired-yesterday", "2026-09-03", 11_000),
+        ("expires-today", "2026-09-04", 12_000),
+    ):
+        records.append(
+            {
+                "record_id": lot_id,
+                "fields": {
+                    "broker": "富途",
+                    "account": "lx",
+                    "symbol": "PDD",
+                    "status": "open",
+                    "side": "short",
+                    "option_type": "put",
+                    "contracts": 1,
+                    "contracts_open": 1,
+                    "cash_secured_amount": secured,
+                    "currency": "USD",
+                    "expiration": int(
+                        datetime.fromisoformat(expiration)
+                        .replace(tzinfo=timezone.utc)
+                        .timestamp()
+                        * 1000
+                    ),
+                },
+            }
+        )
+
+    ctx = build_context(
+        records,
+        broker="富途",
+        account="lx",
+        rates={"USDCNY": 7.2},
+        observed_at=observed_at,
+    )
+
+    assert [row["lot_id"] for row in ctx["open_positions_min"]] == [
+        "expired",
+        "expired-yesterday",
+        "expires-today",
+    ]
+    assert ctx["cash_secured_total_by_ccy"] == {"USD": 33_000.0}
+    assert ctx["cash_secured_total_cny"] == 237_600.0
+
+
+def test_build_context_scales_locked_shares_for_partial_close() -> None:
+    records = [_lot(account="sy", symbol="AAPL", option_type="call", contracts=3, contracts_open=2,
+                    contracts_closed=1, underlying_share_locked=300)]
+
+    ctx = build_context(records, broker="富途", account="sy")
+
+    assert ctx["locked_shares_by_symbol"]["AAPL"] == 200
+
+
+def test_build_context_uses_multiplier_when_locked_shares_missing() -> None:
+    records = [_lot(account="sy", symbol="700.HK", option_type="call", multiplier=500)]
+
+    ctx = build_context(records, broker="富途", account="sy")
+
+    assert ctx["locked_shares_by_symbol"]["0700.HK"] == 500
+    assert ctx["open_positions_min"][0]["symbol"] == "0700.HK"
+
+
+def test_build_context_marks_short_call_lock_unavailable_without_real_multiplier() -> None:
+    records = [_lot(account="sy", symbol="700.HK", option_type="call")]
+
+    ctx = build_context(records, broker="富途", account="sy")
+
+    assert "0700.HK" not in ctx["locked_shares_by_symbol"]
+    assert ctx["locked_shares_unavailable_by_symbol"]["0700.HK"] == "short_call_locked_shares_basis_missing"
+    assert ctx["locked_shares_status"] == "available"
+
+
+def test_build_context_derives_missing_cash_secured_from_strike_multiplier() -> None:
+    records = [_lot(symbol="700.HK", strike=480, multiplier=500, currency="HKD")]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"HKDCNY": 0.92})
+
+    assert ctx["cash_secured_by_symbol_by_ccy"]["0700.HK"]["HKD"] == 240000.0
+    assert ctx["cash_secured_total_cny"] == 220800.0
+
+
+def test_build_context_marks_short_put_cash_secured_unavailable_when_basis_missing() -> None:
+    records = [_lot(symbol="700.HK", strike=480, currency="HKD")]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"HKDCNY": 0.92})
+
+    assert ctx["cash_secured_by_symbol_by_ccy"] == {}
+    assert ctx["cash_secured_total_cny"] is None
+    assert ctx["cash_secured_unavailable_by_symbol"]["0700.HK"] == "short_put_cash_secured_basis_missing"
+
+
+def test_build_context_marks_short_put_cash_secured_unavailable_when_currency_missing() -> None:
+    records = [_lot(symbol="700.HK", strike=480, multiplier=500)]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"HKDCNY": 0.92})
+
+    assert ctx["cash_secured_by_symbol_by_ccy"] == {}
+    assert ctx["cash_secured_total_cny"] is None
+    assert ctx["cash_secured_unavailable_by_symbol"]["0700.HK"] == "short_put_cash_secured_currency_missing"
+
+
+def test_build_context_derives_missing_cash_secured_then_scales_partial_close() -> None:
+    records = [_lot(symbol="AAPL", contracts=4, contracts_closed=3, strike=100, multiplier=100, currency="USD")]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["cash_secured_by_symbol_by_ccy"]["AAPL"]["USD"] == 10000.0
+    assert ctx["cash_secured_total_cny"] == 72000.0
+
+
+def test_closed_option_leg_keeps_settlement_constraints_while_reason_pending(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.application.positions.context_builder.build_lifecycle_read_models_from_decision_snapshot",
+        lambda *_args, **_kwargs: {
+            "closed": {
+                "lifecycle_state": "settlement_pending",
+                "reason_state": "cause_pending",
+                "closure_fact": "option_leg_closed",
+                "reserved_contracts_by_lot": {"closed": 1},
+            },
+            "partial": {
+                "lifecycle_state": "settlement_pending",
+                "reason_state": "cause_pending",
+                "closure_fact": "partial_close_observed",
+                "reserved_contracts_by_lot": {"partial": 2},
+            },
+            "closed-call": {
+                "lifecycle_state": "settlement_pending",
+                "reason_state": "cause_pending",
+                "closure_fact": "option_leg_closed",
+                "reserved_contracts_by_lot": {"closed-call": 1},
+            },
+            "partial-call": {
+                "lifecycle_state": "settlement_pending",
+                "reason_state": "cause_pending",
+                "closure_fact": "partial_close_observed",
+                "reserved_contracts_by_lot": {"partial-call": 1},
+            },
+        },
+    )
+    records = [
+        _lot(record_id="closed", symbol="3690.HK", strike=80, multiplier=500, currency="HKD"),
+        _lot(record_id="partial", symbol="9992.HK", contracts=3, contracts_open=3,
+             strike=140, multiplier=200, currency="HKD"),
+        _lot(record_id="closed-call", symbol="0700.HK", option_type="call", multiplier=100),
+        _lot(record_id="partial-call", symbol="AAPL", option_type="call",
+             contracts=3, contracts_open=3, multiplier=100),
+    ]
+    snapshot_rows = deepcopy(records)
+    for record in records:
+        is_call = record["fields"]["option_type"] == "call"
+        record["fields"]["strategy"] = "covered_call" if is_call else "sell_put"
+        record["fields"]["leg_role"] = "short_call" if is_call else "short_put"
+
+    ctx = build_context(
+        records,
+        broker="富途",
+        account="lx",
+        rates={"HKDCNY": 0.8547},
+        decision_snapshot={"snapshot_status": "trusted", "normalized_account": "lx", "account_position_lots": snapshot_rows},
+    )
+
+    assert ctx["cash_secured_total_by_ccy"] == {"HKD": 28_000.0}
+    assert ctx["cash_secured_total_cny"] == 28_000.0 * 0.8547
+    assert ctx["locked_shares_by_symbol"] == {"AAPL": 200}
+    assert ctx["cash_secured_unavailable_by_symbol"] == {
+        "3690.HK": "option_close_settlement_pending",
+        "9992.HK": "option_close_settlement_pending",
+    }
+    assert ctx["locked_shares_unavailable_by_symbol"] == {
+        "0700.HK": "option_close_settlement_pending",
+        "AAPL": "option_close_settlement_pending",
+    }
+    assert ctx["open_positions_min"][0]["contracts_open"] == 1
+    from src.application.wheel.capacity import build_shared_coverage_facts
+    coverage = build_shared_coverage_facts(
+        account="lx",
+        portfolio_context={"stocks_by_symbol": {
+            "0700.HK": {"shares": 500, "can_sell_qty": 500},
+            "AAPL": {"shares": 500, "can_sell_qty": 500},
+        }},
+        option_context=ctx,
+        wheel_read_model={"batches": []},
+    )
+    assert {item["symbol"]: item["reason"] for item in coverage} == {
+        "0700.HK": "option_close_settlement_pending",
+        "AAPL": "option_close_settlement_pending",
+    }
+
+
+def test_fully_closed_pending_put_still_blocks_cash_capacity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.application.positions.context_builder.build_lifecycle_read_models_from_decision_snapshot",
+        lambda *_args, **_kwargs: {
+            "closed": {
+                "lifecycle_state": "settlement_pending",
+                "reason_state": "cause_pending",
+                "closure_fact": "option_leg_closed",
+                "reserved_contracts_by_lot": {},
+                "pending_close_contracts_by_lot": {"closed": 4},
+            }
+        },
+    )
+    records = [_lot(
+        record_id="closed", symbol="0700.HK", status="closed",
+        contracts=4, contracts_open=0, strike=430, multiplier=100,
+        currency="HKD",
+    )]
+    context = build_context(
+        records, broker="富途", account="lx", rates={"HKDCNY": 0.85},
+        decision_snapshot={
+            "snapshot_status": "trusted", "normalized_account": "lx",
+            "account_position_lots": deepcopy(records),
+        },
+    )
+    assert context["cash_secured_total_by_ccy"] == {}
+    assert context["cash_secured_unavailable_by_symbol"] == {
+        "0700.HK": "option_close_settlement_pending"
+    }
+
+
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_closed_option_leg_uses_bound_snapshot_and_preserves_conflict(
+    monkeypatch: pytest.MonkeyPatch, mismatch: bool,
+) -> None:
+    monkeypatch.setattr(
+        "src.application.positions.context_builder.build_lifecycle_read_models_from_decision_snapshot",
+        lambda *_args, **_kwargs: {
+            "lot": {
+                "lifecycle_state": "settlement_pending" if mismatch else "conflict",
+                "reason_state": "cause_pending" if mismatch else "conflict",
+                "closure_fact": "option_leg_closed",
+                "reserved_contracts_by_lot": {"lot": 1},
+            },
+        },
+    )
+    records = [_lot(record_id="lot", symbol="3690.HK", strike=80, multiplier=500, currency="HKD")]
+    snapshot_lot = _lot(record_id="lot", symbol="3690.HK", strike=80, multiplier=500, currency="HKD")
+    if mismatch:
+        snapshot_lot["fields"]["contracts_open"] = 2
+
+    ctx = build_context(
+        records,
+        broker="富途",
+        account="lx",
+        rates={"HKDCNY": 0.8547},
+        decision_snapshot={"snapshot_status": "trusted", "normalized_account": "lx", "account_position_lots": [snapshot_lot]},
+    )
+
+    assert ctx["cash_secured_total_by_ccy"] == {"HKD": 40_000.0}
+    assert ctx["cash_secured_unavailable_by_symbol"] == (
+        {"3690.HK": "option_close_settlement_pending"} if mismatch else {}
+    )
+
+
+def test_build_context_excludes_closed_or_zero_open_records() -> None:
+    records = [
+        {
+            "record_id": "closed",
+            "fields": {
+                "broker": "富途",
+                "account": "lx",
+                "symbol": "NVDA",
+                "status": "close",
+                "side": "short",
+                "option_type": "put",
+                "contracts": 1,
+                "cash_secured_amount": 1000,
+                "currency": "USD",
+            },
+        },
+        {
+            "record_id": "zero",
+            "fields": {
+                "broker": "富途",
+                "account": "lx",
+                "symbol": "AAPL",
+                "status": "open",
+                "side": "short",
+                "option_type": "call",
+                "contracts": 1,
+                "contracts_open": 0,
+                "contracts_closed": 1,
+                "underlying_share_locked": 100,
+            },
+        },
+    ]
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert ctx["open_positions_min"] == []
+    assert ctx["cash_secured_by_symbol_by_ccy"] == {}
+    assert ctx["locked_shares_by_symbol"] == {}
+
+
+def test_load_position_lot_records_prefers_position_lots_when_available() -> None:
+    class _PrimaryRepo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            return [{"record_id": "lot_1", "fields": {"symbol": "NVDA"}}]
+
+    class _Repo:
+        primary_repo = _PrimaryRepo()
+
+        def list_records(self, *, page_size: int = 500) -> list[dict[str, Any]]:
+            return [{"record_id": "legacy_1", "fields": {"symbol": "AAPL"}}]
+
+    rows = load_position_lot_records(_Repo())
+
+    assert rows == [{"record_id": "lot_1", "fields": {"symbol": "NVDA"}}]
+
+
+def test_load_position_lot_records_returns_empty_when_projection_empty() -> None:
+    class _PrimaryRepo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            return []
+
+    class _Repo:
+        primary_repo = _PrimaryRepo()
+
+        def list_records(self, *, page_size: int = 500) -> list[dict[str, Any]]:
+            return [{"record_id": "legacy_1", "fields": {"symbol": "AAPL"}}]
+
+    rows = load_position_lot_records(_Repo())
+
+    assert rows == []
+
+
+def test_load_position_lot_records_propagates_repository_failure() -> None:
+    class _PrimaryRepo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            raise RuntimeError("ledger unavailable")
+
+    class _Repo:
+        primary_repo = _PrimaryRepo()
+
+    import pytest  # pyright: ignore[reportMissingImports]
+
+    with pytest.raises(RuntimeError, match="ledger unavailable"):
+        load_position_lot_records(_Repo())
+
+
+def test_list_position_rows_requires_broker_on_persisted_rows() -> None:
+    class _Repo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            return [
+                {"record_id": "legacy_1", "fields": {"market": "富途", "account": "lx", "symbol": "AAPL", "status": "open"}},
+                {"record_id": "lot_1", "fields": {"broker": "富途", "account": "lx", "symbol": "NVDA", "status": "open"}},
+            ]
+
+    rows = list_position_rows(_Repo(), broker="富途", account="lx", status="open", limit=10)
+
+    assert [row["lot_id"] for row in rows] == ["lot_1"]
+    assert rows[0]["broker"] == "富途"
+
+
+def test_list_open_short_assignment_rows_is_strict_and_excludes_long_options() -> None:
+    class _Repo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            common = {
+                "broker": "富途证券(香港)",
+                "account": "LX",
+                "symbol": "0700.HK",
+                "contracts_open": 1,
+                "multiplier": 100,
+                "strike": 350,
+                "currency": "HKD",
+                "expiration_ymd": "2026-08-28",
+            }
+            return [
+                {
+                    "record_id": "short-put",
+                    "fields": {**common, "status": "open", "side": "short", "option_type": "put"},
+                },
+                {
+                    "record_id": "long-call",
+                    "fields": {**common, "status": "open", "side": "long", "option_type": "call"},
+                },
+                {
+                    "record_id": "closed-call",
+                    "fields": {**common, "status": "closed", "side": "short", "option_type": "call"},
+                },
+                {
+                    "record_id": "other-account",
+                    "fields": {
+                        **common,
+                        "account": "sy",
+                        "status": "open",
+                        "side": "short",
+                        "option_type": "call",
+                    },
+                },
+            ]
+
+    rows = list_open_short_assignment_rows(_Repo(), accounts=["lx"])
+
+    assert [row["lot_id"] for row in rows] == ["short-put"]
+    assert rows[0]["account"] == "lx"
+    assert rows[0]["option_type"] == "put"
+    assert rows[0]["side"] == "short"
+
+
+def test_list_open_short_assignment_rows_propagates_repository_failure() -> None:
+    class _Repo:
+        def list_position_lots(self) -> list[dict[str, Any]]:
+            raise RuntimeError("ledger unavailable")
+
+    with pytest.raises(RuntimeError) as _caught:
+        list_open_short_assignment_rows(_Repo(), accounts=["lx"])
+    exc = _caught.value
+    assert str(exc) == "ledger unavailable"
+
+
+def test_build_context_exposes_quantity_aware_combo_yield_groups() -> None:
+    group_id = "combo_yield:lx:combo_yield|PDD|PDD_P80_AUG|PDD_C100_SEP"
+    records = []
+    for lot_id, option_type, side, contracts, expiration, leg_role in (
+        ("put-1", "put", "short", 2, "2026-09-18", "sell_put"),
+        ("call-1", "call", "long", 1, "2026-09-18", "enhancement_call"),
+        ("call-2", "call", "long", 1, "2026-09-18", "enhancement_call"),
+    ):
+        expiration_ms = int(datetime.fromisoformat(expiration).replace(tzinfo=timezone.utc).timestamp() * 1000)
+        records.append(
+            {
+                "record_id": lot_id,
+                "fields": {
+                    "broker": "富途",
+                    "account": "lx",
+                    "symbol": "PDD",
+                    "status": "open",
+                    "side": side,
+                    "option_type": option_type,
+                    "contracts": contracts,
+                    "contracts_open": contracts,
+                    "contracts_closed": 0,
+                    "currency": "USD",
+                    "strike": 80.0 if option_type == "put" else 100.0,
+                    "multiplier": 100,
+                    "expiration": expiration_ms,
+                        "expiration_ymd": expiration,
+                        "opened_at": 1,
+                        "premium": 1.0,
+                        "strategy": "combo_yield",
+                    "leg_role": leg_role,
+                    "strategy_group_id": group_id,
+                    "strategy_snapshot": {"expiry_structure": "same_expiry", "strategy_group_id": group_id},
+                },
+            }
+        )
+
+    ctx = build_context(records, broker="富途", account="lx", rates={"USDCNY": 7.2})
+
+    assert len(ctx["combo_yield_groups"]) == 1
+    group = ctx["combo_yield_groups"][0]
+    assert group["strategy_group_id"] == group_id
+    assert group["put_contracts_open"] == 2
+    assert group["call_contracts_open"] == 2
+    assert group["summary_classification"] == "active_combo"
+    assert group["evidence_scope"] == "option_lots"

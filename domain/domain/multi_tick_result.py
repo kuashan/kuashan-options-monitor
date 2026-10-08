@@ -1,0 +1,102 @@
+from __future__ import annotations
+
+from typing import Any, Callable
+
+
+def _flat_cash_footer_lines(lines: list[str] | None) -> list[str]:
+    out: list[str] = []
+    for raw in lines or []:
+        text = str(raw or '').strip()
+        if not text or '💰' in text:
+            continue
+        text = text.replace('**', '').removeprefix('- ').strip()
+        if text.startswith('> '):
+            detail = text[2:].strip()
+            out.append(f"数据｜{detail}" if detail.startswith('截至 ') else f"说明｜{detail}")
+            continue
+        text = text.replace('总现金折算 ', '总现金 ')
+        text = text.replace('担保后可用 ', '担保后 ')
+        text = text.replace(' | ', '｜')
+        out.append(f"账户｜{text}")
+    return out
+
+
+def build_no_candidate_notification_text(
+    *,
+    account_label: str | None = None,
+    now_bj: str | None = None,
+    cash_footer_lines: list[str] | None = None,
+    include_account_header: bool = False,
+) -> str:
+    acct = str(account_label or '').strip().lower()
+    lines: list[str] = []
+    if include_account_header and acct:
+        lines.extend(
+            [
+                f"# OM · 决策简报 · {acct}",
+                '',
+                "状态｜扫描完成",
+            ]
+        )
+        if now_bj:
+            lines.append(f"时间｜{now_bj} 北京时间")
+        lines.extend(["结论｜当前没有通过筛选的候选。", ''])
+        footer = _flat_cash_footer_lines(cash_footer_lines)
+        if footer:
+            lines.extend(["## 资金", *footer, ''])
+        return '\n'.join(lines).strip() + '\n'
+
+    return '当前没有通过筛选的候选。\n'
+
+
+def build_no_account_notification_payloads(
+    *,
+    now_utc_fn: Callable[[], str],
+    results: list,
+    run_dir: str,
+    reason: str = 'no_account_notification',
+    error_code: str | None = None,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    shared_now = now_utc_fn()
+    shared_payload = {
+        'last_run_utc': shared_now,
+        'sent': False,
+        'reason': reason,
+        'accounts': [r.account for r in results],
+        'results': [r.__dict__ for r in results],
+    }
+    account_payloads: dict[str, dict[str, Any]] = {}
+    for r in results:
+        account_payloads[str(r.account)] = {
+            'last_run_utc': now_utc_fn(),
+            'sent': False,
+            'reason': reason,
+            'account': r.account,
+            'result': r.__dict__,
+            'run_dir': str(run_dir),
+        }
+    if error_code:
+        shared_payload['error_code'] = str(error_code)
+        for payload in account_payloads.values():
+            payload['error_code'] = str(error_code)
+    return shared_payload, account_payloads
+
+
+def build_shared_last_run_payload(
+    *,
+    prev_payload: dict[str, Any] | Any,
+    run_meta: dict[str, Any],
+    history_limit: int = 20,
+) -> dict[str, Any]:
+    prev = prev_payload if isinstance(prev_payload, dict) else {}
+    hist = prev.get('history')
+    if not isinstance(hist, list):
+        hist = []
+    hist.append(run_meta)
+    if history_limit > 0:
+        hist = hist[-int(history_limit):]
+    return {
+        **prev,
+        **run_meta,
+        'history': hist,
+    }

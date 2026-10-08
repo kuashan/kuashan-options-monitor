@@ -1,0 +1,784 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+def _portfolio_ctx(account: str, *, usd_cash: float, shares: int) -> dict:
+    return {
+        "as_of_utc": "2026-04-14T00:00:00+00:00",
+        "filters": {"broker": "富途", "account": account},
+        "cash_by_currency": {"USD": usd_cash},
+        "stocks_by_symbol": {
+            "NVDA": {
+                "symbol": "NVDA",
+                "shares": shares,
+                "avg_cost": 100.0,
+                "currency": "USD",
+                "account": account,
+            }
+        },
+        "raw_selected_count": 2,
+    }
+
+
+def _option_ctx(account: str, *, locked: int) -> dict:
+    # Stands in for ``context_builder.build_context``'s payload, so it carries
+    # the vocabulary marker the cache check requires (the strategy family comes
+    # from the event layer).
+    from src.application.positions.context_builder import STRATEGY_FAMILY_SOURCE
+
+    return {
+        "as_of_utc": "2026-04-14T00:00:00+00:00",
+        "filters": {"broker": "富途", "account": account},
+        "locked_shares_by_symbol": {"NVDA": locked},
+        "cash_secured_by_symbol_by_ccy": {"NVDA": {"USD": 1000.0}},
+        "cash_secured_total_by_ccy": {"USD": 1000.0},
+        "cash_secured_total_cny": 7200.0,
+        "exchange_rates": {"rates": {"USDCNY": 7.2}},
+        "raw_selected_count": 1,
+        "open_positions_min": [],
+        "strategy_family_source": STRATEGY_FAMILY_SOURCE,
+    }
+
+
+def _load_portfolio_ctx(
+    tmp_path: Path,
+    *,
+    account: str = "lx",
+    runtime_config: dict | None = None,
+    portfolio_source: str = "auto",
+):
+    import src.application.pipeline_context as pc
+
+    logs: list[str] = []
+    root = Path(tmp_path).resolve()
+    out = pc.load_portfolio_context(
+        base=root,
+        data_config="x.json",
+        market="富途",
+        account=account,
+
+        state_dir=(root / "state").resolve(),
+        shared_state_dir=(root / "shared").resolve(),
+        log=logs.append,
+        runtime_config=(
+            {"portfolio": {"source": "auto", "base_currency": "CNY"}}
+            if runtime_config is None
+            else runtime_config
+        ),
+        portfolio_source=portfolio_source,
+    )
+    return out, logs
+
+
+def test_build_pipeline_context_uses_futu_account_source(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    captured: dict[str, object] = {}
+    old_load_portfolio_context = pc.load_portfolio_context
+    old_load_option_positions_context = pc.load_option_positions_context
+    old_load_exchange_rates = pc.load_exchange_rates
+    try:
+        def _fake_load_portfolio_context(**kwargs):  # type: ignore[no-untyped-def]
+            captured["portfolio_source"] = kwargs.get("portfolio_source")
+            captured["account"] = kwargs.get("account")
+            return {"portfolio_source_name": kwargs.get("portfolio_source")}
+
+        def _fake_load_option_positions_context(**_kwargs):  # type: ignore[no-untyped-def]
+            return None, False
+
+        pc.load_portfolio_context = _fake_load_portfolio_context  # type: ignore[assignment]
+        pc.load_option_positions_context = _fake_load_option_positions_context  # type: ignore[assignment]
+        pc.load_exchange_rates = lambda **_kwargs: (None, None)  # type: ignore[assignment]
+
+        td = tmp_path
+        root = Path(td).resolve()
+        portfolio_ctx, option_ctx, usd_per_cny_exchange_rate, cny_per_hkd_exchange_rate = pc.build_pipeline_context(
+            py="python",
+            base=root,
+            cfg={
+                "portfolio": {
+                    "data_config": "x.json",
+                    "broker": "富途",
+                    "account": "sy",
+                    "source": "auto",
+                }
+            },
+            report_dir=(root / "reports").resolve(),
+            portfolio_timeout_sec=1,
+            runtime={},
+            is_scheduled=True,
+            state_dir=(root / "state").resolve(),
+            shared_state_dir=(root / "shared").resolve(),
+            log=lambda _msg: None,
+            no_context=False,
+            want_scan=True,
+        )
+        assert portfolio_ctx == {"portfolio_source_name": "auto"}
+        assert option_ctx is None
+        assert usd_per_cny_exchange_rate is None
+        assert cny_per_hkd_exchange_rate is None
+        assert captured == {"portfolio_source": "auto", "account": "sy"}
+    finally:
+        pc.load_portfolio_context = old_load_portfolio_context  # type: ignore[assignment]
+        pc.load_option_positions_context = old_load_option_positions_context  # type: ignore[assignment]
+        pc.load_exchange_rates = old_load_exchange_rates  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    ("template_name", "template_body", "option_payload"),
+    [
+        ("put_base", {"sell_put": {"strategy": "insurance_underwriting"}}, {"cash_secured_total_cny": 0.0}),
+        ("call_base", {"sell_call": {"strategy": "insurance_underwriting"}}, {"locked_shares_by_symbol": {}}),
+    ],
+    ids=["put_base", "call_base"],
+)
+def test_build_pipeline_context_keeps_account_context_for_underwriting(
+    tmp_path: Path,
+    template_name: str,
+    template_body: dict,
+    option_payload: dict,
+) -> None:
+    import src.application.pipeline_context as pc
+
+    old_load_portfolio_context = pc.load_portfolio_context
+    old_load_option_positions_context = pc.load_option_positions_context
+    old_load_exchange_rates = pc.load_exchange_rates
+    try:
+        pc.load_portfolio_context = lambda **_kwargs: {"cash_by_currency": {"USD": 1000.0}}  # type: ignore[assignment]
+        pc.load_option_positions_context = lambda **_kwargs: (option_payload, False)  # type: ignore[assignment]
+        pc.load_exchange_rates = lambda **_kwargs: (0.14, None)  # type: ignore[assignment]
+
+        td = tmp_path
+        root = Path(td).resolve()
+        portfolio_ctx, option_ctx, usd_per_cny_exchange_rate, _ = pc.build_pipeline_context(
+            py="python",
+            base=root,
+            cfg={
+                "portfolio": {"data_config": "x.json", "broker": "富途", "account": "lx"},
+                "templates": {template_name: template_body},
+                "symbols": [{"symbol": "NVDA", "use": [template_name]}],
+            },
+            report_dir=(root / "reports").resolve(),
+            portfolio_timeout_sec=1,
+            runtime={},
+            is_scheduled=True,
+            state_dir=(root / "state").resolve(),
+            shared_state_dir=(root / "shared").resolve(),
+            log=lambda _msg: None,
+            no_context=False,
+            want_scan=True,
+        )
+
+        assert portfolio_ctx is not None
+        assert portfolio_ctx == {"cash_by_currency": {"USD": 1000.0}}
+        assert option_ctx == option_payload
+        assert usd_per_cny_exchange_rate == 0.14
+        assert not (root / "shared" / "portfolio_context.global.json").exists()
+        assert not (root / "shared" / "option_positions_context.global.json").exists()
+    finally:
+        pc.load_portfolio_context = old_load_portfolio_context  # type: ignore[assignment]
+        pc.load_option_positions_context = old_load_option_positions_context  # type: ignore[assignment]
+        pc.load_exchange_rates = old_load_exchange_rates  # type: ignore[assignment]
+
+
+def test_shared_context_reuses_fetch_calls_across_accounts(tmp_path: Path, monkeypatch) -> None:
+    import src.application.pipeline_context as pc
+
+    shared_portfolio = {
+        "as_of_utc": "2026-04-14T00:00:00+00:00",
+        "filters": {"broker": "富途"},
+        "all_accounts": _portfolio_ctx("", usd_cash=2500.0, shares=300),
+        "by_account": {
+            "lx": _portfolio_ctx("lx", usd_cash=1000.0, shares=100),
+            "sy": _portfolio_ctx("sy", usd_cash=1500.0, shares=200),
+        },
+    }
+    shared_option = {
+        "as_of_utc": "2026-04-14T00:00:00+00:00",
+        "filters": {"broker": "富途"},
+        "all_accounts": _option_ctx("", locked=300),
+        "by_account": {
+            "lx": _option_ctx("lx", locked=100),
+            "sy": _option_ctx("sy", locked=200),
+        },
+    }
+
+    monkeypatch.setattr(pc, "decision_state_snapshot", lambda *_a, **_k: {"snapshot_status": "trusted"})
+    for context in shared_option["by_account"].values():
+        context["decision_snapshot_status"] = "trusted"
+    counts = {"portfolio": 0, "option": 0}
+    old_is_fresh = pc.is_fresh
+    old_fetch_futu_portfolio_context = pc.fetch_futu_portfolio_context
+    old_open_position_ledger = pc.open_position_ledger
+    old_load_option_position_records = pc._load_option_position_records
+    old_build_option_positions_context = pc.build_option_positions_context
+    old_build_shared_option_positions_context = pc.build_shared_option_positions_context
+    old_load_option_position_exchange_rates = pc._load_option_position_exchange_rates
+    old_decision_snapshots = pc._decision_snapshots_for_records
+
+    try:
+        pc.is_fresh = lambda path, ttl_sec: Path(path).exists()  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **kwargs: (counts.__setitem__("portfolio", counts["portfolio"] + 1) or dict(shared_portfolio["by_account"][kwargs["account"]]))  # type: ignore[assignment]
+        pc.open_position_ledger = lambda *_a, **_k: object()  # type: ignore[assignment]
+        pc._load_option_position_records = lambda *_a, **_k: (object(), [])  # type: ignore[assignment]
+        pc._load_option_position_exchange_rates = lambda **_kwargs: {"rates": {"USDCNY": 7.2}}  # type: ignore[assignment]
+        pc._decision_snapshots_for_records = lambda *_a, **_k: {  # type: ignore[assignment]
+            account: {
+                "current_decision_shadow": {
+                    "schema_version": "current_decision_shadow.v1",
+                    "status": "matched",
+                    "mismatch_count": 0,
+                    "mismatch_samples": [],
+                    "sections": [],
+                }
+            }
+            for account in ("lx", "sy")
+        }
+        pc.build_shared_option_positions_context = lambda *_a, **_k: (counts.__setitem__("option", counts["option"] + 1) or shared_option)  # type: ignore[assignment]
+        pc.build_option_positions_context = lambda *_a, **_k: (counts.__setitem__("option", counts["option"] + 1) or shared_option["all_accounts"])  # type: ignore[assignment]
+        logs: list[str] = []
+        td = tmp_path
+        root = Path(td).resolve()
+        shared_dir = (root / "shared").resolve()
+        p1 = pc.load_portfolio_context(
+            base=root,
+            data_config="x.json",
+            market="富途",
+            account="lx",
+
+            state_dir=(root / "acct_lx_state").resolve(),
+            shared_state_dir=shared_dir,
+            log=logs.append,
+        )
+        p2 = pc.load_portfolio_context(
+            base=root,
+            data_config="x.json",
+            market="富途",
+            account="sy",
+
+            state_dir=(root / "acct_sy_state").resolve(),
+            shared_state_dir=shared_dir,
+            log=logs.append,
+        )
+        o1, r1 = pc.load_option_positions_context(
+            base=root,
+            data_config="x.json",
+            market="富途",
+            account="lx",
+            ttl_sec=3600,
+            state_dir=(root / "acct_lx_state").resolve(),
+            shared_state_dir=shared_dir,
+            log=logs.append,
+        )
+        o2, r2 = pc.load_option_positions_context(
+            base=root,
+            data_config="x.json",
+            market="富途",
+            account="sy",
+            ttl_sec=3600,
+            state_dir=(root / "acct_sy_state").resolve(),
+            shared_state_dir=shared_dir,
+            log=logs.append,
+        )
+        assert counts["portfolio"] == 2
+        assert counts["option"] == 1
+        assert p1 and p2
+        assert o1 and o2
+        assert r1 is True
+        assert r2 is True
+        assert p1["context_source"] == "futu_direct"
+        assert p2["context_source"] == "futu_direct"
+        assert o1["context_source"] == "shared_refresh"
+        assert o2["context_source"] == "shared_slice"
+        assert p1["cash_by_currency"]["USD"] == 1000.0
+        assert p2["cash_by_currency"]["USD"] == 1500.0
+        assert o1["locked_shares_by_symbol"]["NVDA"] == 100
+        assert o2["locked_shares_by_symbol"]["NVDA"] == 200
+        assert o1["current_decision_shadow"]["status"] == "matched"
+        assert o2["current_decision_shadow"]["status"] == "matched"
+        assert any("portfolio_context source=futu_direct account=sy" in x for x in logs)
+        assert any("option_positions_context source=shared_slice account=sy" in x for x in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch_futu_portfolio_context  # type: ignore[assignment]
+        pc.open_position_ledger = old_open_position_ledger  # type: ignore[assignment]
+        pc._load_option_position_records = old_load_option_position_records  # type: ignore[assignment]
+        pc.build_option_positions_context = old_build_option_positions_context  # type: ignore[assignment]
+        pc.build_shared_option_positions_context = old_build_shared_option_positions_context  # type: ignore[assignment]
+        pc._load_option_position_exchange_rates = old_load_option_position_exchange_rates  # type: ignore[assignment]
+        pc._decision_snapshots_for_records = old_decision_snapshots  # type: ignore[assignment]
+
+
+def test_shared_slice_matches_legacy_key_fields() -> None:
+    from src.application.positions.context_builder import (
+        build_context as build_option_context,
+        build_shared_context as build_option_shared_context,
+        slice_shared_context_for_account as slice_option_shared_context,
+    )
+    from src.application.portfolio_context_builder import (
+        build_context as build_portfolio_context,
+        build_shared_context as build_portfolio_shared_context,
+        slice_shared_context_for_account as slice_portfolio_shared_context,
+    )
+
+    holdings_records = [
+        {"fields": {"market": "富途美股", "account": "lx", "asset_type": "cash", "asset_id": "USD-CASH", "currency": "USD", "quantity": "1000"}},
+        {"fields": {"market": "富途美股", "account": "lx", "asset_type": "us_stock", "asset_id": "NVDA", "asset_name": "NVIDIA", "currency": "USD", "quantity": "10", "avg_cost": "100"}},
+        {"fields": {"market": "富途美股", "account": "sy", "asset_type": "cash", "asset_id": "USD-CASH", "currency": "USD", "quantity": "2000"}},
+        {"fields": {"market": "富途美股", "account": "sy", "asset_type": "us_stock", "asset_id": "AAPL", "asset_name": "Apple", "currency": "USD", "quantity": "20", "avg_cost": "150"}},
+    ]
+    option_records = [
+        {
+            "record_id": "r1",
+            "fields": {
+                "broker": "富途",
+                "account": "lx",
+                "status": "open",
+                "symbol": "NVDA",
+                "option_type": "call",
+                "side": "short",
+                "contracts": "1",
+                "underlying_share_locked": "100",
+            },
+        },
+        {
+            "record_id": "r2",
+            "fields": {
+                "broker": "富途",
+                "account": "sy",
+                "status": "open",
+                "symbol": "AAPL",
+                "option_type": "put",
+                "side": "short",
+                "contracts": "1",
+                "cash_secured_amount": "500",
+                "currency": "USD",
+            },
+        },
+    ]
+
+    single_portfolio = build_portfolio_context(holdings_records, broker="富途", account="lx")
+    shared_portfolio = build_portfolio_shared_context(holdings_records, broker="富途")
+    sliced_portfolio = slice_portfolio_shared_context(shared_portfolio, "lx")
+    assert sliced_portfolio is not None
+    assert sliced_portfolio["filters"] == single_portfolio["filters"]
+    assert sliced_portfolio["cash_by_currency"] == single_portfolio["cash_by_currency"]
+    assert {
+        k: {kk: vv for kk, vv in v.items() if kk != "market"}
+        for k, v in sliced_portfolio["stocks_by_symbol"].items()
+    } == {
+        k: {kk: vv for kk, vv in v.items() if kk != "market"}
+        for k, v in single_portfolio["stocks_by_symbol"].items()
+    }
+
+    rates = {"rates": {"USDCNY": 7.2}}
+    legacy_option = build_option_context(option_records, broker="富途", account="lx", rates=rates)
+    shared_option = build_option_shared_context(option_records, broker="富途", rates=rates)
+    sliced_option = slice_option_shared_context(shared_option, "lx")
+    assert sliced_option is not None
+    assert sliced_option["filters"] == legacy_option["filters"]
+    assert sliced_option["locked_shares_by_symbol"] == legacy_option["locked_shares_by_symbol"]
+    assert sliced_option["cash_secured_by_symbol_by_ccy"] == legacy_option["cash_secured_by_symbol_by_ccy"]
+    assert sliced_option["open_positions_min"] == legacy_option["open_positions_min"]
+
+
+def test_option_context_rejects_foreign_account_cache_before_adapter(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import src.application.pipeline_context as pc
+
+    monkeypatch.setattr(
+        pc,
+        "is_fresh",
+        lambda path, _ttl: Path(path).name
+        == "option_positions_context.json",
+    )
+    monkeypatch.setattr(
+        pc,
+        "load_cached_json",
+        lambda _path: {
+            "filters": {"broker": "富途", "account": "lx"},
+            "open_positions_min": [],
+        },
+    )
+    monkeypatch.setattr(
+        pc,
+        "_load_option_position_records",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("live ledger unavailable")
+        ),
+    )
+    logs: list[str] = []
+
+    td = tmp_path
+    root = Path(td).resolve()
+    context, refreshed = pc.load_option_positions_context(
+        base=root,
+        data_config="portfolio.runtime.json",
+        market="富途",
+        account="sy",
+        ttl_sec=3600,
+        state_dir=root / "account-state",
+        shared_state_dir=root / "run-state",
+        log=logs.append,
+    )
+
+    assert context is None
+    assert refreshed is False
+    assert any(
+        "rejected source=account_cache" in message
+        and "expected=sy actual=lx" in message
+        for message in logs
+    )
+
+
+def test_load_holdings_records_falls_back_to_list_only_on_permanent_search_error(monkeypatch, tmp_path: Path) -> None:
+    import src.application.portfolio_context_builder as fpc
+
+    monkeypatch.setenv("OM_FEISHU_APP_ID", "app_id")
+    monkeypatch.setenv("OM_FEISHU_APP_SECRET", "app_secret")
+    monkeypatch.setenv("OM_FEISHU_HOLDINGS_TABLE", "app_token/table_id")
+    cfg = tmp_path / "data.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "feishu": {
+                    "app_id_env": "OM_FEISHU_APP_ID",
+                    "app_secret_env": "OM_FEISHU_APP_SECRET",
+                    "tables": {"holdings_env": "OM_FEISHU_HOLDINGS_TABLE"},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    old_retry = fpc.with_tenant_token_retry
+    old_search = fpc.bitable_search_records
+    old_list = fpc.bitable_list_records
+    try:
+        fpc.with_tenant_token_retry = lambda app_id, app_secret, fn: fn("token")  # type: ignore[assignment]
+        fpc.bitable_search_records = lambda *_args, **_kwargs: (_ for _ in ()).throw(fpc.FeishuPermanentError("unsupported"))  # type: ignore[assignment]
+        fpc.bitable_list_records = lambda *_args, **_kwargs: [{"record_id": "rec_1", "fields": {}}]  # type: ignore[assignment]
+
+        rows = fpc.load_holdings_records(cfg)
+    finally:
+        fpc.with_tenant_token_retry = old_retry  # type: ignore[assignment]
+        fpc.bitable_search_records = old_search  # type: ignore[assignment]
+        fpc.bitable_list_records = old_list  # type: ignore[assignment]
+
+    assert rows == [{"record_id": "rec_1", "fields": {}}]
+
+
+def test_load_holdings_records_does_not_fallback_on_permission_error(monkeypatch, tmp_path: Path) -> None:
+    import src.application.portfolio_context_builder as fpc
+
+    monkeypatch.setenv("OM_FEISHU_APP_ID", "app_id")
+    monkeypatch.setenv("OM_FEISHU_APP_SECRET", "app_secret")
+    monkeypatch.setenv("OM_FEISHU_HOLDINGS_TABLE", "app_token/table_id")
+    cfg = tmp_path / "data.json"
+    cfg.write_text(
+        json.dumps(
+            {
+                "feishu": {
+                    "app_id_env": "OM_FEISHU_APP_ID",
+                    "app_secret_env": "OM_FEISHU_APP_SECRET",
+                    "tables": {"holdings_env": "OM_FEISHU_HOLDINGS_TABLE"},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    old_retry = fpc.with_tenant_token_retry
+    old_search = fpc.bitable_search_records
+    old_list = fpc.bitable_list_records
+    try:
+        fpc.with_tenant_token_retry = lambda app_id, app_secret, fn: fn("token")  # type: ignore[assignment]
+        fpc.bitable_search_records = lambda *_args, **_kwargs: (_ for _ in ()).throw(fpc.FeishuPermissionError("denied"))  # type: ignore[assignment]
+        fpc.bitable_list_records = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("permission errors should not fall back to list"))  # type: ignore[assignment]
+
+        try:
+            fpc.load_holdings_records(cfg)
+            assert False, "should raise"
+        except fpc.FeishuPermissionError:
+            pass
+    finally:
+        fpc.with_tenant_token_retry = old_retry  # type: ignore[assignment]
+        fpc.bitable_search_records = old_search  # type: ignore[assignment]
+        fpc.bitable_list_records = old_list  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_auto_prefers_futu_when_available(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: {  # type: ignore[assignment]
+            "as_of_utc": "2026-04-14T00:00:00+00:00",
+            "filters": {"broker": "富途", "account": "lx"},
+            "cash_by_currency": {"CNY": 120000.0},
+            "stocks_by_symbol": {},
+            "raw_selected_count": 1,
+            "portfolio_source_name": "futu",
+        }
+
+        out, logs = _load_portfolio_ctx(tmp_path, )
+        assert out is not None
+        assert out["portfolio_source_name"] == "futu"
+        assert out["context_source"] == "futu_direct"
+        assert any("portfolio_context source=futu_direct account=lx" in x for x in logs)
+    finally:
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_auto_skips_fresh_holdings_cache_and_uses_futu(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_is_fresh = pc.is_fresh
+    old_load_cached_json = pc.load_cached_json
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        pc.is_fresh = lambda *_a, **_k: True  # type: ignore[assignment]
+
+        def _load_cached(path: Path):  # type: ignore[no-untyped-def]
+            if path.name == "portfolio_context.json":
+                return {
+                    "as_of_utc": "2026-04-14T00:00:00+00:00",
+                    "filters": {"broker": "富途", "account": "lx"},
+                    "cash_by_currency": {"CNY": 88000.0},
+                    "stocks_by_symbol": {},
+                    "raw_selected_count": 1,
+                    "portfolio_source_name": "holdings",
+                }
+            return None
+
+        pc.load_cached_json = _load_cached  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: {  # type: ignore[assignment]
+            "as_of_utc": "2026-04-14T00:01:00+00:00",
+            "filters": {"broker": "富途", "account": "lx"},
+            "cash_by_currency": {"CNY": 120000.0},
+            "stocks_by_symbol": {},
+            "raw_selected_count": 1,
+            "portfolio_source_name": "futu",
+        }
+
+        out, logs = _load_portfolio_ctx(tmp_path)
+        assert out is not None
+        assert out["portfolio_source_name"] == "futu"
+        assert out["context_source"] == "futu_direct"
+        assert any("portfolio_context source=futu_direct account=lx" in x for x in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.load_cached_json = old_load_cached_json  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_auto_does_not_fall_back_when_futu_unavailable(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_fetch = pc.fetch_futu_portfolio_context
+
+    try:
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("opend down"))  # type: ignore[assignment]
+
+        out, logs = _load_portfolio_ctx(tmp_path, )
+        assert out["cash_snapshot"]["status"] == "unknown"
+        assert "CASH_PROVIDER_UNAVAILABLE" in out["cash_snapshot"]["reason_codes"]
+        assert not out.get("cash_by_currency")
+        assert any("opend down" in line for line in logs)
+    finally:
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_auto_ignores_local_holdings_cache_when_futu_fails(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_is_fresh = pc.is_fresh
+    old_load_cached_json = pc.load_cached_json
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        pc.is_fresh = lambda path, ttl_sec: Path(path).name == "portfolio_context.json"  # type: ignore[assignment]
+
+        def _load_cached(path: Path):  # type: ignore[no-untyped-def]
+            if path.name == "portfolio_context.json":
+                return {
+                    "as_of_utc": "2026-04-14T00:00:00+00:00",
+                    "filters": {"market": "富途", "account": "lx"},
+                    "cash_by_currency": {"CNY": 88000.0},
+                    "stocks_by_symbol": {},
+                    "raw_selected_count": 1,
+                    "portfolio_source_name": "holdings",
+                }
+            return None
+
+        pc.load_cached_json = _load_cached  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("opend down"))  # type: ignore[assignment]
+
+        out, logs = _load_portfolio_ctx(tmp_path)
+        assert out["cash_snapshot"]["status"] == "unknown"
+        assert "CASH_PROVIDER_UNAVAILABLE" in out["cash_snapshot"]["reason_codes"]
+        assert not out.get("cash_by_currency")
+        assert any("opend down" in line for line in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.load_cached_json = old_load_cached_json  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_rejects_stale_account_cache_with_wrong_filters_account(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_is_fresh = pc.is_fresh
+    old_load_cached_json = pc.load_cached_json
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        shared_ctx = {
+            "as_of_utc": "2026-04-14T00:00:00+00:00",
+            "filters": {"broker": "富途", "account": None},
+            "all_accounts": _portfolio_ctx("", usd_cash=2000.0, shares=200),
+            "by_account": {
+                "lx": _portfolio_ctx("lx", usd_cash=1000.0, shares=100),
+                "sy": _portfolio_ctx("sy", usd_cash=1500.0, shares=200),
+            },
+        }
+
+        pc.is_fresh = lambda *_args, **_kwargs: True  # type: ignore[assignment]
+
+        def _load_cached(path: Path):  # type: ignore[no-untyped-def]
+            if path.name == "portfolio_context.json":
+                stale = _portfolio_ctx("lx", usd_cash=800.0, shares=100)
+                stale["portfolio_source_name"] = "futu"
+                return stale
+            if path.name == "portfolio_context.shared.json":
+                return shared_ctx
+            return None
+
+        pc.load_cached_json = _load_cached  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: _portfolio_ctx("sy", usd_cash=1500.0, shares=200)  # type: ignore[assignment]
+
+        runtime_cfg = {
+            "accounts": ["sy"],
+            "account_settings": {"sy": {"type": "futu"}},
+            "portfolio": {"source": "auto"},
+        }
+        out, logs = _load_portfolio_ctx(
+            tmp_path, account="sy", runtime_config=runtime_cfg, portfolio_source="auto"
+        )
+        assert out is not None
+        assert out["filters"]["account"] == "sy"
+        assert out["stocks_by_symbol"]["NVDA"]["account"] == "sy"
+        assert out["context_source"] == "futu_direct"
+        assert any("cache rejected due to account mismatch source=account_cache filters.account requested=sy cached=lx" in x for x in logs)
+        assert any("portfolio_context source=futu_direct account=sy" in x for x in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.load_cached_json = old_load_cached_json  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_rejects_stale_account_cache_with_wrong_stock_account(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_is_fresh = pc.is_fresh
+    old_load_cached_json = pc.load_cached_json
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        pc.is_fresh = lambda path, ttl_sec: Path(path).name == "portfolio_context.json"  # type: ignore[assignment]
+
+        def _load_cached(path: Path):  # type: ignore[no-untyped-def]
+            if path.name == "portfolio_context.json":
+                stale = _portfolio_ctx("sy", usd_cash=1500.0, shares=200)
+                stale["stocks_by_symbol"]["NVDA"]["account"] = "lx"
+                stale["portfolio_source_name"] = "futu"
+                return stale
+            return None
+
+        pc.load_cached_json = _load_cached  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: _portfolio_ctx("sy", usd_cash=1500.0, shares=200)  # type: ignore[assignment]
+
+        runtime_cfg = {
+            "accounts": ["sy"],
+            "account_settings": {"sy": {"type": "futu"}},
+            "portfolio": {"source": "auto"},
+        }
+        out, logs = _load_portfolio_ctx(
+            tmp_path, account="sy", runtime_config=runtime_cfg, portfolio_source="auto"
+        )
+        assert out is not None
+        assert out["filters"]["account"] == "sy"
+        assert out["stocks_by_symbol"]["NVDA"]["account"] == "sy"
+        assert out["context_source"] == "futu_direct"
+        assert any("cache rejected due to account mismatch source=account_cache stocks_by_symbol[NVDA].account requested=sy cached=lx" in x for x in logs)
+        assert any("portfolio_context source=futu_direct account=sy" in x for x in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.load_cached_json = old_load_cached_json  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]
+
+
+def test_load_portfolio_context_futu_cache_reuses_matching_account_label(tmp_path: Path) -> None:
+    import src.application.pipeline_context as pc
+
+    old_is_fresh = pc.is_fresh
+    old_load_cached_json = pc.load_cached_json
+    old_fetch = pc.fetch_futu_portfolio_context
+    try:
+        pc.is_fresh = lambda path, ttl_sec: Path(path).name == "portfolio_context.json"  # type: ignore[assignment]
+
+        def _load_cached(path: Path):  # type: ignore[no-untyped-def]
+            if path.name == "portfolio_context.json":
+                from datetime import datetime, timezone
+                return {
+                    "cash_source_observed_at": datetime.now(timezone.utc).isoformat(),
+                    "cash_balance_reliable": True,
+                    "cash_balance_unavailable_by_row": {},
+                    "source_account_identifiers": ["123"],
+                    "capacity_authority": {
+                        "status": "available", "source": "opend", "logical_account": "user1",
+                        "futu_account_id": "123", "trd_env": "REAL", "market": "us",
+                    },
+                    "as_of_utc": "2026-04-14T00:00:00+00:00",
+                    "filters": {"broker": "富途", "account": "user1"},
+                    "cash_by_currency": {"USD": 88000.0},
+                    "stocks_by_symbol": {
+                        "NVDA": {
+                            "symbol": "NVDA",
+                            "shares": 300,
+                            "avg_cost": 100.0,
+                            "currency": "USD",
+                            "account": "user1",
+                        }
+                    },
+                    "raw_selected_count": 1,
+                    "portfolio_source_name": "futu",
+                }
+            return None
+
+        pc.load_cached_json = _load_cached  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("fresh futu cache should be reused"))  # type: ignore[assignment]
+
+        runtime_cfg = {
+            "accounts": ["user1"],
+            "account_settings": {"user1": {"type": "futu", "futu": {"account_id": "123", "trd_env": "REAL"}}},
+            "_resolved": {"market": "us"},
+            "portfolio": {"source": "auto", "base_currency": "CNY"},
+        }
+        out, logs = _load_portfolio_ctx(tmp_path, account="user1", runtime_config=runtime_cfg)
+        assert out is not None
+        assert out["portfolio_source_name"] == "futu"
+        assert out["filters"]["account"] == "user1"
+        assert out["stocks_by_symbol"]["NVDA"]["account"] == "user1"
+        assert out["context_source"] == "account_cache"
+        assert any("portfolio_context source=account_cache account=user1" in x for x in logs)
+        assert not any("cache rejected due to account mismatch" in x for x in logs)
+    finally:
+        pc.is_fresh = old_is_fresh  # type: ignore[assignment]
+        pc.load_cached_json = old_load_cached_json  # type: ignore[assignment]
+        pc.fetch_futu_portfolio_context = old_fetch  # type: ignore[assignment]

@@ -1,0 +1,931 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+import math
+from typing import Any
+from domain.domain.wheel_call_allocation import parse_wheel_call_allocations
+
+from domain.domain.trade_contract_identity import contract_share_quantity, require_option_multiplier
+from domain.domain.option_position_identity import (
+    BUY_TO_CLOSE,
+    EXPIRE_AUTO_CLOSE,
+    SELL_TO_CLOSE,
+    exp_ms_to_datetime as exp_ms_to_datetime,
+    exp_ms_to_ymd as exp_ms_to_ymd,
+    norm_symbol,
+    normalize_account,
+    normalize_broker,
+    normalize_close_type,
+    normalize_option_type,
+    normalize_side,
+    normalize_status,
+    now_ms,
+    parse_exp_to_ms,
+    resolve_open_currency,
+)
+from domain.domain.strategy_vocab import STRATEGY_COMBO_YIELD, canonical_strategy_id
+from domain.domain.strategy_membership import POSITION_LOT_STRATEGY_PATCH_FIELDS as POSITION_LOT_STRATEGY_PATCH_FIELDS
+
+
+class _Unset:
+    pass
+
+
+_UNSET = _Unset()
+_PatchValue = int | float | str | dict[str, Any] | list[dict[str, Any]] | None | _Unset
+
+
+PRICE_DECIMAL_PLACES = 3
+_PRICE_QUANTUM = Decimal(1).scaleb(-PRICE_DECIMAL_PLACES)
+
+LEGACY_POSITION_LOT_PATCH_FIELDS = ("yield_enhancement_mode",)
+
+# §7.1: ``position_id`` is retired, so it is not a patch field and must never be
+# re-emitted. Adjust events written before the retirement still carry it (the
+# writer stored it alongside the real fields), and rejecting the whole payload
+# would silently drop those historical adjustments — the projection only logs an
+# ``adjust_patch_invalid`` diagnostic and keeps going. Tolerate and discard it.
+RETIRED_POSITION_LOT_PATCH_FIELDS = ("position_id",)
+
+POSITION_LOT_PATCH_FIELDS = (
+    "contracts_open",
+    "contracts_closed",
+    "last_action_at",
+    "close_type",
+    "close_reason",
+    "close_price",
+    "status",
+    "closed_at",
+    "contracts",
+    "strike",
+    "premium",
+    "multiplier",
+    "expiration",
+    "expiration_ymd",
+    "opened_at",
+    "cash_secured_amount",
+    "underlying_share_locked",
+    "currency",
+    "note",
+    *POSITION_LOT_STRATEGY_PATCH_FIELDS,
+    *LEGACY_POSITION_LOT_PATCH_FIELDS,
+)
+
+#: Persisted payload key -> declared field name, for the keys whose stored
+#: spelling is a boundary the convergence batch must not move.  This tuple is
+#: the *storage* key list (``decode_position_lot_patch`` rejects anything outside
+#: it), so a field whose declared name converged onto ``lot_id`` still stores its
+#: original key.  Mirrors the translation already written out longhand in
+#: ``decode_position_lot_patch``; every other key is its own field name.
+PATCH_STORAGE_KEY_TO_FIELD = {"source_stock_lot_id": "source_lot_id"}
+
+
+def safe_float(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _required_text(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} is required")
+    return text
+
+
+def _optional_patch_text(value: Any, field_name: str) -> str | _Unset:
+    if value is None:
+        return _UNSET
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name} must be non-empty when provided")
+    return text
+
+
+def _optional_patch_object(value: Any, field_name: str) -> dict[str, Any] | _Unset:
+    if value is None:
+        return _UNSET
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"{field_name} must be a non-empty JSON object when provided")
+    return dict(value)
+
+
+def strip_retired_strategy_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    out = {key: value for key, value in payload.items() if key != "yield_enhancement_mode"}
+    if canonical_strategy_id(out.get("strategy")) == STRATEGY_COMBO_YIELD:
+        out["strategy"] = STRATEGY_COMBO_YIELD
+    snapshot = out.get("strategy_snapshot")
+    if isinstance(snapshot, dict):
+        cleaned_snapshot = {
+            key: value for key, value in snapshot.items() if key != "yield_enhancement_mode"
+        }
+        if canonical_strategy_id(cleaned_snapshot.get("strategy")) == STRATEGY_COMBO_YIELD:
+            cleaned_snapshot["strategy"] = STRATEGY_COMBO_YIELD
+        out["strategy_snapshot"] = cleaned_snapshot
+    return out
+
+
+def normalize_trade_price(value: Any, field_name: str = "premium_per_share", *, allow_zero: bool = False) -> float:
+    if value in (None, ""):
+        raise ValueError(f"{field_name} is required")
+    try:
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field_name} must be numeric") from None
+    if not price.is_finite():
+        raise ValueError(f"{field_name} must be numeric")
+    if price < 0 or (price == 0 and not allow_zero):
+        comparator = ">= 0" if allow_zero else "> 0"
+        raise ValueError(f"{field_name} must be {comparator}")
+    if isinstance(value, float):
+        try:
+            rounded = price.quantize(_PRICE_QUANTUM)
+        except InvalidOperation:
+            # Quantizing very large, otherwise valid values can exceed the
+            # active decimal context. Preserve the pre-existing validation
+            # behavior for those values instead of leaking InvalidOperation.
+            pass
+        else:
+            if (
+                (rounded != 0 or allow_zero)
+                and abs(price - rounded)
+                <= Decimal(str(math.ulp(value))) * 2
+            ):
+                price = rounded
+    exponent = price.normalize().as_tuple().exponent
+    decimal_places = max(0, -exponent) if isinstance(exponent, int) else 0
+    if decimal_places > PRICE_DECIMAL_PLACES:
+        raise ValueError(f"{field_name} supports at most {PRICE_DECIMAL_PLACES} decimal places")
+    return float(price)
+
+
+def _required_decimal(value: Any, field_name: str) -> Decimal:
+    if value in (None, ""):
+        raise ValueError(f"{field_name} is required")
+    try:
+        decimal_value = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"{field_name} must be numeric") from None
+    if not decimal_value.is_finite():
+        raise ValueError(f"{field_name} must be numeric")
+    return decimal_value
+
+
+def _required_positive_float(value: Any, field_name: str) -> float:
+    decimal_value = _required_decimal(value, field_name)
+    if decimal_value <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return float(decimal_value)
+
+
+def _required_positive_int(value: Any, field_name: str) -> int:
+    decimal_value = _required_decimal(value, field_name)
+    if decimal_value != decimal_value.to_integral_value():
+        raise ValueError(f"{field_name} must be an integer")
+    if decimal_value <= 0:
+        raise ValueError(f"{field_name} must be > 0")
+    return int(decimal_value)
+
+
+def _short_call_locked_shares(multiplier: float, contracts: int) -> int:
+    return contract_share_quantity(contracts, multiplier)
+
+
+def parse_note_kv(note: str, key: str) -> str:
+    if not note:
+        return ""
+    for part in str(note).replace(",", ";").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        if part.startswith(f"{key}="):
+            return part.split("=", 1)[1].strip()
+    return ""
+
+
+def merge_note(note: str | None, kv: dict[str, str]) -> str:
+    parts: list[str] = []
+    base = str(note or "").strip()
+    if base:
+        parts.append(base)
+    for key, value in kv.items():
+        if value in (None, ""):
+            continue
+        parts.append(f"{key}={value}")
+    return ";".join(parts)
+
+
+def calc_cash_secured(strike: float, multiplier: float, contracts: int | float) -> float:
+    return float(strike) * contract_share_quantity(contracts, multiplier)
+
+
+def _contract_key(fields: dict[str, Any]) -> dict[str, Any]:
+    contract_key = fields.get("contract_key")
+    return contract_key if isinstance(contract_key, dict) else {}
+
+
+def effective_contracts(fields: dict[str, Any]) -> int:
+    v = safe_float(fields.get("contracts_opened"))
+    if v is None:
+        v = safe_float(fields.get("contracts"))
+    return max(0, int(v or 0))
+
+
+def effective_contracts_open(fields: dict[str, Any]) -> int:
+    status = normalize_status(fields.get("status"))
+    if status == "close":
+        return 0
+    open_v = safe_float(fields.get("contracts_open"))
+    if open_v is not None:
+        return max(0, int(open_v))
+    closed_v = safe_float(fields.get("contracts_closed"))
+    total = effective_contracts(fields)
+    if closed_v is not None:
+        return max(0, total - int(closed_v))
+    return total
+
+
+def effective_contracts_closed(fields: dict[str, Any]) -> int:
+    closed_v = safe_float(fields.get("contracts_closed"))
+    if closed_v is not None:
+        return max(0, int(closed_v))
+    total = effective_contracts(fields)
+    open_v = effective_contracts_open(fields)
+    return max(0, total - open_v)
+
+
+def effective_expiration(fields: dict[str, Any]) -> tuple[int | None, str]:
+    # Converged payloads carry the contract under
+    # ``contract_key.expiration_ymd``; the flat ``expiration`` ms sibling is
+    # retired (write-side-definition §2) but stays as a legacy fallback until
+    # the window replay rewrites every row. ``parse_exp_to_ms`` renders
+    # midnight UTC -- never ``EXPIRATION_DATE_TZ`` (UTC+8).
+    exp_ms = parse_exp_to_ms(_contract_key(fields).get("expiration_ymd"))
+    if exp_ms is not None:
+        return int(exp_ms), "contract_key.expiration_ymd"
+    exp_ms = fields.get("expiration")
+    parsed_exp = exp_ms_to_datetime(exp_ms)
+    if parsed_exp is not None:
+        return int(parsed_exp.timestamp() * 1000), "expiration"
+    return None, "none"
+
+
+def effective_expiration_ymd(fields: dict[str, Any]) -> str | None:
+    ymd = _contract_key(fields).get("expiration_ymd")
+    if ymd:
+        return ymd
+    exp_ms, _source = effective_expiration(fields)
+    return exp_ms_to_ymd(exp_ms)
+
+
+def effective_strike(fields: dict[str, Any]) -> float | None:
+    strike = safe_float(_contract_key(fields).get("strike"))
+    if strike is None:
+        strike = safe_float(fields.get("strike"))
+    if strike is not None:
+        return float(strike)
+    return None
+
+
+def effective_multiplier(fields: dict[str, Any]) -> int | None:
+    # Only the canonical field supplies option units; notes are not evidence.
+    try:
+        return require_option_multiplier(fields.get("multiplier"))
+    except ValueError:
+        return None
+
+
+# §7.1: ``build_position_id`` and its ``_fmt_strike`` helper are retired. The
+# position display/aggregation key is ``position_key`` (contract identity +
+# derived side, §9.2 step 3), produced by ``PositionLot.position_key``; the
+# retired ``position_id`` was a second, contract-count-bearing display id that
+# duplicated that concept with a different string.
+
+
+@dataclass(frozen=True)
+class PositionLotPatch:
+    contracts_open: _PatchValue = _UNSET
+    contracts_closed: _PatchValue = _UNSET
+    last_action_at: _PatchValue = _UNSET
+    close_type: _PatchValue = _UNSET
+    close_reason: _PatchValue = _UNSET
+    close_price: _PatchValue = _UNSET
+    status: _PatchValue = _UNSET
+    closed_at: _PatchValue = _UNSET
+    contracts: _PatchValue = _UNSET
+    strike: _PatchValue = _UNSET
+    premium: _PatchValue = _UNSET
+    multiplier: _PatchValue = _UNSET
+    expiration: _PatchValue = _UNSET
+    expiration_ymd: _PatchValue = _UNSET
+    opened_at: _PatchValue = _UNSET
+    cash_secured_amount: _PatchValue = _UNSET
+    underlying_share_locked: _PatchValue = _UNSET
+    currency: _PatchValue = _UNSET
+    note: _PatchValue = _UNSET
+    strategy: _PatchValue = _UNSET
+    leg_role: _PatchValue = _UNSET
+    strategy_group_id: _PatchValue = _UNSET
+    source_lot_id: _PatchValue = _UNSET
+    source_wheel_branch_id: _PatchValue = _UNSET
+    wheel_call_allocations: _PatchValue = _UNSET
+    strategy_snapshot: _PatchValue = _UNSET
+    yield_enhancement_mode: _PatchValue = _UNSET
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key in POSITION_LOT_PATCH_FIELDS:
+            value = getattr(self, PATCH_STORAGE_KEY_TO_FIELD.get(key, key))
+            if value is _UNSET:
+                continue
+            payload[key] = value
+        return payload
+
+    def has(self, key: str) -> bool:
+        if key not in POSITION_LOT_PATCH_FIELDS:
+            raise KeyError(f"unsupported position lot patch field: {key}")
+        return getattr(self, PATCH_STORAGE_KEY_TO_FIELD.get(key, key)) is not _UNSET
+
+    def value(self, key: str) -> int | float | str | dict[str, Any] | list[dict[str, Any]] | None:
+        if key not in POSITION_LOT_PATCH_FIELDS:
+            raise KeyError(f"unsupported position lot patch field: {key}")
+        value = getattr(self, PATCH_STORAGE_KEY_TO_FIELD.get(key, key))
+        if value is _UNSET:
+            raise KeyError(f"position lot patch field is unset: {key}")
+        return value
+
+
+def decode_position_lot_patch(payload: Any) -> PositionLotPatch:
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError("adjust event requires non-empty raw_payload.patch")
+    retired = frozenset(RETIRED_POSITION_LOT_PATCH_FIELDS)
+    unsupported = sorted(
+        str(key)
+        for key in payload
+        if str(key) not in POSITION_LOT_PATCH_FIELDS and str(key) not in retired
+    )
+    if unsupported:
+        raise ValueError(f"adjust patch contains unsupported fields: {', '.join(unsupported)}")
+    return PositionLotPatch(
+        contracts_open=payload.get("contracts_open", _UNSET),
+        contracts_closed=payload.get("contracts_closed", _UNSET),
+        last_action_at=payload.get("last_action_at", _UNSET),
+        close_type=payload.get("close_type", _UNSET),
+        close_reason=payload.get("close_reason", _UNSET),
+        close_price=payload.get("close_price", _UNSET),
+        status=payload.get("status", _UNSET),
+        closed_at=payload.get("closed_at", _UNSET),
+        contracts=payload.get("contracts", _UNSET),
+        strike=payload.get("strike", _UNSET),
+        premium=payload.get("premium", _UNSET),
+        multiplier=payload.get("multiplier", _UNSET),
+        expiration=payload.get("expiration", _UNSET),
+        expiration_ymd=payload.get("expiration_ymd", _UNSET),
+        opened_at=payload.get("opened_at", _UNSET),
+        cash_secured_amount=payload.get("cash_secured_amount", _UNSET),
+        underlying_share_locked=payload.get("underlying_share_locked", _UNSET),
+        currency=payload.get("currency", _UNSET),
+        note=payload.get("note", _UNSET),
+        strategy=payload.get("strategy", _UNSET),
+        leg_role=payload.get("leg_role", _UNSET),
+        strategy_group_id=payload.get("strategy_group_id", _UNSET),
+        source_lot_id=payload.get("source_stock_lot_id", _UNSET),
+        source_wheel_branch_id=payload.get("source_wheel_branch_id", _UNSET),
+        wheel_call_allocations=payload.get("wheel_call_allocations", _UNSET),
+        strategy_snapshot=payload.get("strategy_snapshot", _UNSET),
+        yield_enhancement_mode=payload.get("yield_enhancement_mode", _UNSET),
+    )
+
+
+def build_position_lot_fields(
+    *,
+    broker: str,
+    account: str,
+    symbol: str,
+    option_type: str,
+    side: str,
+    contracts: int,
+    currency: str | None = None,
+    strike: float | None = None,
+    multiplier: float | None = None,
+    expiration_ymd: str | None = None,
+    premium_per_share: float | None = None,
+    underlying_share_locked: int | None = None,
+    note: str | None = None,
+    opened_at_ms: int | None = None,
+    strategy_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    sym = norm_symbol(symbol)
+    broker = normalize_broker(broker)
+    account = normalize_account(account)
+    _required_text(broker, "broker")
+    _required_text(account, "account")
+    _required_text(sym, "symbol")
+    side = normalize_side(side, strict=True)
+    option_type = normalize_option_type(option_type, strict=True)
+    currency = resolve_open_currency(sym, currency)
+    contracts = _required_positive_int(contracts, "contracts")
+
+    if strike is None:
+        raise ValueError(f"{option_type} option requires strike")
+    strike = _required_positive_float(strike, "strike")
+    exp_ms = parse_exp_to_ms(expiration_ymd)
+    if exp_ms is None:
+        raise ValueError(f"{option_type} option requires expiration_ymd")
+    premium = normalize_trade_price(premium_per_share, "premium_per_share")
+
+    if multiplier is None:
+        raise ValueError(f"{option_type} option requires multiplier")
+    multiplier = require_option_multiplier(multiplier)
+    cash_secured = None
+    if side == "short" and option_type == "put":
+        cash_secured = calc_cash_secured(strike, multiplier, contracts)
+
+    underlying_locked = None
+    if underlying_share_locked not in (None, ""):
+        if side != "short" or option_type != "call":
+            raise ValueError("underlying_share_locked only applies to short call")
+        underlying_locked = _required_positive_int(underlying_share_locked, "underlying_share_locked")
+    if side == "short" and option_type == "call":
+        expected_locked = _short_call_locked_shares(multiplier, contracts)
+        if underlying_locked is None:
+            underlying_locked = expected_locked
+        elif underlying_locked != expected_locked:
+            raise ValueError("underlying_share_locked must equal contracts * multiplier for short call")
+
+    note_kv: dict[str, str] = {}
+
+    opened_at = int(opened_at_ms or now_ms())
+    normalized_multiplier = multiplier
+    strategy_snapshot_value = (
+        strip_retired_strategy_metadata(strategy_snapshot) or None
+        if isinstance(strategy_snapshot, dict)
+        else None
+    )
+    payload: dict[str, Any] = {
+        "broker": broker,
+        "account": account,
+        "symbol": sym,
+        "option_type": option_type,
+        "side": side,
+        "contracts": contracts,
+        "contracts_open": contracts,
+        "contracts_closed": 0,
+        "currency": currency,
+        "status": "open",
+        "note": merge_note(note, note_kv) or None,
+        "opened_at": opened_at,
+        "last_action_at": opened_at,
+        "strike": strike,
+        "expiration": int(exp_ms),
+    }
+    if premium is not None:
+        payload["premium"] = premium
+    if normalized_multiplier is not None:
+        payload["multiplier"] = normalized_multiplier
+    if underlying_locked is not None:
+        payload["underlying_share_locked"] = int(underlying_locked)
+    if cash_secured is not None:
+        payload["cash_secured_amount"] = float(cash_secured)
+    if strategy_snapshot_value is not None:
+        payload["strategy_snapshot"] = strategy_snapshot_value
+    return payload
+
+
+def strategy_metadata_fields_from_payload(
+    payload: dict[str, Any] | None,
+    *,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    if not include_legacy:
+        payload = strip_retired_strategy_metadata(payload)
+    snapshot = payload.get("strategy_snapshot")
+    snapshot_fields = snapshot if isinstance(snapshot, dict) else {}
+    out: dict[str, Any] = {}
+    for key in POSITION_LOT_STRATEGY_PATCH_FIELDS:
+        value = payload.get(key)
+        if key == "strategy_snapshot":
+            if snapshot_fields:
+                out[key] = dict(snapshot_fields)
+            continue
+        if key == "wheel_call_allocations":
+            if isinstance(value, list):
+                out[key] = value
+            elif isinstance(snapshot_fields.get(key), list):
+                out[key] = snapshot_fields[key]
+            continue
+        if value in (None, ""):
+            value = snapshot_fields.get(key)
+        text = str(value or "").strip()
+        if text:
+            out[key] = text
+    if include_legacy:
+        value = payload.get("yield_enhancement_mode")
+        if value in (None, ""):
+            value = snapshot_fields.get("yield_enhancement_mode")
+        text = str(value or "").strip()
+        if text:
+            out["yield_enhancement_mode"] = text
+    return out
+
+
+def apply_strategy_metadata_patch(
+    payload: dict[str, Any] | None,
+    patch: dict[str, Any],
+    *,
+    include_legacy: bool = False,
+) -> dict[str, Any]:
+    """Apply explicit strategy metadata set/clear semantics to one payload.
+
+    A present ``None``/empty value is a durable clear, including the fallback
+    copy inside ``strategy_snapshot``.  Keeping this operation in the ledger
+    domain prevents publication and report projections from interpreting the
+    same adjustment differently.
+    """
+
+    out = dict(payload or {})
+    keys = (
+        *POSITION_LOT_STRATEGY_PATCH_FIELDS,
+        *(LEGACY_POSITION_LOT_PATCH_FIELDS if include_legacy else ()),
+    )
+    snapshot_value = out.get("strategy_snapshot")
+    snapshot = dict(snapshot_value) if isinstance(snapshot_value, dict) else {}
+
+    if "strategy_snapshot" in patch:
+        value = patch.get("strategy_snapshot")
+        if isinstance(value, dict) and value:
+            snapshot = (
+                dict(value)
+                if include_legacy
+                else strip_retired_strategy_metadata(dict(value))
+            )
+        else:
+            snapshot = {}
+        if snapshot:
+            out["strategy_snapshot"] = dict(snapshot)
+        else:
+            out.pop("strategy_snapshot", None)
+
+    for key in keys:
+        if key == "strategy_snapshot" or key not in patch:
+            continue
+        value = patch.get(key)
+        if key == "wheel_call_allocations":
+            if value is None:
+                out.pop(key, None)
+                snapshot.pop(key, None)
+            elif isinstance(value, list):
+                parse_wheel_call_allocations(value)
+                out[key] = value
+                if snapshot:
+                    snapshot[key] = value
+            else:
+                raise ValueError("wheel_call_allocations must be a list")
+            continue
+        if value in (None, ""):
+            out.pop(key, None)
+            snapshot.pop(key, None)
+            continue
+        text = str(value).strip()
+        if not text:
+            out.pop(key, None)
+            snapshot.pop(key, None)
+            continue
+        out[key] = text
+        if snapshot:
+            snapshot[key] = text
+
+    if snapshot:
+        out["strategy_snapshot"] = snapshot
+    else:
+        out.pop("strategy_snapshot", None)
+    return out
+
+
+def build_open_adjustment_patch_contract(
+    fields: dict[str, Any],
+    *,
+    contracts: int | None = None,
+    strike: float | None = None,
+    expiration_ymd: str | None = None,
+    premium_per_share: float | None = None,
+    multiplier: _PatchValue = _UNSET,
+    opened_at_ms: int | None = None,
+    strategy: str | None = None,
+    leg_role: str | None = None,
+    strategy_group_id: str | None = None,
+    source_lot_id: str | None = None,
+    source_wheel_branch_id: str | None = None,
+    wheel_call_allocations: list[dict[str, Any]] | None = None,
+    strategy_snapshot: dict[str, Any] | None = None,
+    as_of_ms: int | None = None,
+) -> PositionLotPatch:
+    if isinstance(strategy_snapshot, dict):
+        strategy_snapshot = strip_retired_strategy_metadata(strategy_snapshot) or None
+    if multiplier is _UNSET and all(
+        value is None
+        for value in (
+            contracts,
+            strike,
+            expiration_ymd,
+            premium_per_share,
+            opened_at_ms,
+            strategy,
+            leg_role,
+            strategy_group_id,
+            source_lot_id,
+            source_wheel_branch_id,
+            wheel_call_allocations,
+            strategy_snapshot,
+        )
+    ):
+        raise ValueError("at least one adjustment field is required")
+
+    contract_key = _contract_key(fields)
+    symbol = norm_symbol(contract_key.get("underlying_symbol") or fields.get("symbol") or "")
+    option_type = normalize_option_type(contract_key.get("option_type") or fields.get("option_type"), strict=True)
+    side = normalize_side(fields.get("position_side") or fields.get("side"), strict=True)
+    status = normalize_status(fields.get("status"), strict=True)
+    total_contracts = effective_contracts(fields)
+    closed_contracts = effective_contracts_closed(fields)
+
+    next_contracts = _required_positive_int(contracts, "contracts") if contracts is not None else total_contracts
+    if next_contracts <= 0:
+        raise ValueError("contracts must be > 0")
+    if closed_contracts > next_contracts:
+        raise ValueError(f"contracts must be >= contracts_closed: {next_contracts} < {closed_contracts}")
+    if status == "close" and contracts is not None and next_contracts != closed_contracts:
+        raise ValueError("cannot change contracts on a closed lot unless it equals contracts_closed")
+
+    next_strike = _required_positive_float(strike, "strike") if strike is not None else effective_strike(fields)
+    next_multiplier = require_option_multiplier(
+        fields.get("multiplier") if multiplier is _UNSET else multiplier
+    )
+
+    next_expiration_ymd = expiration_ymd or effective_expiration_ymd(fields) or None
+    parsed_exp_ms: int | None = None
+    if expiration_ymd is not None:
+        parsed_exp_ms = parse_exp_to_ms(expiration_ymd)
+        if parsed_exp_ms is None:
+            raise ValueError("expiration_ymd must be YYYY-MM-DD")
+
+    patch_contracts: _PatchValue = _UNSET
+    patch_contracts_open: _PatchValue = _UNSET
+    patch_contracts_closed: _PatchValue = _UNSET
+    patch_strike: _PatchValue = _UNSET
+    patch_premium: _PatchValue = _UNSET
+    patch_multiplier: _PatchValue = _UNSET
+    patch_expiration: _PatchValue = _UNSET
+    patch_opened_at: _PatchValue = _UNSET
+    patch_cash_secured: _PatchValue = _UNSET
+    patch_underlying_locked: _PatchValue = _UNSET
+    canonical_strategy = strip_retired_strategy_metadata({"strategy": strategy}).get("strategy")
+    patch_strategy = _optional_patch_text(canonical_strategy, "strategy")
+    patch_leg_role = _optional_patch_text(leg_role, "leg_role")
+    patch_strategy_group_id = _optional_patch_text(strategy_group_id, "strategy_group_id")
+    patch_source_lot_id = _optional_patch_text(
+        source_lot_id,
+        "source_stock_lot_id",
+    )
+    patch_source_wheel_branch_id = _optional_patch_text(
+        source_wheel_branch_id,
+        "source_wheel_branch_id",
+    )
+    if wheel_call_allocations is not None:
+        parse_wheel_call_allocations(wheel_call_allocations)
+    patch_wheel_call_allocations: _PatchValue = wheel_call_allocations if wheel_call_allocations is not None else _UNSET
+    patch_strategy_snapshot = _optional_patch_object(strategy_snapshot, "strategy_snapshot")
+
+    if contracts is not None:
+        patch_contracts = next_contracts
+        patch_contracts_closed = closed_contracts
+        patch_contracts_open = 0 if status == "close" else max(0, next_contracts - closed_contracts)
+    if strike is not None:
+        if next_strike is None:
+            raise ValueError("strike must be numeric")
+        patch_strike = next_strike
+    if premium_per_share is not None:
+        patch_premium = normalize_trade_price(premium_per_share, "premium_per_share")
+    if multiplier is not _UNSET:
+        patch_multiplier = next_multiplier
+    if expiration_ymd is not None:
+        assert parsed_exp_ms is not None
+        patch_expiration = int(parsed_exp_ms)
+    if opened_at_ms is not None:
+        patch_opened_at = int(opened_at_ms)
+
+    if side == "short" and option_type == "put" and (
+        contracts is not None or strike is not None or multiplier is not _UNSET
+    ):
+        if next_strike is None:
+            raise ValueError("short put adjustment requires strike")
+        if next_multiplier is None:
+            raise ValueError("short put adjustment requires multiplier")
+        patch_cash_secured = float(calc_cash_secured(float(next_strike), next_multiplier, next_contracts))
+
+    if side == "short" and option_type == "call" and (contracts is not None or multiplier is not _UNSET):
+        if next_multiplier is None:
+            raise ValueError("short call adjustment requires multiplier")
+        patch_underlying_locked = _short_call_locked_shares(next_multiplier, next_contracts)
+
+    return PositionLotPatch(
+        contracts=patch_contracts,
+        contracts_open=patch_contracts_open,
+        contracts_closed=patch_contracts_closed,
+        last_action_at=int(as_of_ms or now_ms()),
+        strike=patch_strike,
+        premium=patch_premium,
+        multiplier=patch_multiplier,
+        expiration=patch_expiration,
+        opened_at=patch_opened_at,
+        cash_secured_amount=patch_cash_secured,
+        underlying_share_locked=patch_underlying_locked,
+        strategy=patch_strategy,
+        leg_role=patch_leg_role,
+        strategy_group_id=patch_strategy_group_id,
+        source_lot_id=patch_source_lot_id,
+        source_wheel_branch_id=patch_source_wheel_branch_id,
+        wheel_call_allocations=patch_wheel_call_allocations,
+        strategy_snapshot=patch_strategy_snapshot,
+    )
+
+
+def build_open_adjustment_patch(
+    fields: dict[str, Any],
+    *,
+    contracts: int | None = None,
+    strike: float | None = None,
+    expiration_ymd: str | None = None,
+    premium_per_share: float | None = None,
+    multiplier: _PatchValue = _UNSET,
+    opened_at_ms: int | None = None,
+    strategy: str | None = None,
+    leg_role: str | None = None,
+    strategy_group_id: str | None = None,
+    source_lot_id: str | None = None,
+    source_wheel_branch_id: str | None = None,
+    wheel_call_allocations: list[dict[str, Any]] | None = None,
+    strategy_snapshot: dict[str, Any] | None = None,
+    as_of_ms: int | None = None,
+) -> dict[str, Any]:
+    return build_open_adjustment_patch_contract(
+        fields,
+        contracts=contracts,
+        strike=strike,
+        expiration_ymd=expiration_ymd,
+        premium_per_share=premium_per_share,
+        multiplier=multiplier,
+        opened_at_ms=opened_at_ms,
+        strategy=strategy,
+        leg_role=leg_role,
+        strategy_group_id=strategy_group_id,
+        source_lot_id=source_lot_id,
+        source_wheel_branch_id=source_wheel_branch_id,
+        wheel_call_allocations=wheel_call_allocations,
+        strategy_snapshot=strategy_snapshot,
+        as_of_ms=as_of_ms,
+    ).to_dict()
+
+
+def build_close_patch_contract(
+    fields: dict[str, Any],
+    *,
+    contracts_to_close: int,
+    close_price: float | None = None,
+    close_reason: str = "manual_close",
+    close_type: str | None = None,
+    as_of_ms: int | None = None,
+) -> PositionLotPatch:
+    qty = int(contracts_to_close)
+    if qty <= 0:
+        raise ValueError("contracts_to_close must be > 0")
+    open_qty = effective_contracts_open(fields)
+    if qty > open_qty:
+        raise ValueError(f"contracts_to_close exceeds open contracts: {qty} > {open_qty}")
+
+    total = effective_contracts(fields)
+    closed = effective_contracts_closed(fields) + qty
+    remaining = max(0, open_qty - qty)
+    ts = int(as_of_ms or now_ms())
+    if close_type:
+        effective_close_type = normalize_close_type(close_type) or str(close_type).strip().lower()
+    else:
+        normalized_side = normalize_side(fields.get("position_side") or fields.get("side"), strict=True)
+        effective_close_type = (BUY_TO_CLOSE if normalized_side == "short" else SELL_TO_CLOSE)
+
+    close_price_value: _PatchValue = _UNSET
+    if close_price is not None:
+        close_price_value = normalize_trade_price(
+            close_price,
+            "close_price",
+            allow_zero=(effective_close_type == EXPIRE_AUTO_CLOSE),
+        )
+    if remaining == 0:
+        status = "close"
+        closed_at: _PatchValue = ts
+    else:
+        status = "open"
+        closed_at = _UNSET
+    return PositionLotPatch(
+        contracts_open=remaining,
+        contracts_closed=min(closed, total) if total > 0 else closed,
+        last_action_at=ts,
+        close_type=effective_close_type,
+        close_reason=str(close_reason or "manual_close"),
+        close_price=close_price_value,
+        status=status,
+        closed_at=closed_at,
+    )
+
+
+def build_close_patch(
+    fields: dict[str, Any],
+    *,
+    contracts_to_close: int,
+    close_price: float | None = None,
+    close_reason: str = "manual_close",
+    close_type: str | None = None,
+    as_of_ms: int | None = None,
+) -> dict[str, Any]:
+    return build_close_patch_contract(
+        fields,
+        contracts_to_close=contracts_to_close,
+        close_price=close_price,
+        close_reason=close_reason,
+        close_type=close_type,
+        as_of_ms=as_of_ms,
+    ).to_dict()
+
+
+def build_buy_to_close_patch(
+    fields: dict[str, Any],
+    *,
+    contracts_to_close: int,
+    close_price: float | None = None,
+    close_reason: str = "manual_buy_to_close",
+    as_of_ms: int | None = None,
+) -> dict[str, Any]:
+    return build_close_patch(
+        fields,
+        contracts_to_close=contracts_to_close,
+        close_price=close_price,
+        close_reason=close_reason,
+        close_type=BUY_TO_CLOSE,
+        as_of_ms=as_of_ms,
+    )
+
+
+def build_expire_auto_close_patch_contract(
+    fields: dict[str, Any],
+    *,
+    as_of_ms: int | None = None,
+    close_reason: str = "expired",
+    exp_source: str | None = None,
+    grace_days: int | None = None,
+) -> PositionLotPatch:
+    open_qty = effective_contracts_open(fields)
+    total = effective_contracts(fields)
+    ts = int(as_of_ms or now_ms())
+    note_kv = {
+        "auto_close_at": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+        "auto_close_reason": close_reason,
+        "close_reason": close_reason,
+    }
+    if grace_days is not None:
+        note_kv["auto_close_grace_days"] = str(grace_days)
+    if exp_source:
+        note_kv["auto_close_exp_src"] = str(exp_source)
+    return PositionLotPatch(
+        contracts_open=0,
+        contracts_closed=max(effective_contracts_closed(fields) + open_qty, total),
+        status="close",
+        closed_at=ts,
+        last_action_at=ts,
+        close_type=EXPIRE_AUTO_CLOSE,
+        close_reason=str(close_reason or "expired"),
+        note=merge_note(fields.get("note"), note_kv),
+    )
+
+
+def build_expire_auto_close_patch(
+    fields: dict[str, Any],
+    *,
+    as_of_ms: int | None = None,
+    close_reason: str = "expired",
+    exp_source: str | None = None,
+    grace_days: int | None = None,
+) -> dict[str, Any]:
+    return build_expire_auto_close_patch_contract(
+        fields,
+        as_of_ms=as_of_ms,
+        close_reason=close_reason,
+        exp_source=exp_source,
+        grace_days=grace_days,
+    ).to_dict()

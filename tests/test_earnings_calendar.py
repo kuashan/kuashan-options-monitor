@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from hashlib import sha256
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+from domain.domain.decision_state_fingerprint import canonical_sha256
+import src.application.earnings_calendar as earnings_calendar
+from src.application.earnings_calendar import (
+    annotate_candidates_with_earnings_evidence,
+    earnings_calendar_intervals,
+    earnings_calendar_scan_date,
+    fetch_market_earnings_calendar,
+    prefetch_market_earnings_calendars,
+    project_earnings_for_expiry,
+    validate_earnings_calendar_snapshot,
+)
+from src.infrastructure.futu_gateway import (
+    FutuGatewayCapabilityUnavailableError,
+)
+
+
+def _us_timestamp(day: int, hour: int) -> float:
+    from zoneinfo import ZoneInfo
+
+    return datetime(
+        2026,
+        8,
+        day,
+        hour,
+        tzinfo=ZoneInfo("America/New_York"),
+    ).timestamp()
+
+
+def _event(
+    security: str,
+    earnings_date: str,
+    *,
+    timestamp: float | None = None,
+    pub_type: str | None = None,
+) -> dict:
+    event = {"security": security, "earnings_date": earnings_date}
+    if timestamp is not None:
+        event["earnings_timestamp"] = timestamp
+    if pub_type is not None:
+        event["pub_type"] = pub_type
+    return event
+
+
+class _Gateway:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+        self.close_calls = 0
+
+    def get_earnings_calendar(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+def test_candidate_annotation_preserves_optional_earnings_none(tmp_path: Path) -> None:
+    snapshot = _fetch_calendar(
+        _Gateway([[]] * 7),
+        expirations_by_underlier={"US.NVDA": ["2026-08-12", "2026-09-18"]},
+    )
+    _write_snapshot(tmp_path, snapshot)
+    candidates = pd.DataFrame(
+        [
+            {"market": "US", "symbol": "NVDA", "expiration": "2026-08-12"},
+            {"market": "US", "symbol": "NVDA", "expiration": "2026-09-18"},
+        ]
+    )
+
+    rows = annotate_candidates_with_earnings_evidence(
+        candidates,
+        input_root=tmp_path,
+    ).to_dict("records")
+
+    assert rows[0]["earnings_soft_window_end"] is None
+    assert rows[1]["earnings_soft_window_end"] == "2026-09-11"
+    assert canonical_sha256(rows[0])
+
+
+_SCAN_AT_UTC = datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc)
+
+
+def _fetch_calendar(
+    gateway: _Gateway,
+    *,
+    expirations_by_underlier: dict[str, list[str]],
+    market: str = "US",
+    scan_date: date = date(2026, 8, 6),
+    scan_at_utc: datetime = _SCAN_AT_UTC,
+    now_fn=lambda: datetime(2026, 8, 6, 16, 1, tzinfo=timezone.utc),
+) -> dict:
+    return fetch_market_earnings_calendar(
+        gateway=gateway,
+        market=market,
+        scan_date=scan_date,
+        scan_at_utc=scan_at_utc,
+        expirations_by_underlier=expirations_by_underlier,
+        now_fn=now_fn,
+    )
+
+
+def _fetch(gateway: _Gateway, *, expiry: str = "2026-08-21"):
+    return _fetch_calendar(gateway, expirations_by_underlier={"US.NVDA": [expiry]})
+
+
+def _rehash(snapshot: dict) -> None:
+    payload = {key: value for key, value in snapshot.items() if key != "snapshot_hash"}
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    snapshot["snapshot_hash"] = sha256(encoded).hexdigest()
+
+
+def test_intervals_are_inclusive_non_overlapping_and_at_most_seven_days() -> None:
+    assert earnings_calendar_intervals(
+        date(2026, 8, 6),
+        date(2026, 8, 21),
+    ) == [
+        (date(2026, 8, 6), date(2026, 8, 12)),
+        (date(2026, 8, 13), date(2026, 8, 19)),
+        (date(2026, 8, 20), date(2026, 8, 21)),
+    ]
+
+
+def test_scan_date_uses_each_market_local_calendar_date() -> None:
+    scan_at = datetime(2026, 8, 6, 1, 0, tzinfo=timezone.utc)
+    assert earnings_calendar_scan_date("US", scan_at) == date(2026, 8, 5)
+    assert earnings_calendar_scan_date("HK", scan_at) == date(2026, 8, 6)
+
+
+def test_complete_empty_results_make_absence_authoritative() -> None:
+    snapshot = _fetch(_Gateway([[], [], []]))
+
+    evidence = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+    assert snapshot["status"] == "ready"
+    assert snapshot["absence_authoritative"] is True
+    assert evidence["status"] == "ready"
+    assert evidence["has_earnings_event"] is False
+    assert all(item["result_hash"] for item in snapshot["intervals"])
+
+
+def test_interval_failure_only_blocks_expiries_that_need_it() -> None:
+    gateway = _Gateway([[], RuntimeError("interval unavailable"), []])
+    snapshot = _fetch_calendar(
+        gateway,
+        expirations_by_underlier={"US.NVDA": ["2026-08-12", "2026-08-21"]},
+    )
+
+    short = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-12"]
+    long = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+    assert short["status"] == "ready"
+    assert short["absence_authoritative"] is True
+    assert long["status"] == "data_unavailable"
+    assert len(gateway.calls) == 3
+
+
+def test_distant_event_does_not_hide_unresolved_hard_window_coverage() -> None:
+    event = _event("US.NVDA", "2026-08-09", timestamp=_us_timestamp(9, 16))
+    snapshot = _fetch(_Gateway([[event], RuntimeError("later failure"), []]))
+    evidence = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+
+    assert evidence["status"] == "data_unavailable"
+    assert evidence["has_earnings_event"] is True
+    assert evidence["has_blocking_earnings_event"] is False
+    assert evidence["absence_authoritative"] is False
+    assert evidence["hard_failed_intervals"]
+
+
+def test_known_blocking_event_resolves_outcome_despite_other_hard_window_gap() -> None:
+    event = _event("US.NVDA", "2026-08-21", timestamp=_us_timestamp(21, 16))
+    snapshot = _fetch(
+        _Gateway([[], RuntimeError("hard-window gap"), [event]])
+    )
+    evidence = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+
+    assert evidence["status"] == "ready"
+    assert evidence["has_blocking_earnings_event"] is True
+    assert evidence["hard_coverage_status"] == "partial"
+    assert evidence["absence_authoritative"] is False
+
+
+def test_expiry_date_earnings_is_inside_holding_period() -> None:
+    event = _event("US.NVDA", "2026-08-21", timestamp=_us_timestamp(21, 16), pub_type="AFTER")
+    snapshot = _fetch(_Gateway([[], [], [event]]))
+    evidence = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+
+    assert evidence["status"] == "ready"
+    assert evidence["has_earnings_event"] is True
+    assert evidence["has_blocking_earnings_event"] is True
+    assert evidence["events"][0]["earnings_date"] == "2026-08-21"
+
+
+def test_scan_day_is_pending_for_the_full_market_day_regardless_of_timestamp() -> None:
+    released = _event("US.NVDA", "2026-08-06", timestamp=_us_timestamp(6, 8), pub_type="BEFORE")
+    upcoming = _event("US.AAPL", "2026-08-06", timestamp=_us_timestamp(6, 16), pub_type="AFTER")
+    snapshot = _fetch_calendar(
+        _Gateway([[released, upcoming]]),
+        expirations_by_underlier={"US.NVDA": ["2026-08-12"], "US.AAPL": ["2026-08-12"]},
+    )
+
+    nvda = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-12"]
+    aapl = snapshot["evidence_by_underlier"]["US.AAPL"]["2026-08-12"]
+    assert nvda["has_earnings_event"] is True
+    assert aapl["has_earnings_event"] is True
+    assert nvda["has_blocking_earnings_event"] is True
+    assert aapl["has_blocking_earnings_event"] is True
+
+
+def test_scan_day_date_only_is_pending_and_does_not_require_timestamp() -> None:
+    snapshot = _fetch_calendar(
+        _Gateway([[_event("US.NVDA", "2026-08-06")]]),
+        expirations_by_underlier={"US.NVDA": ["2026-08-12"], "US.AAPL": ["2026-08-12"]},
+    )
+
+    nvda = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-12"]
+    aapl = snapshot["evidence_by_underlier"]["US.AAPL"]["2026-08-12"]
+    assert nvda["status"] == "ready"
+    assert nvda["has_blocking_earnings_event"] is True
+    assert aapl["status"] == "ready"
+
+
+def test_hk_underliers_share_inclusive_day_six_and_nonblocking_day_seven_policy() -> None:
+    events = [
+        _event("HK.00700", "2026-08-08"),
+        _event("HK.09992", "2026-08-07"),
+    ]
+    snapshot = _fetch_calendar(
+        _Gateway([events, []]),
+        market="HK",
+        scan_at_utc=datetime(2026, 8, 6, 6, 0, tzinfo=timezone.utc),
+        expirations_by_underlier={"HK.00700": ["2026-08-14"], "HK.09992": ["2026-08-14"]},
+        now_fn=None,
+    )
+
+    tencent = snapshot["evidence_by_underlier"]["HK.00700"]["2026-08-14"]
+    pop_mart = snapshot["evidence_by_underlier"]["HK.09992"]["2026-08-14"]
+    assert tencent["blocking_events"][0]["days_before_expiration"] == 6
+    assert pop_mart["blocking_events"] == []
+    assert pop_mart["nonblocking_events"][0]["days_before_expiration"] == 7
+
+
+def test_snapshot_validation_rejects_partition_gaps_even_with_fresh_hash() -> None:
+    snapshot = _fetch(_Gateway([[], [], []]))
+    snapshot["intervals"][1]["start"] = "2026-08-14"
+    _rehash(snapshot)
+
+    with pytest.raises(ValueError, match="interval partition"):
+        validate_earnings_calendar_snapshot(snapshot)
+
+
+def test_snapshot_validation_rejects_stored_projection_drift() -> None:
+    snapshot = _fetch(_Gateway([[], [], []]))
+    projection = snapshot["evidence_by_underlier"]["US.NVDA"]["2026-08-21"]
+    projection["hard_window_start"] = "2026-08-14"
+    _rehash(snapshot)
+
+    with pytest.raises(ValueError, match="stored projection mismatch"):
+        validate_earnings_calendar_snapshot(snapshot)
+
+
+def test_unsupported_sdk_is_typed_and_not_retried_for_every_interval() -> None:
+    error = FutuGatewayCapabilityUnavailableError(
+        "unsupported",
+        capability="get_earnings_calendar",
+        reason_code="opend_earnings_calendar_unsupported",
+    )
+    gateway = _Gateway([error])
+    snapshot = _fetch(gateway)
+
+    assert snapshot["status"] == "data_unavailable"
+    assert len(gateway.calls) == 1
+    assert {
+        item["reason_code"] for item in snapshot["intervals"]
+    } == {"opend_earnings_calendar_unsupported"}
+
+
+def test_provider_dataframe_is_normalized_and_out_of_interval_fails_closed() -> None:
+    valid = pd.DataFrame(
+        [
+            {
+                "security": "US.NVDA",
+                "earnings_date": "2026-08-09",
+                "earnings_timestamp": _us_timestamp(9, 16),
+                "pub_type": "AFTER",
+                "predict_eps": 999,
+            }
+        ]
+    )
+    snapshot = _fetch_calendar(
+        _Gateway([valid]),
+        expirations_by_underlier={"US.NVDA": ["2026-08-12"]},
+        now_fn=None,
+    )
+    assert snapshot["events"][0].keys() == {
+        "security",
+        "earnings_date",
+        "earnings_timestamp",
+        "pub_type",
+    }
+
+    unavailable = _fetch_calendar(
+        _Gateway([[_event("US.NVDA", "2026-08-13")]]),
+        expirations_by_underlier={"US.NVDA": ["2026-08-12"]},
+        now_fn=None,
+    )
+    assert unavailable["status"] == "data_unavailable"
+
+
+def test_prefetch_publishes_one_shared_snapshot_per_market(tmp_path: Path) -> None:
+    gateways: list[_Gateway] = []
+
+    def build_gateway(**kwargs):
+        gateway = _Gateway([[], []])
+        gateways.append(gateway)
+        return gateway
+
+    result = prefetch_market_earnings_calendars(
+        market_requests={
+            "US": {
+                "host": "127.0.0.1",
+                "port": 11111,
+                "scan_date": "2026-08-06",
+                "expirations_by_underlier": {
+                    "US.NVDA": ["2026-08-13"],
+                    "US.AAPL": ["2026-08-13"],
+                },
+            }
+        },
+        output_dir=tmp_path / "earnings_calendar",
+        scan_at_utc=datetime(2026, 8, 6, 16, 0, tzinfo=timezone.utc),
+        gateway_builder=build_gateway,
+    )
+
+    artifact = json.loads(
+        (tmp_path / "earnings_calendar" / "US.json").read_text(encoding="utf-8")
+    )
+    assert result["market_count"] == 1
+    assert len(gateways) == 1
+    assert len(gateways[0].calls) == 2
+    assert gateways[0].close_calls == 1
+    assert set(artifact["evidence_by_underlier"]) == {"US.NVDA", "US.AAPL"}
+    assert project_earnings_for_expiry(
+        artifact,
+        underlier_code="US.NVDA",
+        expiration="2026-08-13",
+    )["status"] == "ready"
+
+
+def _write_snapshot(root: Path, snapshot: dict) -> Path:
+    path = root / "earnings_calendar" / f"{snapshot['market']}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    return path
+
+
+def test_annotation_reuses_market_validation_and_candidate_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshots = [
+        _fetch_calendar(_Gateway([[], [], []]),
+                        expirations_by_underlier={"US.NVDA": ["2026-08-12", "2026-08-21"]}),
+        _fetch_calendar(_Gateway([[], [], []]), market="HK",
+                        scan_at_utc=datetime(2026, 8, 6, 8, tzinfo=timezone.utc),
+                        expirations_by_underlier={"HK.00700": ["2026-08-21"]}),
+    ]
+    for snapshot in snapshots:
+        _write_snapshot(tmp_path, snapshot)
+    records = [
+        {"market": "US", "symbol": "NVDA", "expiration": "2026-08-12"},
+        {"market": " us ", "symbol": "NVDA", "expiration": "2026-08-12"},
+        {"market": "US", "symbol": "NVDA", "expiration": "2026-08-21"},
+        {"market": "HK", "symbol": "0700.HK", "expiration": "2026-08-21"},
+        {"market": "US", "symbol": "0700.HK", "expiration": "2026-08-21"},
+    ]
+    expected = [{**row, **earnings_calendar.load_earnings_evidence_for_candidate(
+        input_root=tmp_path, **row,
+    )} for row in records]
+    reads, validations, projections = [], [], []
+    read_text = Path.read_text
+    validate = earnings_calendar.validate_earnings_calendar_snapshot
+    project = earnings_calendar._candidate_earnings_from_snapshot
+
+    def counted_read(path, *args, **kwargs):
+        reads.append(path.name)
+        return read_text(path, *args, **kwargs)
+
+    def counted_validate(snapshot, **kwargs):
+        validations.append(kwargs["expected_market"])
+        return validate(snapshot, **kwargs)
+
+    def counted_project(snapshot, **kwargs):
+        projections.append((kwargs["market"], kwargs["symbol"], kwargs["expiration"]))
+        return project(snapshot, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counted_read)
+    monkeypatch.setattr(earnings_calendar, "validate_earnings_calendar_snapshot", counted_validate)
+    monkeypatch.setattr(earnings_calendar, "_candidate_earnings_from_snapshot", counted_project)
+    frame = pd.DataFrame(records)
+    original = frame.copy(deep=True)
+    actual = annotate_candidates_with_earnings_evidence(frame, input_root=tmp_path).to_dict("records")
+    evidence_fields = {key for row in expected for key in row if key.startswith("earnings_")}
+    expected = [{**row, **{key: row.get(key) for key in evidence_fields}} for row in expected]
+    assert actual == expected
+    pd.testing.assert_frame_equal(frame, original)
+    assert reads == ["US.json", "HK.json"]
+    assert validations == ["US", "HK"]
+    assert len(projections) == 4
+    assert actual[-1]["earnings_reason_code"] == "earnings_calendar_candidate_identity_invalid"
+
+
+@pytest.mark.parametrize("condition", ["missing", "invalid_json", "not_object", "hash", "partition", "partial"])
+def test_annotation_failure_evidence_matches_single_candidate_and_refreshes(
+    tmp_path: Path, condition: str,
+) -> None:
+    responses = [[], RuntimeError("calendar unavailable"), []] if condition == "partial" else [[], [], []]
+    snapshot = _fetch(_Gateway(responses))
+    path = _write_snapshot(tmp_path, snapshot)
+    if condition == "missing":
+        path.unlink()
+    elif condition == "invalid_json":
+        path.write_text("{", encoding="utf-8")
+    elif condition == "not_object":
+        path.write_text("[]", encoding="utf-8")
+    elif condition == "hash":
+        snapshot["snapshot_hash"] = "0" * 64
+        _write_snapshot(tmp_path, snapshot)
+    elif condition == "partition":
+        snapshot["market"] = "HK"
+        path.write_text(json.dumps(snapshot), encoding="utf-8")
+    candidate = {"market": "US", "symbol": "NVDA", "expiration": "2026-08-21"}
+    expected = earnings_calendar.load_earnings_evidence_for_candidate(input_root=tmp_path, **candidate)
+    actual = annotate_candidates_with_earnings_evidence(pd.DataFrame([candidate] * 3), input_root=tmp_path)
+    assert actual.to_dict("records") == [{**candidate, **expected}] * 3
+    assert actual.iloc[0]["earnings_evidence_status"] == "data_unavailable"
+    _write_snapshot(tmp_path, _fetch(_Gateway([[], [], []])))
+    fresh = annotate_candidates_with_earnings_evidence(pd.DataFrame([candidate]), input_root=tmp_path)
+    assert fresh.iloc[0]["earnings_evidence_status"] == "ready"
+
+
+def test_annotation_cached_evidence_does_not_alias_rows(tmp_path: Path) -> None:
+    snapshot = _fetch(_Gateway([[ _event("US.NVDA", "2026-08-10") ], [], []]))
+    _write_snapshot(tmp_path, snapshot)
+    candidate = {"market": "US", "symbol": "NVDA", "expiration": "2026-08-21"}
+    frame = pd.DataFrame([candidate] * 2)
+    result = annotate_candidates_with_earnings_evidence(frame, input_root=tmp_path)
+    result.at[0, "earnings_events"][0]["earnings_date"] = "changed"
+    result.at[0, "earnings_hard_reason_codes"].append("changed")
+    assert result.at[1, "earnings_events"][0]["earnings_date"] == "2026-08-10"
+    assert result.at[1, "earnings_hard_reason_codes"] == []
+    fresh = annotate_candidates_with_earnings_evidence(frame, input_root=tmp_path)
+    assert fresh.at[0, "earnings_events"][0]["earnings_date"] == "2026-08-10"

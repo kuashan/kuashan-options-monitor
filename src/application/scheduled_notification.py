@@ -1,0 +1,780 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from dataclasses import dataclass
+from time import monotonic, sleep
+from typing import Any, Callable
+
+from domain.domain import (
+    DeliveryPlan,
+    SchemaValidationError,
+    SnapshotDTO,
+)
+from domain.domain.engine import (
+    AccountSchedulerDecisionView,
+    decide_notification_delivery,
+    resolve_multi_tick_engine_entrypoint,
+)
+from src.application.notification_delivery_adapter import (
+    build_notification_idempotency_key,
+    build_notification_transport_key,
+    normalize_notification_delivery_result,
+    notification_target_reference,
+)
+from src.application.notification_shells import render_system_notice
+
+
+@dataclass(frozen=True)
+class PreparedPerAccountMessages:
+    messages_by_account: dict[str, str]
+    threshold_met: bool
+    used_heartbeat: bool
+    heartbeat_accounts: tuple[str, ...] = ()
+
+    @property
+    def account_messages(self) -> dict[str, str]:
+        """Compatibility alias for the persisted account_messages contract."""
+        return self.messages_by_account
+
+@dataclass(frozen=True)
+class AccountDeliveryBatch:
+    messages_by_account: dict[str, str]
+    target: str
+    channel: str
+    mode: str = "per_account"
+    should_send: bool = True
+
+    @property
+    def account_messages(self) -> dict[str, str]:
+        """Compatibility alias for DeliveryPlan.account_messages callers."""
+        return self.messages_by_account
+
+    @classmethod
+    def from_delivery_contract(cls, delivery_contract: Any) -> "AccountDeliveryBatch":
+        if isinstance(delivery_contract, dict):
+            raw_messages = delivery_contract.get("account_messages") or {}
+            target = delivery_contract.get("target")
+            channel = delivery_contract.get("channel")
+            should_send = delivery_contract.get("should_send")
+        else:
+            raw_messages = getattr(delivery_contract, "account_messages", {}) or {}
+            target = getattr(delivery_contract, "target", None)
+            channel = getattr(delivery_contract, "channel", None)
+            should_send = getattr(delivery_contract, "should_send", True)
+
+        return cls(
+            messages_by_account={str(k): str(v) for k, v in dict(raw_messages).items()},
+            target=str(target or ""),
+            channel=str(channel or ""),
+            should_send=bool(should_send),
+        )
+
+    def to_delivery_payload(self) -> dict[str, Any]:
+        return {
+            "schema_kind": "delivery_plan",
+            "schema_version": "1.0",
+            "channel": str(self.channel),
+            "target": str(self.target),
+            "account_messages": dict(self.messages_by_account),
+            "should_send": bool(self.should_send),
+        }
+
+
+@dataclass(frozen=True)
+class PerAccountSendExecution:
+    sent_accounts: list[str]
+    notify_failures: list[dict[str, object]]
+    attempted_accounts: list[str]
+    send_results: list[dict[str, object]]
+
+    @property
+    def send_attempted_count(self) -> int:
+        return len(self.attempted_accounts)
+
+    @property
+    def send_confirmed_count(self) -> int:
+        return len(self.sent_accounts)
+
+    @property
+    def send_failed_count(self) -> int:
+        return len(self.notify_failures)
+
+    @property
+    def retry_attempt_count(self) -> int:
+        return sum(int(item.get("retry_attempt_count") or 0) for item in self.send_results)
+
+    @property
+    def provider_retry_attempt_count(self) -> int:
+        return sum(
+            int(item.get("provider_retry_attempt_count") or 0)
+            for item in self.send_results
+        )
+
+    @property
+    def outer_retry_attempt_count(self) -> int:
+        return sum(
+            int(item.get("outer_retry_attempt_count") or 0)
+            for item in self.send_results
+        )
+
+    @property
+    def fallback_attempt_count(self) -> int:
+        return sum(
+            int(item.get("fallback_attempt_count") or 0)
+            for item in self.send_results
+        )
+
+    @property
+    def ambiguous_send_count(self) -> int:
+        return sum(1 for item in self.send_results if bool(item.get("ambiguous_send")))
+
+    @property
+    def duplicate_risk_count(self) -> int:
+        return sum(1 for item in self.send_results if bool(item.get("duplicate_risk")))
+
+NOTIFY_SEND_MAX_ATTEMPTS = 2
+NOTIFY_SEND_RETRY_DELAYS_SEC: tuple[float, ...] = (1.0,)
+NOTIFY_SEND_RETRYABLE_ERROR_CODES = {"SEND_FAILED", "SEND_EXCEPTION", "SEND_UNCONFIRMED"}
+
+
+def _snapshot_payload_dict(
+    *,
+    snapshot_cls: type[SnapshotDTO],
+    snapshot_name: str,
+    as_of_utc: str,
+    payload: dict[str, Any],
+    key: str,
+    error_message: str,
+) -> dict[str, Any]:
+    snapshot = snapshot_cls.from_payload(
+        {
+            "schema_kind": "snapshot_dto",
+            "schema_version": "1.0",
+            "snapshot_name": snapshot_name,
+            "as_of_utc": as_of_utc,
+            "payload": payload,
+        }
+    )
+    value = snapshot.payload.get(key)
+    if not isinstance(value, dict):
+        raise SchemaValidationError(error_message)
+    return value
+
+
+def build_per_account_delivery_batch(
+    *,
+    channel: str | None,
+    target: str | None,
+    account_messages: dict[str, str],
+    should_notify_window: bool = True,
+    no_send: bool = False,
+    is_quiet: bool = False,
+    quiet_window: str = "",
+    decision_builder: Callable[..., dict[str, Any]] = decide_notification_delivery,
+    delivery_plan_cls: type[DeliveryPlan] = DeliveryPlan,
+) -> tuple[dict[str, Any], AccountDeliveryBatch | None, str | None]:
+    delivery_decision = decision_builder(
+        should_notify_window=bool(should_notify_window),
+        notification_text="\n".join(str(msg) for msg in account_messages.values()),
+        target=target,
+        no_send=no_send,
+        is_quiet=is_quiet,
+        quiet_window=quiet_window,
+    )
+    config_error = delivery_decision.get("config_error")
+    if config_error:
+        raise ValueError(str(config_error))
+
+    effective_target = delivery_decision.get("effective_target")
+    if not bool(delivery_decision.get("should_send")):
+        return delivery_decision, None, effective_target
+
+    delivery_contract = delivery_plan_cls.from_payload(
+        {
+            "schema_kind": "delivery_plan",
+            "schema_version": "1.0",
+            "channel": str(channel),
+            "target": str(effective_target),
+            "account_messages": account_messages,
+            "should_send": True,
+        }
+    )
+    return delivery_decision, AccountDeliveryBatch.from_delivery_contract(delivery_contract), effective_target
+
+
+def _notify_error_code(send_tool_dto: dict[str, Any]) -> str:
+    normalized_error = str(send_tool_dto.get("error_code") or "").strip()
+    if normalized_error:
+        return normalized_error
+    return "SEND_UNCONFIRMED" if bool(send_tool_dto.get("command_ok")) else "SEND_FAILED"
+
+
+def _tail_text(value: Any, *, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    return text[-int(limit):]
+
+
+def _coerce_returncode(value: Any, *, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _retry_delay_for_attempt(attempt: int, retry_delays_sec: tuple[float, ...]) -> float:
+    if not retry_delays_sec:
+        return 0.0
+    idx = min(max(0, int(attempt) - 1), len(retry_delays_sec) - 1)
+    try:
+        return max(0.0, float(retry_delays_sec[idx] or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _should_retry_send(
+    *,
+    error_code: str | None,
+    attempt: int,
+    attempts: int,
+    message_id: Any,
+    upstream_message_id: Any = None,
+    local_receipt_id: Any = None,
+) -> bool:
+    if int(attempt) >= int(attempts):
+        return False
+    normalized_error = str(error_code or "")
+    if normalized_error not in NOTIFY_SEND_RETRYABLE_ERROR_CODES:
+        return False
+    if str(upstream_message_id or "").strip():
+        return False
+    local_receipt = str(local_receipt_id or "").strip()
+    if normalized_error == "SEND_UNCONFIRMED":
+        return bool(local_receipt and str(message_id or "").strip() == local_receipt)
+    if message_id and normalized_error != "SEND_UNCONFIRMED":
+        return False
+    return True
+
+
+def _confirmed_from_send_tool(send_tool_dto: dict[str, Any], message_id: Any) -> bool:
+    del message_id
+    return bool(send_tool_dto.get("delivery_confirmed"))
+
+
+def _aggregate_retry_metrics(
+    attempt_records: list[dict[str, object]],
+) -> dict[str, int]:
+    provider_retries = sum(
+        int(item.get("retry_attempt_count") or 0)
+        for item in attempt_records
+    )
+    outer_retries = max(0, len(attempt_records) - 1)
+    fallback_attempts = sum(
+        1 for item in attempt_records if bool(item.get("fallback_used"))
+    )
+    return {
+        "retry_attempt_count": provider_retries + outer_retries,
+        "provider_retry_attempt_count": provider_retries,
+        "outer_retry_attempt_count": outer_retries,
+        "fallback_attempt_count": fallback_attempts,
+    }
+
+
+def build_notify_failure_summary_message(
+    *,
+    run_id: str,
+    sent_accounts: list[str],
+    notify_failures: list[dict[str, object]],
+) -> str:
+    failure_rows: list[str] = []
+    for failure in notify_failures:
+        account = str(failure.get("account") or "").strip() or "unknown"
+        error_code = str(failure.get("error_code") or "SEND_FAILED")
+        attempts = int(failure.get("attempts") or 0)
+        message_id = failure.get("message_id") or "none"
+        confirmed = bool(failure.get("delivery_confirmed"))
+        provider_response_code = failure.get("provider_response_code")
+        parts = [
+            error_code,
+            f"尝试 {attempts} 次",
+            "已确认" if confirmed else "未确认",
+        ]
+        if message_id != "none":
+            parts.append(f"message_id={message_id}")
+        if provider_response_code is not None:
+            parts.append(f"provider_code={provider_response_code}")
+        failure_rows.append(f"{account}｜{' · '.join(parts)}")
+    return render_system_notice(
+        component="通知投递",
+        status="⚠️ 部分失败" if sent_accounts else "❌ 投递失败",
+        fields=(
+            ("批次", f"`{run_id}`"),
+            ("已确认", ", ".join(sent_accounts) if sent_accounts else "无"),
+            ("失败", f"{len(notify_failures)} 个账户"),
+        ),
+        sections=(("失败明细", failure_rows),),
+    )
+
+
+def send_account_message_with_retry(
+    *,
+    base,
+    channel: str,
+    target: str,
+    account: str,
+    message: str,
+    run_id: str,
+    runlog,
+    audit_fn,
+    send_fn: Callable[..., Any],
+    normalize_fn: Callable[..., dict[str, Any]],
+    safe_data_fn: Callable[[dict[str, Any]], dict[str, Any]],
+    failure_fields_builder: Callable[..., dict[str, Any]],
+    failure_stage: str = "send_notification_message",
+    sleep_fn: Callable[[float], Any] = sleep,
+    max_attempts: int = NOTIFY_SEND_MAX_ATTEMPTS,
+    retry_delays_sec: tuple[float, ...] = NOTIFY_SEND_RETRY_DELAYS_SEC,
+    idempotency_key_override: str | None = None,
+    transport_envelope: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    attempts = max(1, int(max_attempts or 1))
+    final_record: dict[str, object] | None = None
+    attempt_records: list[dict[str, object]] = []
+    logical_override = str(idempotency_key_override or "").strip()
+    idempotency_key = (
+        build_notification_transport_key(logical_override)
+        if logical_override
+        else ""
+    )
+    if not idempotency_key:
+        idempotency_key = build_notification_idempotency_key(
+            run_id=run_id,
+            account=account,
+            renderer="scheduled_notification:" + hashlib.sha256(str(message).encode("utf-8")).hexdigest(),
+        )
+
+    for attempt in range(1, attempts + 1):
+        t_notify0 = monotonic()
+        start_record = {
+            "account": account,
+            "attempt": attempt,
+            "max_attempts": attempts,
+            "channel": str(channel),
+            "target_set": bool(str(target or "")),
+            "message_len": len(str(message or "")),
+            "idempotency_key": idempotency_key,
+            "transport_envelope": bool(transport_envelope),
+        }
+        audit_target = notification_target_reference(target)
+        audit_fn(
+            "notify",
+            "send_start",
+            run_id=run_id,
+            account=account,
+            status="start",
+            target=audit_target,
+            extra=dict(start_record),
+        )
+
+        send_tool_dto: dict[str, Any] = {}
+        try:
+            send_kwargs: dict[str, Any] = {
+                "base": base,
+                "channel": str(channel),
+                "target": str(target),
+                "message": message,
+                "idempotency_key": idempotency_key,
+            }
+            if transport_envelope is not None:
+                send_kwargs["transport_envelope"] = transport_envelope
+            send = send_fn(
+                **send_kwargs,
+            )
+            send_tool_dto = normalize_notification_delivery_result(send, normalize_fn=normalize_fn)
+            raw_message_id = send_tool_dto.get("message_id")
+            message_id = None if raw_message_id is None or str(raw_message_id).strip() == "" else str(raw_message_id)
+            raw_upstream_message_id = send_tool_dto.get("upstream_message_id")
+            upstream_message_id = (
+                None
+                if raw_upstream_message_id is None or str(raw_upstream_message_id).strip() == ""
+                else str(raw_upstream_message_id)
+            )
+            ok = _confirmed_from_send_tool(send_tool_dto, message_id)
+            error_code = None if ok else _notify_error_code(send_tool_dto)
+            provider_response_code = send_tool_dto.get("provider_response_code")
+            returncode = _coerce_returncode(
+                getattr(send, "returncode", send_tool_dto.get("returncode")),
+                default=(0 if bool(send_tool_dto.get("command_ok")) else 1),
+            )
+            record = {
+                **start_record,
+                "returncode": returncode,
+                "message_id": message_id,
+                "upstream_message_id": upstream_message_id,
+                "command_ok": bool(send_tool_dto.get("command_ok")),
+                "delivery_confirmed": bool(ok),
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "error_code": error_code,
+                "provider_response_code": provider_response_code,
+                "idempotency_key": send_tool_dto.get("idempotency_key") or idempotency_key,
+                "effective_idempotency_key": send_tool_dto.get("effective_idempotency_key"),
+                "local_receipt_id": send_tool_dto.get("local_receipt_id"),
+                "http_attempts": send_tool_dto.get("http_attempts") if isinstance(send_tool_dto.get("http_attempts"), list) else [],
+                "retry_attempt_count": int(send_tool_dto.get("retry_attempt_count") or 0),
+                "ambiguous_send": bool(send_tool_dto.get("ambiguous_send")),
+                "duplicate_risk": bool(send_tool_dto.get("duplicate_risk")),
+                "local_error_code": send_tool_dto.get("local_error_code"),
+                "request_body_bytes": send_tool_dto.get("request_body_bytes"),
+                "request_body_budget_bytes": send_tool_dto.get("request_body_budget_bytes"),
+                "normalized_markdown_chars": send_tool_dto.get("normalized_markdown_chars"),
+                "normalized_markdown_sha256": send_tool_dto.get("normalized_markdown_sha256"),
+                "render_mode": send_tool_dto.get("render_mode"),
+                "fallback_used": bool(send_tool_dto.get("fallback_used")),
+            }
+        except subprocess.TimeoutExpired as exc:
+            message_id = None
+            ok = False
+            error_code = "SEND_TIMEOUT"
+            record = {
+                **start_record,
+                "returncode": 124,
+                "message_id": None,
+                "upstream_message_id": None,
+                "command_ok": False,
+                "delivery_confirmed": False,
+                "stdout_tail": "",
+                "stderr_tail": "",
+                "error_code": error_code,
+                "provider_response_code": None,
+                "timeout_sec": getattr(exc, "timeout", None),
+                "exception_type": type(exc).__name__,
+                "idempotency_key": idempotency_key,
+                "local_receipt_id": None,
+            }
+        except Exception as exc:
+            message_id = None
+            ok = False
+            error_code = "SEND_EXCEPTION"
+            record = {
+                **start_record,
+                "returncode": 1,
+                "message_id": None,
+                "upstream_message_id": None,
+                "command_ok": False,
+                "delivery_confirmed": False,
+                "stdout_tail": "",
+                "stderr_tail": type(exc).__name__,
+                "error_code": error_code,
+                "provider_response_code": None,
+                "exception_type": type(exc).__name__,
+                "idempotency_key": idempotency_key,
+                "local_receipt_id": None,
+            }
+
+        will_retry = _should_retry_send(
+            error_code=error_code,
+            attempt=attempt,
+            attempts=attempts,
+            message_id=message_id,
+            upstream_message_id=record.get("upstream_message_id"),
+            local_receipt_id=record.get("local_receipt_id"),
+        )
+        record["will_retry"] = bool(will_retry)
+        attempt_records.append(record)
+        final_record = record
+
+        audit_extra = dict(record)
+        if not ok:
+            audit_extra.update(
+                failure_fields_builder(
+                    failure_kind="io_error",
+                    failure_stage=str(failure_stage),
+                    failure_adapter=str(send_tool_dto.get("adapter") or "notify"),
+                )
+            )
+        audit_fn(
+            "notify",
+            ("send_done" if ok else "send_fail"),
+            run_id=run_id,
+            account=account,
+            status=("ok" if ok else ("unconfirmed" if error_code == "SEND_UNCONFIRMED" else "error")),
+            target=audit_target,
+            message_id=record.get("message_id"),
+            confirmed=bool(record.get("delivery_confirmed")),
+            error_code=error_code,
+            extra=audit_extra,
+        )
+
+        if ok:
+            retry_metrics = _aggregate_retry_metrics(attempt_records)
+            runlog.safe_event(
+                "notify",
+                "ok",
+                duration_ms=int((monotonic() - t_notify0) * 1000),
+                data=safe_data_fn({"channel": channel, **record}),
+            )
+            return {
+                "ok": True,
+                "account": account,
+                "attempts": attempt,
+                "max_attempts": attempts,
+                "attempt_records": attempt_records,
+                "final": final_record,
+                "final_returncode": int(record.get("returncode") or 0),
+                "message_id": record.get("message_id"),
+                "upstream_message_id": record.get("upstream_message_id"),
+                "command_ok": bool(record.get("command_ok")),
+                "delivery_confirmed": bool(record.get("delivery_confirmed")),
+                "provider_response_code": record.get("provider_response_code"),
+                "idempotency_key": record.get("idempotency_key") or idempotency_key,
+                "effective_idempotency_key": record.get("effective_idempotency_key"),
+                "local_receipt_id": record.get("local_receipt_id"),
+                **retry_metrics,
+                "ambiguous_send": bool(record.get("ambiguous_send")),
+                "duplicate_risk": bool(record.get("duplicate_risk")),
+                "render_mode": record.get("render_mode"),
+                "fallback_used": bool(record.get("fallback_used")),
+            }
+
+        runlog.safe_event(
+            "notify",
+            "error",
+            duration_ms=int((monotonic() - t_notify0) * 1000),
+            error_code=error_code,
+            message=(f"message send unconfirmed ({account})" if error_code == "SEND_UNCONFIRMED" else f"message send failed ({account})"),
+            data=safe_data_fn(record),
+        )
+
+        if will_retry:
+            delay = _retry_delay_for_attempt(attempt, retry_delays_sec)
+            if delay > 0:
+                sleep_fn(delay)
+            continue
+        break
+
+    final = final_record or {
+        "account": account,
+        "attempt": 0,
+        "max_attempts": attempts,
+        "returncode": 1,
+        "message_id": None,
+        "upstream_message_id": None,
+        "command_ok": False,
+        "delivery_confirmed": False,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "error_code": "SEND_FAILED",
+        "provider_response_code": None,
+        "idempotency_key": idempotency_key,
+        "local_receipt_id": None,
+    }
+    command_ok = bool(final.get("command_ok"))
+    retry_metrics = _aggregate_retry_metrics(attempt_records)
+    return {
+        "ok": False,
+        "account": account,
+        "error_code": str(final.get("error_code") or ("SEND_UNCONFIRMED" if command_ok else "SEND_FAILED")),
+        "attempts": len(attempt_records),
+        "max_attempts": attempts,
+        "attempt_records": attempt_records,
+        "final": final,
+        "final_returncode": int(final.get("returncode") or 0),
+        "message_id": final.get("message_id"),
+        "upstream_message_id": final.get("upstream_message_id"),
+        "command_ok": command_ok,
+        "delivery_confirmed": bool(final.get("delivery_confirmed")),
+        "provider_response_code": final.get("provider_response_code"),
+        "idempotency_key": final.get("idempotency_key") or idempotency_key,
+        "effective_idempotency_key": final.get("effective_idempotency_key"),
+        "local_receipt_id": final.get("local_receipt_id"),
+        **retry_metrics,
+        "ambiguous_send": bool(final.get("ambiguous_send")),
+        "duplicate_risk": bool(final.get("duplicate_risk")),
+        "local_error_code": final.get("local_error_code"),
+        "request_body_bytes": final.get("request_body_bytes"),
+        "request_body_budget_bytes": final.get("request_body_budget_bytes"),
+        "normalized_markdown_chars": final.get("normalized_markdown_chars"),
+        "normalized_markdown_sha256": final.get("normalized_markdown_sha256"),
+        "render_mode": final.get("render_mode"),
+        "fallback_used": bool(final.get("fallback_used")),
+    }
+
+
+def execute_per_account_delivery(
+    *,
+    delivery_batch: AccountDeliveryBatch | DeliveryPlan,
+    run_id: str,
+    runlog,
+    audit_fn,
+    safe_data_fn: Callable[[dict[str, Any]], dict[str, Any]],
+    send_fn: Callable[..., Any],
+    normalize_fn: Callable[..., dict[str, Any]],
+    failure_fields_builder: Callable[..., dict[str, Any]],
+    on_failure: Callable[[str], Any] | None = None,
+    base,
+    failure_stage: str = "send_notification_message",
+    sleep_fn: Callable[[float], Any] = sleep,
+    idempotency_keys_by_account: dict[str, str] | None = None,
+    transport_envelopes_by_account: dict[str, dict[str, Any]] | None = None,
+) -> PerAccountSendExecution:
+    sent_accounts: list[str] = []
+    notify_failures: list[dict[str, object]] = []
+    attempted_accounts: list[str] = []
+    send_results: list[dict[str, object]] = []
+    target = str(delivery_batch.target)
+    channel = str(delivery_batch.channel)
+
+    for acct, msg in delivery_batch.account_messages.items():
+        attempted_accounts.append(str(acct))
+        runlog.safe_event(
+            "notify",
+            "start",
+            data=safe_data_fn(
+                {
+                    "channel": channel,
+                    "target_set": bool(target),
+                    "account": acct,
+                    "message_len": len(msg),
+                }
+            ),
+        )
+        def _send_account() -> dict[str, object]:
+            return send_account_message_with_retry(
+                base=base,
+                channel=channel,
+                target=target,
+                account=str(acct),
+                message=msg,
+                run_id=run_id,
+                runlog=runlog,
+                audit_fn=audit_fn,
+                send_fn=send_fn,
+                normalize_fn=normalize_fn,
+                safe_data_fn=safe_data_fn,
+                failure_fields_builder=failure_fields_builder,
+                failure_stage=failure_stage,
+                sleep_fn=sleep_fn,
+                idempotency_key_override=(
+                    idempotency_keys_by_account or {}
+                ).get(str(acct)),
+                transport_envelope=(
+                    transport_envelopes_by_account or {}
+                ).get(str(acct)),
+            )
+
+        send_result = _send_account()
+        if not bool(send_result.get("ok")):
+            send_results.append(dict(send_result))
+            error_code = str(send_result.get("error_code") or "SEND_FAILED")
+            final_record = send_result.get("final") if isinstance(send_result.get("final"), dict) else {}
+            if on_failure is not None:
+                on_failure(error_code)
+            notify_failures.append(
+                {
+                    "account": acct,
+                    "error_code": error_code,
+                    "attempts": int(send_result.get("attempts") or 1),
+                    "final_returncode": int(send_result.get("final_returncode") or 0),
+                    "message_id": send_result.get("message_id"),
+                    "upstream_message_id": send_result.get("upstream_message_id"),
+                    "command_ok": bool(send_result.get("command_ok")),
+                    "delivery_confirmed": bool(send_result.get("delivery_confirmed")),
+                    "provider_response_code": send_result.get("provider_response_code"),
+                    "stdout_tail": final_record.get("stdout_tail"),
+                    "stderr_tail": final_record.get("stderr_tail"),
+                    "timeout_sec": final_record.get("timeout_sec"),
+                    "exception_type": final_record.get("exception_type"),
+                    "idempotency_key": send_result.get("idempotency_key"),
+                    "effective_idempotency_key": send_result.get("effective_idempotency_key"),
+                    "local_receipt_id": send_result.get("local_receipt_id"),
+                    "retry_attempt_count": int(send_result.get("retry_attempt_count") or 0),
+                    "provider_retry_attempt_count": int(
+                        send_result.get("provider_retry_attempt_count") or 0
+                    ),
+                    "outer_retry_attempt_count": int(
+                        send_result.get("outer_retry_attempt_count") or 0
+                    ),
+                    "fallback_attempt_count": int(
+                        send_result.get("fallback_attempt_count") or 0
+                    ),
+                    "ambiguous_send": bool(send_result.get("ambiguous_send")),
+                    "duplicate_risk": bool(send_result.get("duplicate_risk")),
+                    "local_error_code": send_result.get("local_error_code"),
+                    "request_body_bytes": send_result.get("request_body_bytes"),
+                    "request_body_budget_bytes": send_result.get("request_body_budget_bytes"),
+                    "normalized_markdown_chars": send_result.get("normalized_markdown_chars"),
+                    "normalized_markdown_sha256": send_result.get("normalized_markdown_sha256"),
+                    "render_mode": send_result.get("render_mode"),
+                    "fallback_used": bool(send_result.get("fallback_used")),
+                }
+            )
+            continue
+        send_results.append(dict(send_result))
+        sent_accounts.append(acct)
+
+    return PerAccountSendExecution(
+        sent_accounts=sent_accounts,
+        notify_failures=notify_failures,
+        attempted_accounts=attempted_accounts,
+        send_results=send_results,
+    )
+
+def build_multi_tick_scheduler_decision(
+    *,
+    scheduler_stdout: str,
+    as_of_utc: str,
+    snapshot_cls: type[SnapshotDTO] = SnapshotDTO,
+    engine_entrypoint: Callable[..., dict[str, Any]] = resolve_multi_tick_engine_entrypoint,
+) -> tuple[dict[str, Any], Any]:
+    scheduler_payload = _snapshot_payload_dict(
+        snapshot_cls=snapshot_cls,
+        snapshot_name="scheduler_raw",
+        as_of_utc=as_of_utc,
+        payload={"scheduler_raw": json.loads((scheduler_stdout or "").strip())},
+        key="scheduler_raw",
+        error_message="scheduler_raw must be a dict",
+    )
+    scheduler_bundle = engine_entrypoint(scheduler_raw=scheduler_payload).get("scheduler") or {}
+    scheduler_decision = scheduler_bundle.get("scheduler_decision")
+    scheduler_view = scheduler_bundle.get("scheduler_view")
+    if not isinstance(scheduler_decision, dict) or scheduler_view is None:
+        raise SchemaValidationError("scheduler decision engine entrypoint returned invalid payload")
+    return scheduler_decision, scheduler_view
+
+
+def build_multi_tick_account_scheduler_view(
+    *,
+    account: str,
+    scheduler_stdout: str,
+    scheduler_decision: dict[str, Any],
+    as_of_utc: str,
+    snapshot_cls: type[SnapshotDTO] = SnapshotDTO,
+    engine_entrypoint: Callable[..., dict[str, Any]] = resolve_multi_tick_engine_entrypoint,
+    account_view_cls: type[AccountSchedulerDecisionView] = AccountSchedulerDecisionView,
+) -> AccountSchedulerDecisionView:
+    account_scheduler_bundle = engine_entrypoint(
+        scheduler_raw=scheduler_decision,
+        account_scheduler_raw_by_account={str(account): json.loads((scheduler_stdout or "").strip())},
+    ).get("scheduler") or {}
+    _snapshot_payload_dict(
+        snapshot_cls=snapshot_cls,
+        snapshot_name=f"account_scheduler_decision:{account}",
+        as_of_utc=as_of_utc,
+        payload={
+            "account": str(account),
+            "decision": (account_scheduler_bundle.get("account_scheduler_decisions") or {}).get(str(account)),
+        },
+        key="decision",
+        error_message="account scheduler decision must be a dict",
+    )
+    account_scheduler_decision_view = (account_scheduler_bundle.get("account_scheduler_views") or {}).get(str(account))
+    if not isinstance(account_scheduler_decision_view, account_view_cls):
+        raise SchemaValidationError("account scheduler decision view must be valid")
+    return account_scheduler_decision_view

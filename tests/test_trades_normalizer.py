@@ -1,0 +1,463 @@
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from src.application.multiplier_cache import save_cache
+from src.application.trades.normalizer import normalize_trade_deal
+
+
+@pytest.fixture(autouse=True)
+def _keep_multiplier_resolution_offline(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.application.multiplier_cache.refresh_via_opend",
+        lambda **_kwargs: SimpleNamespace(ok=False, multiplier=None, error="not available in test"),
+    )
+
+
+def _futu_option_code_payload(deal_id: str, **fields) -> dict:
+    """HK option deal carrying an explicit option code and a futu create_time.
+
+    `fields` carries the optional lookup keys a caller adds, in the position
+    they hold in the payload.
+    """
+    return {
+        "deal_id": deal_id,
+        "futu_account_id": "999000000000000001",
+        "code": "HK.POP260528P150000",
+        **fields,
+        "trd_side": "SELL_SHORT",
+        "qty": 1,
+        "price": 6.3,
+        "create_time": "2026-04-28 10:15:56",
+    }
+
+
+def _hk_pop_option_payload(deal_id: str, **fields) -> dict:
+    """Same HK option code under REAL_HK_1, without the futu create_time field."""
+    return {
+        "deal_id": deal_id,
+        "futu_account_id": "REAL_HK_1",
+        "code": "HK.POP260528P150000",
+        **fields,
+        "trd_side": "SELL_SHORT",
+        "qty": 1,
+        "price": 6.3,
+    }
+
+
+def _hk_owner_stock_payload(deal_id: str) -> dict:
+    """HK put deal described through the owner stock code instead of an option code."""
+    return {
+        "deal_id": deal_id,
+        "futu_account_id": "REAL_HK_1",
+        "owner_stock_code": "HK.09992",
+        "option_type": "PUT",
+        "position_effect": "OPEN",
+        "trade_side": "SELL",
+        "qty": 1,
+        "price": 6.3,
+        "strike": 150,
+        "expiry_date": "260528",
+        "currency": "HKD",
+    }
+
+
+def test_normalize_trade_deal_maps_core_fields() -> None:
+    payload = {
+        "deal_id": "deal-1",
+        "order_id": "order-1",
+        "trd_acc_id": "REAL_1",
+        "code": "0700.HK",
+        "option_type": "PUT",
+        "side": "SELL",
+        "position_effect": "OPEN",
+        "qty": 2,
+        "price": "3.93",
+        "strike": "480",
+        "multiplier": 100,
+        "expiration": "20260429",
+        "currency": "HKD",
+        "create_time": "2026-04-09 13:10:25",
+    }
+
+    deal = normalize_trade_deal(payload, futu_account_mapping={"REAL_1": "lx"})
+
+    assert deal.deal_id == "deal-1"
+    assert deal.internal_account == "lx"
+    assert deal.symbol == "0700.HK"
+    assert deal.option_type == "put"
+    assert deal.side == "sell"
+    assert deal.position_effect == "open"
+    assert deal.contracts == 2
+    assert deal.price == 3.93
+    assert deal.strike == 480.0
+    assert deal.multiplier == 100
+    assert deal.multiplier_source == "payload"
+    assert deal.expiration_ymd == "2026-04-29"
+    assert deal.currency == "HKD"
+    assert isinstance(deal.trade_time_ms, int)
+
+
+def test_normalize_trade_deal_parses_futu_millisecond_trade_time_as_beijing() -> None:
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-ms-time",
+            "trd_acc_id": "REAL_1",
+            "code": "0700.HK",
+            "option_type": "CALL",
+            "side": "BUY",
+            "position_effect": "CLOSE",
+            "qty": 2,
+            "price": "1.2",
+            "strike": "510",
+            "multiplier": 100,
+            "expiration": "20260528",
+            "currency": "HKD",
+            "create_time": "2026-05-20 15:05:47.577",
+        },
+        futu_account_mapping={"REAL_1": "lx"},
+    )
+
+    expected = int(datetime(2026, 5, 20, 15, 5, 47, 577000, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+    assert deal.trade_time_ms == expected
+
+
+def test_normalize_trade_deal_uses_runtime_multiplier_cache_from_config_path(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    repo = tmp_path / "repo"
+    runtime.mkdir()
+    repo.mkdir()
+    cache_path = runtime / "output_shared" / "state" / "multiplier_cache.json"
+    save_cache(cache_path, {"0883.HK": {"multiplier": 1000, "source": "runtime_seed"}})
+
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-runtime-cache",
+            "trd_acc_id": "REAL_1",
+            "code": "0883.HK",
+            "option_type": "CALL",
+            "side": "SELL",
+            "position_effect": "OPEN",
+            "qty": 1,
+            "price": "0.41",
+            "strike": "30",
+            "expiration": "20260629",
+            "currency": "HKD",
+        },
+        futu_account_mapping={"REAL_1": "sy"},
+        repo_base=repo,
+        config_path=runtime / "config.hk.json",
+    )
+
+    assert deal.symbol == "0883.HK"
+    assert deal.multiplier == 1000
+    assert deal.multiplier_source == "runtime_seed"
+    assert deal.normalization_diagnostics["multiplier_resolution"]["cache_path"] == str(cache_path.resolve())
+
+
+def test_normalize_trade_deal_keeps_unknown_position_effect_when_missing() -> None:
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-2",
+            "account_id": "REAL_2",
+            "symbol": "NVDA",
+            "option_type": "CALL",
+            "trade_side": "BUY",
+            "qty": 1,
+            "price": 1.23,
+            "strike": 100,
+            "multiplier": 100,
+            "expiry_date": "260618",
+            "currency_code": "USD",
+        },
+        futu_account_mapping={"REAL_2": "sy"},
+    )
+
+    assert deal.position_effect is None
+    assert deal.internal_account == "sy"
+    assert deal.multiplier == 100
+    assert deal.multiplier_source == "payload"
+    assert deal.expiration_ymd == "2026-06-18"
+
+
+def test_normalize_trade_deal_recognizes_additional_account_id_fields() -> None:
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-3",
+            "trade_acc_id": "987654321",
+            "symbol": "NVDA",
+            "option_type": "CALL",
+            "trade_side": "SELL",
+            "position_effect": "OPEN",
+            "qty": 1,
+            "price": 1.23,
+            "strike": 100,
+            "multiplier": 100,
+            "expiry_date": "260618",
+            "currency_code": "USD",
+        },
+        futu_account_mapping={"987654321": "lx"},
+    )
+
+    assert deal.futu_account_id == "987654321"
+    assert deal.internal_account == "lx"
+    assert deal.visible_account_fields == {"trade_acc_id": "987654321"}
+    assert deal.account_mapping_keys == ["987654321"]
+
+
+def test_normalize_trade_deal_parses_futu_option_code_with_lookup_underlying_fields() -> None:
+    deal = normalize_trade_deal(
+        _futu_option_code_payload("deal-4", stock_name="泡泡玛特"),
+        futu_account_mapping={"999000000000000001": "lx"},
+    )
+
+    assert deal.internal_account == "lx"
+    assert deal.symbol == "9992.HK"
+    assert deal.option_type == "put"
+    assert deal.side == "sell"
+    assert deal.position_effect == "open"
+    assert deal.strike == 150.0
+    assert deal.expiration_ymd == "2026-05-28"
+    assert deal.currency == "HKD"
+
+
+def test_normalize_trade_deal_accepts_futu_underlying_code_format() -> None:
+    deal = normalize_trade_deal(
+        _futu_option_code_payload("deal-5", owner_stock_code="HK.09992"),
+        futu_account_mapping={"999000000000000001": "lx"},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.option_type == "put"
+    assert deal.position_effect == "open"
+
+
+def test_normalize_trade_deal_falls_back_to_option_code_root_alias_for_symbol() -> None:
+    deal = normalize_trade_deal(
+        _futu_option_code_payload("deal-6"),
+        futu_account_mapping={"999000000000000001": "lx"},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.option_type == "put"
+    assert deal.position_effect == "open"
+
+
+def test_normalize_trade_deal_maps_met_option_root_to_hk_symbol_multiplier_cache(tmp_path) -> None:
+    cache_dir = tmp_path / "output_shared" / "state"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "multiplier_cache.json").write_text(
+        '{"3690.HK":{"multiplier":500,"source":"test"}}',
+        encoding="utf-8",
+    )
+
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-met",
+            "futu_account_id": "REAL_HK_1",
+            "code": "HK.MET260703P60000",
+            "trd_side": "BUY_BACK",
+            "qty": 1,
+            "price": 0.0,
+            "create_time": "2026-07-03 19:36:21",
+        },
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        runtime_root=tmp_path,
+        allow_opend_refresh=False,
+    )
+
+    assert deal.symbol == "3690.HK"
+    assert deal.multiplier == 500
+    assert deal.multiplier_source == "test"
+
+
+def test_normalize_trade_deal_canonicalizes_us_prefixed_underlying_symbol() -> None:
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-7",
+            "futu_account_id": "REAL_US_1",
+            "underlying_symbol": "US.NVDA",
+            "option_type": "CALL",
+            "trade_side": "SELL",
+            "position_effect": "OPEN",
+            "qty": 1,
+            "price": 1.23,
+            "strike": 100,
+            "multiplier": 100,
+            "expiry_date": "260618",
+            "currency_code": "USD",
+        },
+        futu_account_mapping={"REAL_US_1": "lx"},
+    )
+
+    assert deal.symbol == "NVDA"
+
+
+def test_normalize_trade_deal_uses_contract_metadata_multiplier_with_runtime_context(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_resolver(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return 500, "cache", {
+            "canonical_symbol": kwargs["symbol"],
+            "selected_source": "cache",
+            "attempted_sources": [{"source": "cache", "status": "resolved", "value": 500}],
+        }
+
+    monkeypatch.setattr("src.application.trades.normalizer.resolve_multiplier_with_source_and_diagnostics", _fake_resolver)
+
+    deal = normalize_trade_deal(
+        _hk_pop_option_payload("deal-8", owner_stock_code="HK.09992"),
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        repo_base=tmp_path,
+        config={"runtime": {"option_chain_fetch": {"max_calls": 7}}},
+        host="opend-host",
+        port=22222,
+        opend_fetch_config={"option_chain_max_calls": 7},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.multiplier == 500
+    assert deal.multiplier_source == "cache"
+    assert captured["repo_base"] == tmp_path.resolve()
+    assert captured["host"] == "opend-host"
+    assert captured["port"] == 22222
+    assert captured["opend_fetch_config"] == {"option_chain_max_calls": 7}
+    assert deal.normalization_diagnostics["multiplier_resolution"]["selected_source"] == "cache"
+
+
+def test_normalize_trade_deal_ignores_retired_static_symbol_multiplier(tmp_path: Path) -> None:
+    deal = normalize_trade_deal(
+        _hk_pop_option_payload("deal-9"),
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        repo_base=tmp_path,
+        config={"intake": {"multiplier_by_symbol": {"9992.HK": 1000}}},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.multiplier is None
+    assert deal.multiplier_source is None
+    attempts = deal.normalization_diagnostics["multiplier_resolution"]["attempted_sources"]
+    assert [item["source"] for item in attempts] == ["payload", "cache", "opend"]
+    assert deal.normalization_diagnostics["multiplier_resolution"]["message"] == "recognized 9992.HK but multiplier could not be resolved"
+
+
+def test_normalize_trade_deal_ignores_retired_market_default_multiplier(tmp_path: Path) -> None:
+    hk_deal = normalize_trade_deal(
+        _hk_owner_stock_payload("deal-10"),
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        repo_base=tmp_path,
+        config={"intake": {"default_multiplier_hk": 1000}},
+    )
+    us_deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-11",
+            "futu_account_id": "REAL_US_1",
+            "underlying_symbol": "US.NVDA",
+            "option_type": "CALL",
+            "position_effect": "OPEN",
+            "trade_side": "SELL",
+            "qty": 1,
+            "price": 1.23,
+            "strike": 100,
+            "expiry_date": "260618",
+            "currency_code": "USD",
+        },
+        futu_account_mapping={"REAL_US_1": "lx"},
+        repo_base=tmp_path,
+        config={"intake": {"default_multiplier_us": 100}},
+    )
+
+    assert hk_deal.multiplier is None
+    assert hk_deal.multiplier_source is None
+    assert us_deal.multiplier is None
+    assert us_deal.multiplier_source is None
+    assert not any(
+        str(item["source"]).startswith("config")
+        for item in hk_deal.normalization_diagnostics["multiplier_resolution"]["attempted_sources"]
+    )
+
+
+def test_normalize_trade_deal_ignores_repo_hk_intake_config_when_active_config_has_no_intake(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "config.hk.json").write_text('{"intake":{"default_multiplier_hk":1000}}', encoding="utf-8")
+
+    deal = normalize_trade_deal(
+        _hk_owner_stock_payload("deal-12"),
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        repo_base=tmp_path,
+        config={"trade_intake": {"mode": "dry-run"}},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.multiplier is None
+    assert deal.multiplier_source is None
+    assert deal.normalization_diagnostics["multiplier_resolution"]["message"] == "recognized 9992.HK but multiplier could not be resolved"
+
+
+def test_normalize_trade_deal_does_not_let_hk_option_display_name_block_code_fallback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "src.application.multiplier_cache.refresh_via_opend",
+        lambda **_kwargs: SimpleNamespace(ok=True, multiplier=1000, error=None),
+    )
+
+    deal = normalize_trade_deal(
+        {
+            "deal_id": "deal-13",
+            "futu_account_id": "REAL_HK_1",
+            "symbol": "泡泡玛特 260528 135.00 沽",
+            "code": "HK.POP260528P135000",
+            "trd_side": "SELL_SHORT",
+            "qty": 1,
+            "price": 5.5,
+        },
+        futu_account_mapping={"REAL_HK_1": "lx"},
+        repo_base=tmp_path,
+        config={"trade_intake": {"mode": "dry-run"}},
+    )
+
+    assert deal.symbol == "9992.HK"
+    assert deal.option_type == "put"
+    assert deal.strike == 135.0
+    assert deal.expiration_ymd == "2026-05-28"
+    assert deal.multiplier == 1000
+    assert deal.multiplier_source == "opend"
+
+
+@pytest.mark.parametrize("key", ["multiplier", "contract_multiplier", "lot_size"])
+@pytest.mark.parametrize("raw", [None, "", True, 0, -1, 100.5, "100.00000000000000001", float("inf")])
+def test_invalid_payload_multiplier_alias_cannot_fall_back(tmp_path, monkeypatch, key, raw):
+    save_cache(tmp_path / "output_shared/state/multiplier_cache.json",
+               {"9992.HK": {"multiplier": 500, "source": "opend"}})
+    monkeypatch.setattr("src.application.trades.normalizer.resolve_multiplier_with_source_and_diagnostics",
+                        lambda **_: pytest.fail("explicit invalid payload must not resolve from fallback"))
+    deal = normalize_trade_deal(_futu_option_code_payload("invalid", **{key: raw}), repo_base=tmp_path)
+    assert deal.multiplier is None
+    assert deal.normalization_diagnostics["multiplier_resolution"]["attempted_sources"] == [
+        {"source": "payload", "status": "invalid"},
+    ]
+    assert any("source_field:" + key in error for error in deal.execution_input["errors"])
+
+
+@pytest.mark.parametrize("code", ["US.MET", "MET.US", "US.MET261016P45000"])
+def test_explicit_us_collision_survives_trade_normalization(code) -> None:
+    from domain.domain.symbol_identity import symbol_market, symbol_currency, futu_underlier_code
+    payload = {"deal_id": "synthetic-met", "futu_account_id": "REAL_1", "code": code,
+               "asset_type": "option" if "261016" in code else "stock",
+               "trd_side": "SELL_SHORT", "qty": 1, "price": 1,
+               "create_time": "2026-10-06 10:00:00", "multiplier": 100}
+    deal = normalize_trade_deal(payload, futu_account_mapping={"REAL_1": "lx"})
+    assert deal.symbol == "MET.US"
+    assert deal.currency == "USD"
+    assert symbol_market(deal.symbol) == "US"
+    assert symbol_currency(deal.symbol) == "USD"
+    assert futu_underlier_code(deal.symbol) == "US.MET"

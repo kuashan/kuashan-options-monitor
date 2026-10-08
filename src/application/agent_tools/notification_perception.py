@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+from typing import Any
+
+from src.application.agent_tool_contracts import AgentToolError
+from src.application.agent_tools.base import AgentTool, build_agent_tool
+from src.application.agent_tool_contracts import mask_path
+from src.application.agent_tool_config import repo_base
+from src.application.notification_perception_read import read_notification_perception_events
+from src.application.runtime_paths import resolve_runtime_root
+
+
+_OUTPUT_CONTRACT: dict[str, Any] = {
+    "evidence_type": "collection",
+    "bounded_projection": "contract_fields",
+    "coverage": "source_declared",
+    "freshness": "source_declared",
+    "pagination": {"mode": "keyset"},
+    "schema_version": "notification_perception_read.output.v1",
+    "source_label": "OM tick audit assistant_perception events",
+    "primary_rows": "event_summaries",
+    "fact_fields": [
+        "summary.total_count",
+        "summary.returned_count",
+        "summary.status",
+        "summary.malformed_count",
+        "summary.unreadable_count",
+        "read_statuses[].status",
+        "read_statuses[].malformed_count",
+        "events[].run_id",
+        "events[].event_kind",
+        "events[].threshold_met",
+        "events[].delivery.action",
+        "events[].delivery.reason",
+        "events[].send_summary.send_confirmed_count",
+        "coverage.total_count",
+        "coverage.returned_count",
+    ],
+    "freshness_fields": ["freshness.status", "freshness.as_of"],
+    "model_value_fields": [
+        "scope", "summary.status", "coverage", "freshness", "event_summaries",
+    ],
+    "model_preview_fields": [
+        "scope",
+        "coverage",
+        "freshness",
+        "read_statuses",
+        "events",
+    ],
+}
+
+
+def _notification_perception_read_tool(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    authenticated_conversation = str(payload.get("authenticated_conversation_id") or "").strip()
+    explicit_conversation = str(payload.get("conversation_id") or "").strip()
+    if authenticated_conversation and explicit_conversation and authenticated_conversation != explicit_conversation:
+        raise AgentToolError(
+            code="PERMISSION_DENIED",
+            message="notification perception scope cannot override the authenticated conversation",
+        )
+    conversation_id = authenticated_conversation or explicit_conversation or None
+    runtime_resolution = resolve_runtime_root(
+        repo_root=repo_base(),
+        runtime_root=payload.get("runtime_root"),
+    )
+    from src.application.agent_tools.project import _QUERY_CONTEXT
+    from src.application.agent_tools.project_reader import ProjectReaderError
+
+    deadline, cancelled = _QUERY_CONTEXT.get()
+    try:
+        data = read_notification_perception_events(
+            repo_root=runtime_resolution.runtime_root,
+            run_id=payload.get("run_id"),
+            conversation_id=conversation_id,
+            event_kind=payload.get("event_kind"),
+            limit=int(payload.get("limit") or 10),
+            cursor=payload.get("cursor"),
+            start_utc=payload.get("start_utc"),
+            end_utc=payload.get("end_utc"),
+            deadline_monotonic=deadline,
+            cancelled=cancelled,
+        )
+    except ProjectReaderError as exc:
+        if exc.code == "cancelled":
+            raise AgentToolError(code="CANCELLED", message=exc.code, hint="查询已取消。") from None
+        if exc.code == "time_deadline":
+            raise AgentToolError(code="BUDGET_EXHAUSTED", message=exc.code,
+                hint="本次查询时间已到；可缩小范围后重试。") from None
+        raise
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+    events = data.get("events") if isinstance(data.get("events"), list) else []
+    data["event_summaries"] = [
+        {key: event[key] for key in (
+            "run_id", "created_at_utc", "event_kind", "no_send", "threshold_met",
+            "delivery", "send_summary", "report_refs",
+        ) if key in event}
+        for event in events
+    ]
+    data["source"] = {"label": "OM tick audit notification perception events", "kind": "audit_snapshot"}
+    data["runtime_root"] = {
+        "path": mask_path(runtime_resolution.runtime_root),
+        "source": runtime_resolution.source,
+    }
+    data["scope"] = {
+        **data.get("scope", {}),
+        "run_id": summary.get("run_id"),
+        "conversation_ref": summary.get("conversation_ref"),
+        "event_kind": summary.get("event_kind"),
+    }
+    data["freshness"] = {
+        "kind": "audit_snapshot",
+        "status": "historical" if events else "unknown",
+        "as_of": events[0].get("created_at_utc") if events and isinstance(events[0], dict) else None,
+        "latest_event_at_utc": events[0].get("created_at_utc") if events and isinstance(events[0], dict) else None,
+    }
+    warnings: list[str] = []
+    if summary.get("status") == "failed":
+        warnings.append("Notification perception audit is unreadable.")
+    elif summary.get("status") == "partial":
+        if any(item.get("tail_truncated") for item in data.get("read_statuses") or []):
+            warnings.append("Notification perception audit covers only the recent file tail.")
+        if summary.get("malformed_count"):
+            warnings.append(
+                "Notification perception audit is partially corrupt; "
+                f"malformed_rows={summary['malformed_count']}."
+            )
+    return data, warnings, {
+        "audit_paths": [
+            mask_path(path) for path in data.get("audit_paths") or []
+        ],
+        "runtime_root_source": runtime_resolution.source,
+    }
+
+
+def _notification_perception_input_validator(payload: dict[str, Any]) -> None:
+    if str(payload.get("audit_path") or "").strip():
+        raise AgentToolError(
+            code="INPUT_ERROR",
+            message="audit_path is not accepted by notification_perception_read; use run_id, conversation_id, event_kind, and limit",
+        )
+
+
+NOTIFICATION_PERCEPTION_READ_TOOL = build_agent_tool(
+    name="notification_perception_read",
+    catalog_summary="读取通知感知与确认状态。",
+    description=(
+        "Read notification decision and delivery evidence from tick audit artifacts. Use to explain whether a "
+        "notification threshold was met, skipped, attempted, or confirmed. For report candidate explanations, "
+        "select notification_delivery_completed and use the matching confirmed account's report_refs.source_run_id "
+        "as candidate_rank_explain/candidate_filter_explain run_id; event run_id is only the send attempt. "
+        "Missing/ambiguous references or partial audit evidence cannot bind a report. This tool never sends a notification."
+    ),
+    requires=("runtime_artifacts",),
+    capabilities=("notification_perception", "audit_tail", "read_only", "runtime_artifacts"),
+    input_schema={
+        "run_id": "optional output_runs id; omitted reads output_shared/state/audit_events.jsonl",
+        "conversation_id": "optional Bot conversation scope such as wechat:<chat_key>",
+        "authenticated_conversation_id": "host-injected authenticated conversation scope",
+        "event_kind": "optional event kind filter",
+        "start_utc": "optional ISO-8601 UTC window start; requires end_utc",
+        "end_utc": "optional ISO-8601 UTC window end; requires start_utc",
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Page size, defaults to 10; continue with cursor and the same query"},
+        "cursor": {"type": "string", "maxLength": 8192},
+        "runtime_root": (
+            "optional canonical runtime root; defaults to "
+            "OM_RUNTIME_ROOT then repository fallback"
+        ),
+    },
+    handler=_notification_perception_read_tool,
+    pure_read=True,
+    safe_default_input={"limit": 10},
+    input_validator=_notification_perception_input_validator,
+    examples=(
+        {"input": {"limit": 10}},
+        {"input": {"run_id": "20260515T182459Z-474761"}},
+    ),
+    output_contract=_OUTPUT_CONTRACT,
+    bot_input_fields=(
+        "run_id",
+        "event_kind",
+        "limit",
+        "cursor",
+        "runtime_root",
+    ),
+)
+
+
+TOOLS: tuple[AgentTool, ...] = (NOTIFICATION_PERCEPTION_READ_TOOL,)
+
+
+__all__ = ["NOTIFICATION_PERCEPTION_READ_TOOL", "TOOLS"]

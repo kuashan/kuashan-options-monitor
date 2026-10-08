@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sqlite3
+
+import pytest
+
+from src.application.trades.auto_intake import (
+    _cached_trade_inbox_summary,
+)
+
+from src.application.trades.inbox import (
+    TradePayloadClaimLost,
+    begin_trade_receipt_attempt,
+    claim_trade_payload,
+    claim_trade_payload_refresh_intent,
+    enqueue_trade_payload,
+    get_settlement_attempt_state,
+    list_retryable_trade_payloads,
+    list_settlement_attempt_states,
+    list_trade_receipt_recovery_rows,
+    list_unclaimed_trade_payload_refresh_intents,
+    mark_trade_payload_handled,
+    mark_trade_payload_retryable,
+    read_trade_source_evidence,
+    read_trade_payload,
+    read_trade_payloads_for_reconciliation,
+    record_trade_payload_refresh_intent,
+    settle_trade_payload_result,
+    settle_reconciled_trade_payload,
+    settlement_attempt_summary,
+    trade_payload_evidence_ref,
+    trade_inbox_revision,
+    trade_inbox_summary,
+)
+
+
+def _enqueue(path: Path, payload: dict, **overrides: object) -> str:
+    """Enqueue one trade payload.
+
+    ``payload`` and ``broker_deal_key`` are spelled out at every call site; the
+    default is the ``source="push"`` this module repeats most often.
+    """
+    base: dict[str, object] = {"source": "push"}
+    base.update(overrides)
+    return enqueue_trade_payload(path, payload=payload, **base)
+
+
+def test_complete_inbox_read_schema_avoids_ensure_and_ddl(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    key = _enqueue(path, payload={"deal_id": "one", "futu_account_id": "1001"},
+                   broker_deal_key="futu:lx:1001:one")
+    with sqlite3.connect(path) as conn:
+        objects_before = conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+
+    def unexpected_ensure(_conn):
+        raise AssertionError("complete read schema entered full ensure")
+
+    monkeypatch.setattr("src.application.trades.inbox._ensure_schema", unexpected_ensure)
+    for _ in range(2):
+        assert read_trade_payload(path, inbox_id=key)["inbox_id"] == key
+        assert read_trade_source_evidence(path, evidence_ref=trade_payload_evidence_ref(key))
+        assert isinstance(list_trade_receipt_recovery_rows(path, account_ids=["1001"]), list)
+        assert len(list_retryable_trade_payloads(path)) == 1
+        assert trade_inbox_summary(path)["pending_count"] == 1
+        assert trade_inbox_revision(path) > 0
+        assert get_settlement_attempt_state(path, source_id="test", account="lx", case_id="c") is None
+        assert list_settlement_attempt_states(path, source_id="test", account="lx", case_ids=["c"]) == {}
+        assert settlement_attempt_summary(path, source_id="test", now_ms=1_000,
+                                          account="lx", case_ids=["c"])["eligible_count"] == 0
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall() == objects_before
+
+
+def test_existing_empty_inbox_read_still_creates_schema(tmp_path: Path) -> None:
+    path = tmp_path / "empty.sqlite3"
+    with sqlite3.connect(path):
+        pass
+    assert trade_inbox_summary(path)["pending_count"] == 0
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_inbox'").fetchone()
+    assert trade_inbox_revision(path) == 0
+
+
+@pytest.mark.parametrize("missing", ["column", "revision_trigger", "evidence_envelope", "lookup_indexes"])
+def test_incomplete_inbox_read_falls_back_to_full_migration(tmp_path: Path, missing: str) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    key = _enqueue(path, payload={"deal_id": "one"}, broker_deal_key="futu:lx:1001:one")
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        if missing == "column":
+            conn.execute("ALTER TABLE trade_inbox DROP COLUMN portfolio_refresh_attempted_at_ms")
+        elif missing == "revision_trigger":
+            conn.execute("DROP TRIGGER trg_trade_inbox_summary_update")
+        elif missing == "evidence_envelope":
+            conn.execute("UPDATE trade_inbox_evidence SET evidence_id=NULL, evidence_json=NULL")
+        else:
+            conn.execute("DROP INDEX idx_trade_inbox_broker_deal_key")
+            conn.execute("DROP INDEX idx_trade_inbox_deal_id")
+    if missing == "evidence_envelope":
+        assert read_trade_source_evidence(path, evidence_ref=trade_payload_evidence_ref(key))
+    else:
+        assert trade_inbox_summary(path)["pending_count"] == 1
+    with sqlite3.connect(path) as conn:
+        if missing == "column":
+            assert "portfolio_refresh_attempted_at_ms" in {
+                row[1] for row in conn.execute("PRAGMA table_info(trade_inbox)")}
+        elif missing == "revision_trigger":
+            assert conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                                "AND name='trg_trade_inbox_summary_update'").fetchone()
+            before = trade_inbox_revision(path)
+            conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+            conn.execute("UPDATE trade_inbox SET last_error='after repair' WHERE inbox_id=?", (key,))
+            conn.commit()
+            assert trade_inbox_revision(path) == before + 1
+        elif missing == "evidence_envelope":
+            assert conn.execute("SELECT 1 FROM trade_inbox_evidence "
+                                "WHERE evidence_id IS NULL OR evidence_json IS NULL").fetchone() is None
+        else:
+            assert {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='index' "
+                                                   "AND name LIKE 'idx_trade_inbox_%'")} >= {
+                "idx_trade_inbox_broker_deal_key", "idx_trade_inbox_deal_id"}
+
+
+def test_reconciliation_discovery_is_read_only_and_keeps_all_identities(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    assert read_trade_payloads_for_reconciliation(path, deal_ids=["same"]) == []
+    assert not path.exists()
+    created = [
+        _enqueue(path, payload={"deal_id": "same"}, broker_deal_key=key)
+        for key in ("futu:lx:1001:same", "futu:sy:1002:same", None)
+    ]
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.execute("UPDATE trade_inbox SET status='conflict' WHERE broker_deal_key='futu:sy:1002:same'")
+    before = path.read_bytes()
+    rows = read_trade_payloads_for_reconciliation(path, deal_ids=["same", "futu:lx:1001:same"])
+    assert len(rows) == 3
+    assert {row["inbox_id"] for row in rows} == set(created)
+    assert [(row["received_at_ms"], row["inbox_id"]) for row in rows] == sorted(
+        (row["received_at_ms"], row["inbox_id"]) for row in rows)
+    assert {row["status"] for row in rows} == {"pending", "conflict", "identity_needs_review"}
+    assert path.read_bytes() == before
+    assert len(read_trade_payloads_for_reconciliation(path, deal_ids=["futu:lx:1001:same"])) == 1
+
+    unavailable = tmp_path / "missing-schema.sqlite3"
+    with sqlite3.connect(unavailable):
+        pass
+    with pytest.raises(sqlite3.DatabaseError, match="schema unavailable"):
+        read_trade_payloads_for_reconciliation(unavailable, deal_ids=["same"])
+
+
+def test_inbox_deal_and_broker_lookup_plans_use_indexes(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    _enqueue(path, payload={"deal_id": "same"}, broker_deal_key="futu:lx:1001:same")
+    queries = {
+        "reconciliation": (
+            "SELECT * FROM trade_inbox WHERE deal_id IN (?,?) OR broker_deal_key IN (?,?) "
+            "ORDER BY received_at_ms, inbox_id",
+            ("same", "other", "same", "other"),
+            ("idx_trade_inbox_deal_id", "idx_trade_inbox_broker_deal_key"),
+        ),
+        "attribution": (
+            "SELECT * FROM trade_inbox WHERE broker_deal_key = ? AND status = 'handled' "
+            "AND identity_status = 'bound'",
+            ("futu:lx:1001:same",),
+            ("idx_trade_inbox_broker_deal_key",),
+        ),
+        "receipt_deal": (
+            "SELECT inbox_id, length(payload_json) + coalesce(length(receipt_json), 0) AS size "
+            "FROM trade_inbox WHERE receipt_json IS NOT NULL AND deal_id = ? "
+            "ORDER BY received_at_ms DESC, inbox_id DESC LIMIT ?",
+            ("same", 1001),
+            ("idx_trade_inbox_deal_id",),
+        ),
+    }
+    with sqlite3.connect(path) as conn:
+        for sql, args, indexes in queries.values():
+            plan = "\n".join(row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, args))
+            assert "SCAN trade_inbox" not in plan, plan
+            assert all(index in plan for index in indexes), plan
+
+
+@pytest.mark.parametrize("changed", ["payload_version", "economic_payload_hash", "result_json", "receipt_json", "claim_id", "identity_status", "status"])
+def test_reconciliation_rejects_changed_observation(tmp_path: Path, changed: str) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(path, payload={"deal_id": "one"}, broker_deal_key="futu:lx:1001:one")
+    observed = read_trade_payloads_for_reconciliation(path, deal_ids=["one"])[0]
+    values = {"payload_version": 99, "economic_payload_hash": "changed", "result_json": '{"status":"failed"}',
+              "receipt_json": '{"status":"unknown"}', "claim_id": "another-worker", "identity_status": "identity_needs_review", "status": "conflict"}
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.execute(f"UPDATE trade_inbox SET {changed}=? WHERE inbox_id=?", (values[changed], inbox_id))
+    current = read_trade_payload(path, inbox_id=inbox_id, read_only=True)
+    with pytest.raises(TradePayloadClaimLost):
+        settle_reconciled_trade_payload(path, observed=observed, result={"status": "applied"})
+    assert read_trade_payload(path, inbox_id=inbox_id, read_only=True) == current
+
+
+@pytest.mark.parametrize("ineligible", ["claim", "conflict", "identity_needs_review"])
+def test_reconciliation_rejects_observed_ineligible_row(tmp_path: Path, ineligible: str) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(path, payload={"deal_id": "one"}, broker_deal_key="futu:lx:1001:one")
+    if ineligible == "claim":
+        assert claim_trade_payload(path, inbox_id=inbox_id)
+    else:
+        with sqlite3.connect(path) as conn:
+            conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+            conn.execute("UPDATE trade_inbox SET status=? WHERE inbox_id=?", (ineligible, inbox_id))
+    observed = read_trade_payloads_for_reconciliation(path, deal_ids=["one"])[0]
+    with pytest.raises(TradePayloadClaimLost):
+        settle_reconciled_trade_payload(path, observed=observed, result={"status": "applied"})
+    assert read_trade_payloads_for_reconciliation(path, deal_ids=["one"])[0] == observed
+
+
+@pytest.mark.parametrize("receipt_status", [None, "pending", "sent", "unknown"])
+def test_reconciliation_preserves_history_and_suppresses_all_delivery(tmp_path: Path, receipt_status: str | None) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(
+        path, payload={"deal_id": "one", "futu_account_id": "1001"}, broker_deal_key="futu:lx:1001:one"
+    )
+    old_result = {"status": "unresolved", "reason": "waiting_settlement_evidence", "receipt_kind": "manual_required"}
+    envelope = ({"schema_version": 2, "current_result_key": "manual_required", "receipts": {
+        "manual_required": {"receipt_id": "old-receipt", "status": receipt_status, "attempt_count": 1,
+                            "result": {"delivery_confirmed": receipt_status == "sent"}, "business_result": old_result},
+    }} if receipt_status else None)
+    record_trade_payload_refresh_intent(path, inbox_id=inbox_id, intent={"account": "lx", "request_id": "refresh-one"})
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.execute("UPDATE trade_inbox SET result_json=?, receipt_json=?, receipt_recovery_allowed=1, attempt_count=1 WHERE inbox_id=?",
+                     (json.dumps(old_result), json.dumps(envelope) if envelope else None, inbox_id))
+    observed = read_trade_payloads_for_reconciliation(path, deal_ids=["one"])[0]
+    result = {"status": "applied", "reason": "lifecycle_case_already_recorded", "applied_record_ids": ["lot-one"]}
+    assert settle_reconciled_trade_payload(path, observed=observed, result=result)
+    closed = read_trade_payload(path, inbox_id=inbox_id, read_only=True)
+    assert closed["status"] == "handled"
+    assert closed["receipt_envelope"] == envelope
+    assert closed["result"]["diagnostics"]["previous_result"] == old_result
+    assert closed["result"]["diagnostics"]["previous_receipt_envelope"] == envelope
+    assert closed["portfolio_refresh_intent_json"] == observed["portfolio_refresh_intent_json"]
+    assert closed["portfolio_refresh_attempted_at_ms"] is None
+    closed_observation = read_trade_payloads_for_reconciliation(path, deal_ids=["one"])[0]
+    assert not settle_reconciled_trade_payload(path, observed=closed_observation, result=result)
+    assert read_trade_payload(path, inbox_id=inbox_id, read_only=True) == closed
+    assert list_retryable_trade_payloads(path, retry_delay_sec=0) == []
+    assert list_trade_receipt_recovery_rows(path, account_ids=["1001"]) == []
+    assert list_unclaimed_trade_payload_refresh_intents(path, account_mapping={"1001": "lx"}) == []
+    assert claim_trade_payload_refresh_intent(path, inbox_id=inbox_id) is None
+    assert not begin_trade_receipt_attempt(path, inbox_id=inbox_id, route={"route": "test"}, message="old")["claimed"]
+    assert read_trade_payload(path, inbox_id=inbox_id, read_only=True) == closed
+    next_id = _enqueue(path, payload={"deal_id": "two"}, broker_deal_key="futu:lx:1001:two")
+    assert claim_trade_payload(path, inbox_id=next_id)
+
+
+def test_trade_inbox_claims_portfolio_refresh_intent_once(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(path, payload={"deal_id": "stock-1"}, broker_deal_key="futu:lx:REAL_1:stock-1")
+    intent = {"account": "lx", "request_id": "stock-refresh:abc"}
+
+    record_trade_payload_refresh_intent(
+        path,
+        inbox_id=inbox_id,
+        intent=intent,
+    )
+    assert claim_trade_payload_refresh_intent(
+        path,
+        inbox_id=inbox_id,
+    ) == intent
+    record_trade_payload_refresh_intent(
+        path,
+        inbox_id=inbox_id,
+        intent=intent,
+    )
+    assert claim_trade_payload_refresh_intent(path, inbox_id=inbox_id) is None
+
+
+def test_trade_inbox_is_idempotent_and_retries_callback_exception(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    payload = {"deal_id": "deal-1", "code": "US.NVDA260821P100000"}
+
+    first_id = _enqueue(path, payload=payload, broker_deal_key="futu:lx:REAL_1:deal-1")
+    second_id = _enqueue(path, payload=payload, broker_deal_key="futu:lx:REAL_1:deal-1")
+    assert first_id == second_id
+    assert trade_inbox_summary(path)["pending_count"] == 1
+
+    claim = claim_trade_payload(path, inbox_id=first_id)
+    mark_trade_payload_retryable(
+        path,
+        inbox_id=first_id,
+        error="RuntimeError: callback failed",
+        result={"status": "failed", "reason": "sqlite_busy", "diagnostics": {"retryable": True}},
+        claim=claim,
+    )
+    retry = list_retryable_trade_payloads(path, retry_delay_sec=0)
+    assert len(retry) == 1
+    assert retry[0]["attempt_count"] == 1
+    assert retry[0]["payload"] == payload
+
+    mark_trade_payload_handled(
+        path,
+        inbox_id=first_id,
+        result={"status": "applied", "reason": "applied_open"},
+    )
+    third_id = _enqueue(
+        path, payload=payload, source="backfill", broker_deal_key="futu:lx:REAL_1:deal-1"
+    )
+    assert third_id == first_id
+    mark_trade_payload_handled(
+        path,
+        inbox_id=third_id,
+        result={"status": "skipped", "reason": "duplicate"},
+    )
+    assert list_retryable_trade_payloads(path, retry_delay_sec=0) == []
+    summary = trade_inbox_summary(path)
+    assert summary["pending_count"] == 0
+    assert summary["handled_count"] == 1
+    assert summary["max_attempt_count"] == 1
+
+
+def test_trade_inbox_migrates_old_evidence_without_guessing_adapter_version(
+    tmp_path: Path,
+) -> None:
+    from src.application.ledger.repository import SQLiteOptionPositionsRepository
+
+    repo = SQLiteOptionPositionsRepository(tmp_path / "ledger.sqlite3")
+    from src.application.trades.inbox_authority import resolve_execution_inbox_path
+    path = resolve_execution_inbox_path(repo, tmp_path / "inbox.sqlite3")
+    payload = {"deal_id": "legacy-deal"}
+    inbox_id = _enqueue(
+        path,
+        payload=payload,
+        broker_deal_key="futu:lx:REAL_1:legacy-deal",
+        adapter_version="om.trade-intake.push.v1",
+        repo=repo,
+    )
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.execute(
+            "UPDATE trade_inbox_evidence SET evidence_id = NULL, evidence_json = NULL"
+        )
+
+    _enqueue(
+        path,
+        payload=payload,
+        broker_deal_key="futu:lx:REAL_1:legacy-deal",
+        adapter_version="om.trade-intake.push.v1",
+        repo=repo,
+    )
+    evidence = read_trade_source_evidence(
+        path,
+        evidence_ref=trade_payload_evidence_ref(inbox_id),
+        read_only=True,
+    )
+    assert len(evidence) == 1
+    assert evidence[0]["adapter_version"] == "legacy/unversioned"
+    with sqlite3.connect(path) as conn:
+        plan = conn.execute(
+            """EXPLAIN QUERY PLAN
+            SELECT e.rowid
+            FROM trade_inbox_evidence e
+            LEFT JOIN trade_inbox i ON i.inbox_id = e.inbox_id
+            WHERE e.evidence_id IS NULL OR e.evidence_json IS NULL"""
+        ).fetchall()
+    assert any(
+        "idx_trade_inbox_evidence_missing_envelope" in str(row[-1])
+        for row in plan
+    )
+
+
+def test_trade_inbox_handles_lifecycle_pending_after_evidence_acceptance(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(path, payload={"deal_id": "deal-waiting"}, broker_deal_key="futu:lx:REAL_1:deal-waiting")
+
+    settle_trade_payload_result(
+        path,
+        inbox_id=inbox_id,
+        result={
+            "status": "unresolved",
+            "reason": "waiting_settlement_evidence",
+            "diagnostics": {
+                "retryable": True,
+                "broker_evidence_accepted": True,
+            },
+        },
+    )
+
+    assert list_retryable_trade_payloads(path, retry_delay_sec=0) == []
+    summary = trade_inbox_summary(path)
+    assert summary["handled_count"] == 1
+    assert summary["pending_count"] == 0
+
+
+def test_trade_inbox_quarantines_missing_canonical_identity(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    inbox_id = _enqueue(path, payload={"deal_id": "raw-only"})
+
+    summary = trade_inbox_summary(path)
+    assert summary["pending_count"] == 0
+    assert summary["identity_needs_review_count"] == 1
+    assert summary["identity_attention"] == [{
+        "inbox_id": inbox_id, "deal_id": "raw-only", "source": "push",
+        "received_at_ms": summary["identity_attention"][0]["received_at_ms"],
+        "reason": "canonical_broker_identity_missing",
+        "retryable": False, "next_action": "verify_broker_identity_before_replay",
+    }]
+    assert summary["identity_attention"][0]["received_at_ms"] > 0
+    assert claim_trade_payload(path, inbox_id=inbox_id) is None
+    assert list_retryable_trade_payloads(path, retry_delay_sec=0) == []
+
+
+def test_trade_inbox_scopes_same_deal_id_by_broker_account(tmp_path: Path) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    lx_id = _enqueue(
+        path, payload={"deal_id": "same-id"}, broker_deal_key="futu:lx:REAL_1:same-id"
+    )
+    sy_id = _enqueue(
+        path, payload={"deal_id": "same-id"}, broker_deal_key="futu:sy:REAL_2:same-id"
+    )
+
+    assert lx_id != sy_id
+    assert trade_inbox_summary(path)["pending_count"] == 2
+
+
+def test_trade_inbox_quarantines_same_key_economic_drift(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    source_key = "futu:lx:REAL_1:stock-1"
+    first = {
+        "deal_id": "stock-1",
+        "code": "US.NVDA",
+        "trd_side": "BUY",
+        "qty": 100,
+        "price": "100",
+        "trade_time_ms": 1_800_000_000_000,
+    }
+    _enqueue(path, payload=first, broker_deal_key=source_key)
+    _enqueue(
+        path, payload={**first, "price": "100.01"}, source="poll", broker_deal_key=source_key
+    )
+
+    summary = trade_inbox_summary(path)
+    assert summary["pending_count"] == 0
+    assert summary["conflict_count"] == 1
+    assert list_retryable_trade_payloads(
+        path,
+        retry_delay_sec=0,
+    ) == []
+
+
+def test_trade_inbox_summary_cache_is_revision_gated(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import src.application.trades.auto_intake as auto_intake
+
+    path = tmp_path / "inbox.sqlite3"
+    first_id = _enqueue(path, payload={"deal_id": "seed"}, broker_deal_key="futu:lx:REAL_1:seed")
+    mark_trade_payload_handled(
+        path,
+        inbox_id=first_id,
+        result={"status": "applied", "reason": "seed"},
+    )
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.executemany(
+            """
+            INSERT INTO trade_inbox (
+              inbox_id, source, deal_id, broker_deal_key,
+              identity_status, payload_json, economic_payload_hash,
+              status, attempt_count, received_at_ms, updated_at_ms,
+              last_error, result_status, result_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    f"historical-{index}",
+                    "backfill",
+                    f"historical-{index}",
+                    f"futu:lx:REAL_1:historical-{index}",
+                    "bound",
+                    json.dumps({"deal_id": f"historical-{index}"}),
+                    f"hash-{index}",
+                    "handled",
+                    0,
+                    index + 1,
+                    index + 1,
+                    None,
+                    "applied",
+                    "historical",
+                )
+                for index in range(1_200)
+            ],
+        )
+
+    summary_reads = 0
+    original_summary = auto_intake.trade_inbox_summary
+
+    def counted_summary(summary_path: Path) -> dict:
+        nonlocal summary_reads
+        summary_reads += 1
+        return original_summary(summary_path)
+
+    monkeypatch.setattr(
+        auto_intake,
+        "trade_inbox_summary",
+        counted_summary,
+    )
+    cache: dict = {}
+    for _ in range(10):
+        summary = _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 1
+    assert summary["handled_count"] == 1_201
+
+    revision_before = trade_inbox_revision(path)
+    pending_id = _enqueue(path, payload={"deal_id": "new"}, broker_deal_key="futu:lx:REAL_1:new")
+    assert trade_inbox_revision(path) == revision_before + 1
+    summary = _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 2
+    assert summary["pending_count"] == 1
+
+    duplicate_revision = trade_inbox_revision(path)
+    assert _enqueue(path, payload={"deal_id": "new"}, broker_deal_key="futu:lx:REAL_1:new") == pending_id
+    assert trade_inbox_revision(path) == duplicate_revision
+    _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 2
+
+    mark_trade_payload_handled(
+        path,
+        inbox_id=pending_id,
+        result={"status": "applied", "reason": "new"},
+    )
+    _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 3
+    with sqlite3.connect(path) as conn:
+        conn.create_function("trade_inbox_writer_version", 0, lambda: 2)
+        conn.execute(
+            "DELETE FROM trade_inbox WHERE inbox_id = ?",
+            (first_id,),
+        )
+    final_summary = _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 4
+    assert final_summary["handled_count"] == 1_201
+
+    cache.clear()
+    stable_revision = trade_inbox_revision(path)
+    racing_revisions = iter(
+        (stable_revision, stable_revision + 1)
+    )
+    monkeypatch.setattr(
+        auto_intake,
+        "trade_inbox_revision",
+        lambda _path: next(racing_revisions),
+    )
+    _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 5
+    assert cache == {}
+
+    monkeypatch.setattr(
+        auto_intake,
+        "trade_inbox_revision",
+        lambda _path: stable_revision + 1,
+    )
+    _cached_trade_inbox_summary(path, cache=cache)
+    _cached_trade_inbox_summary(path, cache=cache)
+    assert summary_reads == 6
+
+
+def _futu_stock_payload(**overrides) -> dict:
+    payload = {
+        "broker_account_id": "futu:REAL:900000000000000001",
+        "futu_account_id": "900000000000000001",
+        "acc_id": "900000000000000001",
+        "trd_env": "REAL",
+        "external_id_namespace": "futu.deal",
+        "external_order_namespace": "futu.order",
+        "deal_id": "4583632043475634176",
+        "order_id": "FH1D244146DA2E8000",
+        "code": "US.VOO",
+        "trd_market": "US",
+        "trd_side": "BUY",
+        "qty": 2.0,
+        "price": 695.450589,
+        "create_time": "2026-09-15 10:56:52.838",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_derived_stock_currency_keeps_replayed_futu_payload_identical(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "inbox.sqlite3"
+    key = "futu:sy:900000000000000001:4583632043475634176"
+    inbox_id = _enqueue(path, payload=_futu_stock_payload(), broker_deal_key=key)
+
+    replayed = _enqueue(path, payload=_futu_stock_payload(currency="USD"), broker_deal_key=key)
+
+    assert replayed == inbox_id
+    summary = trade_inbox_summary(path)
+    assert summary["conflict_count"] == 0
+    assert summary["pending_count"] == 1
+
+
+def test_futu_evidence_timezone_tracks_exchange_and_preserves_standard_input(tmp_path):
+    path = tmp_path / 'inbox.sqlite3'
+    raw = {'deal_id': 'timezone', 'code': 'US.NVDA', 'create_time': '2026-09-08 10:43:37.674',
+           '_trade_intake_source': {'opend_process': 'FutuOpenD'}}
+    key = _enqueue(path, payload=raw, broker_deal_key='futu:lx:1001:timezone')
+    evidence = read_trade_source_evidence(path, evidence_ref=trade_payload_evidence_ref(key))
+    assert evidence[0]['source_timezone'] == 'America/New_York'
+    assert evidence[0]['original_time'] == raw['create_time']
+    standard = {'deal_id': 'standard', 'execution_input': {
+        'occurred_at_utc': '2026-09-08T14:43:37.674Z',
+        'source_time': raw['create_time'], 'source_timezone': 'archived-source-zone',
+    }}
+    key = _enqueue(path, payload=standard, broker_deal_key='futu:lx:1001:standard')
+    evidence = read_trade_source_evidence(path, evidence_ref=trade_payload_evidence_ref(key))
+    assert evidence[0]['source_timezone'] == 'archived-source-zone'

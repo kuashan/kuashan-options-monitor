@@ -1,0 +1,404 @@
+# Tool Reference
+
+本文说明如何发现和安全调用 `om-agent` Tool Gateway。它不手工复制每个工具的完整 schema。
+
+运行时权威：
+
+```bash
+./om-agent spec
+```
+
+源码权威：
+
+- `src/application/agent_tool_registry.py`
+- `src/application/agent_tools/*`
+- `src/application/tool_execution.py`
+
+## `om` 与 `om-agent`
+
+| 入口 | 受众 | 作用 |
+|---|---|---|
+| `./om` | 人工操作者 | 配置、扫描、账本、研究、服务和运维 workflow |
+| `./om-agent` | 外部 agent、脚本、结构化集成 | JSON manifest 与单工具 JSON envelope |
+| `./om bot`（兼容 `assistant`） | 消息入口与 Bot | Control / Bot，不属于 Tool Gateway |
+
+人工命令可用 `om help` 按场景查找，完整参数用 `om <命令> --help`。例如 `om symbols add YOUR_SYMBOL --strategy csp --csp-max-strike YOUR_MAX_STRIKE` 默认预览并从标的识别市场，追加 `--apply` 后通过 YAML 配置事务重建快照；应先把占位符换成自己的标的和行权价上限。`om-agent run --tool manage_symbols` 是同一配置源的结构化 Agent 入口。两者均不应直接编辑生成的 JSON。
+
+`om-agent` 不维护对话状态，不负责多步规划，也不是自动交易 Agent。
+
+## Manifest
+
+查看完整 manifest：
+
+```bash
+./om-agent spec
+```
+
+只列工具名：
+
+```bash
+./om-agent spec | jq -r '.tools[].name'
+```
+
+查看一个工具的 schema、示例和风险：
+
+```bash
+./om-agent spec |
+  jq '.tools[] | select(.name == "runtime_status")'
+```
+
+每个工具至少声明：
+
+| 字段 | 含义 |
+|---|---|
+| `name` | 稳定工具名 |
+| `input_json_schema` | 实际输入约束 |
+| `read_only` | 是否修改产品事实或配置 |
+| `risk_level` | 当前执行风险分类 |
+| `side_effects` | 可能物化的本地或外部结果 |
+| `requires_confirm` | 是否需要确认语义 |
+| `requires_env` | 依赖的环境 gate |
+| `safe_default_input` | manifest 声明的安全默认值 |
+| `output_contract` | 结果中可见事实、freshness 和证据形态 |
+
+注意：
+
+- `read_only=true` 不等于“绝不写任何本地文件”。部分工具不修改产品状态，但会物化 report/cache。
+- `defaults.write_tools_enabled` 反映当前环境是否允许写工具；工具自身 metadata 不会因开关而消失。
+- 不要假设所有写命令都有同一套 `--apply` / `--confirm` 参数；以单个 manifest 为准。
+
+## 当前工具分类
+
+以下分类基于当前 registry，完整 schema 仍以 `spec` 为准。
+
+### 诊断与运行
+
+- `healthcheck`
+- `config_validate`
+- `runtime_status`
+- `scheduled_tasks_read`
+- `runtime_runs`
+- `runtime_logs`
+- `scheduler_status`
+- `operation_timeline`
+- `quality_status`
+- `version_check`
+- `version_update`
+- `project_context`
+- `project_files`
+- `receipt_read`
+
+### 候选与 symbol
+
+- `scan_opportunities`
+- `candidate_rank_explain`
+- `candidate_filter_explain`
+- `symbol_resolve`
+- `symbol_config_read`
+- `manage_symbols`
+
+### 收益与桥接
+
+- `option_performance_report`
+- `trade_attribution_read`
+- `portfolio_pnl_bridge`
+- `portfolio_cash_bridge`
+
+`option_performance_report` 提供 MTD/YTD/自然月/自然年的期权净现金流、卖出期权
+胜率、买入期权胜率和期权收益率。现金流保留原币明细，并提供由事件发生时已落库
+`cash_conversion.v1` 证据汇总的 CNY 总额；读取时不查当前汇率。正股交易、指派/行权
+交割现金、PnL 和行情刷新不属于该报告。
+
+### 持仓、现金与组合
+
+- `option_positions_read`
+- `query_cash_headroom`
+- `get_portfolio_context`
+- `portfolio_query`
+- `portfolio_assignment_scenario`
+
+### Wheel 生命周期
+
+- `wheel_end`
+- `wheel_call_intent`
+- `wheel_call_linkage`
+- `wheel_intent`
+- `wheel_linkage`
+- `wheel_branch_decision`
+- `wheel_activation`
+
+### Close Advice
+
+- `close_advice_read`
+
+### 通知
+
+- `preview_notification`：用 `account`、`market`、`date`、`revision` 选择已持久化的成功 Daily Brief，并通过 canonical Daily Brief query renderer 生成只读正文；不扫描、不发送、不改变 delivery state，也不接受 legacy alert/change 文本或路径
+- `notification_perception_read`
+- `daily_decision_brief_read`
+
+历史 `monthly_income_report` 和 `portfolio_capital_bridge` 已移除。Research 的 collect 与 archive inventory/pull/verify 使用 `./om research` 人工 CLI，不注册成通用 Tool Gateway 工具。
+
+## 常用调用
+
+### 健康检查
+
+```bash
+./om-agent run --tool healthcheck \
+  --input-json '{"config_key":"us"}'
+```
+
+`healthcheck` 对 Ledger 只做 SQLite read-only inspection：数据库不存在时会报告
+warning，但不会创建数据库、迁移 schema 或重建 projection。Tool Gateway envelope
+的 `ok` 表示工具执行成功；readiness 结论以 `data.summary.ok` 为准。对应的人类
+`om healthcheck` / `om doctor` 命令会在 readiness 为 false 时返回非零退出码。
+
+### Runtime 状态
+
+本地 checkout：
+
+```bash
+./om-agent run --tool runtime_status \
+  --input-json '{"config_key":"us"}'
+```
+
+生产 release：
+
+```bash
+./om-agent run --tool runtime_status \
+  --input-json '{"config_path":"/var/lib/options-monitor/config.us.json"}'
+```
+
+指定 `run_id` 时，该 run 自身的 tick metrics 是通知计数权威；只有字段缺失且
+shared `last_run.json.run_id` 与所选 run 相同时才会回退 shared 计数。通知明确
+失败、部分失败或 unresolved duplicate risk 会进入 `summary.warning_codes`，
+并令 `summary.ok=false`。
+
+### 通知感知证据
+
+```bash
+./om-agent run --tool notification_perception_read \
+  --input-json '{"runtime_root":"/var/lib/options-monitor","limit":10}'
+```
+
+root 解析顺序是显式 `runtime_root`、`OM_RUNTIME_ROOT`、repo fallback；结果会报告
+root 来源及每个 JSONL 文件的 `ok`、`missing`、`valid_empty`、`tail_only`、
+`partially_corrupt` 或 `unreadable` 状态。共享审计文件超过 1 MiB 时只读最近尾部，
+`tail_truncated=true`、`summary.status=partial`；历史匹配总数未知，不能解释为“没有通知事件”。
+
+### 指派后资产分布
+
+```bash
+./om-agent run --tool portfolio_assignment_scenario \
+  --input-json '{"accounts":["lx","sy"]}'
+```
+
+该工具只有 `accounts` 一个业务入参。富途 OpenD 的股票和现金（含 MMF）是底仓；
+`portfolio.holdings.enabled=true` 时只补充 PM Holdings 中明确为非富途来源的资产，
+PM 的富途股票、现金和 MMF 副本不计入。OM SQLite 的 open short put/call lot 提供指派输入，
+富途 OpenD 市场快照提供股票及期权标的现价；PM 仅在 Holdings 开启时补充非富途资产。
+启用须先通过 `om config holdings set` 预览确认 broker 原文；查询时 PM scoped 清单
+缺失或出现未批准的新值会暂停整份 PM 补充，保留富途基线并标 `partial`。
+输出 `portfolio.assignment_scenario.v1`，主资金口径为 CNY，
+Long Option 完全排除。工具是纯读；业务 `status=partial|unavailable` 仍可处于成功的 Tool Gateway envelope 中，调用方必须同时检查 envelope `ok` 和业务 `data.status`。
+
+### 查询运行历史
+
+```bash
+./om-agent run --tool runtime_runs \
+  --input-json '{"limit":10}'
+
+./om-agent run --tool runtime_logs \
+  --input-json '{"run_id":"<run-id>","kind":"tool","lines":50}'
+```
+
+未显式传路径时，这两个工具按 `OM_RUNTIME_ROOT` 定位 `output_runs` 和 `logs`，
+未配置时才回退到 repo root。
+
+### 候选解释
+
+```bash
+./om-agent run --tool candidate_rank_explain \
+  --input-json '{"run_id":"<run-id>","account":"lx","mode":"put","top_n":5}'
+
+./om-agent run --tool candidate_filter_explain \
+  --input-json '{"run_id":"<run-id>","account":"lx","symbol":"NVDA"}'
+```
+
+两者读取已有 artifact，不重跑扫描；运行根路径按显式 `runtime_root`、
+`OM_RUNTIME_ROOT`、repo fallback 的顺序解析。
+
+`candidate_filter_explain` 还支持从通知投递证据定位轮次：`run_selector=latest_notification`
+解析该账户在 `notification_date`（ISO 日期，默认按运行时主机本地时区的今天）实际送达的
+最近一次通知对应的 run；找不到匹配通知时 fail-closed 返回 `DEPENDENCY_MISSING`
+（`details.reason=no_notification_run`），不会静默回退到其他轮次。
+
+### 扫描
+
+```bash
+./om-agent run --tool scan_opportunities \
+  --input-json '{"config_key":"us","symbols":["NVDA"],"top_n":5}'
+```
+
+`scan_opportunities` 会读取外部数据并物化本地报告。它不发送通知，但不是 no-write 诊断。
+
+### 现金与持仓
+
+```bash
+./om-agent run --tool query_cash_headroom \
+  --input-json '{"config_key":"us","account":"lx"}'
+
+./om-agent run --tool option_positions_read \
+  --input-json '{"config_key":"us","action":"list","account":"lx","status":"open"}'
+
+./om-agent run --tool option_positions_read \
+  --input-json '{"config_key":"us","action":"events","account":"lx","position_effect":"close","limit":5}'
+```
+
+`query_cash_headroom` 是 pure-read，并以 `write_cache=false` 查询，不持久化本次 cash query。
+
+现金读取与扫描、Wheel、指派情景共用 `portfolio_context_service`：只按独立现金源时间和有效配置 `runtime.portfolio_context_ttl_sec`（缺省 900 秒，必须为正整数）决定缓存复用；`get_portfolio_context` 不再接受单独的 `ttl_sec`。
+
+返回的 `cash_snapshot` 包含 `status`（fresh/stale/unknown）、`reason_codes`、`source_observed_at`、`evaluated_at` 和 `max_age_sec`；仅 fresh 可用于现金容量。FX 缺失影响换算值，不改变原币现金可信度。历史报告保留封存时判定，缺少原现金证据时保持不可用。
+
+`option_positions_read` 不写账本，但当前时点查询可能从 OpenD 读取报价。
+
+`option_positions_read action=events` 读取 canonical SQLite `trade_events`，不会读取报价：
+
+- `limit` 默认 10，范围为 1–20；`position_effect` 当前只接受 `close`。
+- 结果按 `trade_time_ms DESC, event_id DESC` 排序。`has_more=true` 时，将原样返回的
+  `next_cursor` 用于下一次调用；后续页可改变 `limit`，不需要重复筛选条件。
+- cursor 固定首次查询的 market、账户权限、筛选条件和事件成员边界。首次查询后写入的事件，
+  即使业务时间更早，也不会进入该 cursor 流。
+- `symbol` 先按标的身份规范化；例如 HK 查询中的 `700.HK` 会匹配账本里的 `0700.HK`。
+  无法识别或不属于所选市场的代码会报输入错误，不会返回看似完整的空页。
+- `include_total=true` 才计算冻结成员集合的 `total_count`。cursor 有效期为 30 分钟；过期、
+  签名错误、权限或筛选条件变化都会明确失败，不会自动从头查询。
+- cursor 签名子密钥由运行服务从既有 `inbound.operation_hmac_key` 做固定域派生，不需要
+  单独配置游标密钥；缺少 inbound 密钥时返回 `DEPENDENCY_MISSING`。轮换该主密钥会使
+  尚未过期的 cursor 失效。
+- `snapshot_exhausted=true` 表示当前冻结集合已读完。过期后重新查询会建立新集合，因此可能
+  与旧查询已经返回的记录重叠。
+- 首次查询即 `snapshot_exhausted=true` 时，返回结果覆盖当前完整查询，Bot 会明确说明
+  已全部返回且没有更多记录；`has_more=true` 时则明确说明仍有下一页。继续页即使读到末尾，
+  单页证据仍只覆盖该页，不能单独声称覆盖完整查询。
+- 请求超过单页 20 条时不得静默截断；应说明单页上限并使用分页。cursor 过期后不得自动续读，
+  应说明查询快照已过期并要求重新发起查询。
+
+继续读取示例：
+
+```bash
+./om-agent run --tool option_positions_read \
+  --input-json '{"config_key":"us","cursor":"<next_cursor>","limit":5}'
+```
+
+### Option Performance
+
+```bash
+./om-agent run --tool option_performance_report \
+  --input-json '{"config_key":"us","account":"lx","period":"mtd"}'
+```
+
+### Close Advice
+
+读取由计划 Tick 生成的 sealed 报告：
+
+```bash
+./om-agent run --tool close_advice_read \
+  --input-json '{"config_key":"us","query":{"option_type":"put","side":"short"}}'
+```
+
+`close_advice_read` 不刷新持仓或行情，也不生成新建议。当前报告只能由计划 Tick 的 sealed required-data 路径产出；显式历史路径中的非 sealed 行会投影为 `not_evaluable`。
+新报告只支持 short put/call，并仅返回 `close`、`hold` 或
+`not_evaluable`。它不生成新仓、roll、replace 或 reallocate 建议。
+
+### Daily Brief
+
+```bash
+./om-agent run --tool daily_decision_brief_read \
+  --input-json '{"account":"lx","market":"US"}'
+```
+
+该工具读取最近一次可靠成功快照，不扫描、不发送、不确认 delivery。
+
+### Symbol 写入
+
+只读 list：
+
+```bash
+./om-agent run --tool manage_symbols \
+  --input-json '{"config_key":"us","action":"list"}'
+```
+
+编辑请求先看 manifest 中的 schema、write predicate、env gate 与 confirm 要求。不要把 `OM_AGENT_ENABLE_WRITE_TOOLS=true` 当成自动授权；它只打开执行门，仍需精确目标和工具级确认语义。
+
+## JSON envelope
+
+调用：
+
+```bash
+./om-agent run --tool <tool-name> --input-json '<json>'
+```
+
+成功或失败都返回结构化 envelope，常见字段包括：
+
+```json
+{
+  "schema_version": "1.0",
+  "tool_name": "runtime_status",
+  "ok": true,
+  "data": {},
+  "warnings": [],
+  "error": null,
+  "meta": {}
+}
+```
+
+集成方应：
+
+1. 先判断 `ok`；
+2. 保留 `warnings`、freshness 和 evidence；
+3. 读取 `error.code` / `error.details`，不要解析 traceback 文本；
+4. 不把 missing / partial / stale 转成零或成功；
+5. 不根据自然语言 description 猜 schema。
+
+完整 envelope 与 launcher 合同见 [Agent Integration](AGENT_INTEGRATION.md)。
+
+## 权限与副作用
+
+Tool Gateway 的写门禁针对“实际请求产品/配置写入”的非只读工具。以下两类需要区分：
+
+1. 产品或配置写入：例如 symbol edit、VERSION apply，需要匹配工具的 env gate、dry-run/confirm 和精确目标。
+2. 本地物化：例如 scan、portfolio input preparation、Close Advice report，可能写 report/cache，但不会因为 `read_only=true` 自动经过统一 write-tool env gate。
+
+自动化调用前应检查 manifest 的 `side_effects`，并为允许的输出目录设置明确 runtime root。未知工具名会返回结构化错误，不要 fallback 到任意 shell 或内部 Python 模块。
+
+## 与 Bot / Control 的关系
+
+Tool Gateway 与消息入口是不同能力面：
+
+- Tool Gateway：外部调用方选择一个公开工具；
+- Bot：Host 投影允许的只读工具，回答自由问题；
+- Control：显式命令、pending operation、人工确认和审计。
+
+Bot 不能因为 Tool Gateway 注册了某个写工具就直接写入。详细边界见：
+
+- [OM Capability Surfaces](OM_AGENT_CAPABILITY_MAP.md)
+- [Inbound Control](INBOUND_CONTROL.md)
+- [Bot v2 Design](BOT_DESIGN.md)
+
+### `trade_attribution_read`
+
+只读当前配置账户的成交策略归属、候选身份、原因和数量覆盖。输入 `account`（必填），可选
+`execution_key`、`symbol`、`status`、`cursor`、`limit`（1–100）及配置选择。响应返回 `market`、`rows`、
+`next_cursor` 和证据完整性。`symbol` 使用规范化标的身份；无法识别或与所选市场不符会报输入错误。
+`next_cursor` 是不透明的续页值，绑定首次查询的账户、市场和筛选条件；续页可省略筛选条件，
+但显式改动会报错。游标有效期为 30 分钟；旧版仅含事件 ID 的游标须重新查询。
+账户、物理 broker 身份与配置不一致时不能确认；查询不更新 Inbox 或 Control operation。
+人工操作见 [Inbound Control](INBOUND_CONTROL.md#已入账成交的策略归属)。
+
+归属规则只有一套当前写入路径。人类 CLI `om trade-intake attribution-migrate` 负责按物理来源和账户切换到 v2；
+`--effective-from-ms` 指定未来的成交时间切换点，默认只预览。预览列出旧 v1 启用时间 T0、v2 切换时间 T2、来源和成交数量。
+写入前须停流并排空 writer，提供 `--writers-stopped`、同一来源的完整预览 manifest、新备份目标与 `--apply --confirm`。
+迁移只追加 v2 生效记录，不改旧行。T0 至 T2 之间及未切换来源的未归属成交仍可人工确认；仅成交时间不早于 T2 的成交可自动归属。
+部署与生产迁移各需单独授权；简报和成交回执持续显示待人工确认，不把缺失证据或账户总额变化当作归属证明。

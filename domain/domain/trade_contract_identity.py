@@ -1,0 +1,299 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from datetime import datetime
+import math
+from typing import Any
+
+from domain.domain.expiration_dates import expiration_timestamp_to_ymd
+from domain.domain.money import to_decimal
+from domain.domain.option_position_identity import normalize_option_type, normalize_side
+from domain.domain.symbol_identity import canonical_symbol
+
+
+def _compact_choice(value: Any) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace(" ", "_")
+        .replace("\u3000", "_")
+        .replace("-", "_")
+        .lower()
+    )
+
+
+def _alias_lookup(aliases: dict[str, str], compact: str) -> str | None:
+    return aliases.get(compact) or aliases.get(compact.replace("_", ""))
+
+
+def normalize_trade_side(value: Any) -> str | None:
+    compact = _compact_choice(value)
+    aliases = {
+        "buy": "buy",
+        "b": "buy",
+        "1": "buy",
+        "buy_to_open": "buy",
+        "buytoopen": "buy",
+        "bto": "buy",
+        "buy_to_close": "buy",
+        "buytoclose": "buy",
+        "btc": "buy",
+        "buy_back": "buy",
+        "buyback": "buy",
+        "买": "buy",
+        "買": "buy",
+        "买入": "buy",
+        "買入": "buy",
+        "买开": "buy",
+        "買開": "buy",
+        "买平": "buy",
+        "買平": "buy",
+        "sell": "sell",
+        "s": "sell",
+        "2": "sell",
+        "sell_to_open": "sell",
+        "selltoopen": "sell",
+        "sto": "sell",
+        "sell_to_close": "sell",
+        "selltoclose": "sell",
+        "sell_short": "sell",
+        "short_sell": "sell",
+        "卖": "sell",
+        "賣": "sell",
+        "卖出": "sell",
+        "賣出": "sell",
+        "卖开": "sell",
+        "賣開": "sell",
+    }
+    return _alias_lookup(aliases, compact)
+
+
+def normalize_asset_type(value: Any) -> str | None:
+    compact = _compact_choice(value)
+    if compact in {"stock", "equity", "etf", "share"}:
+        return "stock"
+    if compact in {"option", "option_contract", "optioncontract"}:
+        return "option"
+    return None
+
+
+def normalize_quantity_unit(value: Any) -> str | None:
+    compact = _compact_choice(value)
+    if compact in {"share", "shares"}:
+        return "share"
+    if compact in {"contract", "contracts"}:
+        return "contract"
+    return None
+
+
+def derive_position_side(position_effect: Any, side: Any) -> str | None:
+    effect = normalize_position_effect(position_effect)
+    side_value = normalize_trade_side(side)
+    if effect == "open":
+        return {"buy": "long", "sell": "short"}.get(side_value)
+    if effect == "close":
+        return {"buy": "short", "sell": "long"}.get(side_value)
+    return None
+
+
+def derive_trade_side(position_effect: Any, position_side: Any) -> str | None:
+    """Inverse of :func:`derive_position_side`: long/short + effect → buy/sell.
+
+    Used to backfill the trade side for events (notably system-generated
+    lifecycle closes) that carry only the position side, so ``position_side``
+    can be uniformly re-derived from ``side`` + ``position_effect``.
+    """
+    effect = normalize_position_effect(position_effect)
+    side_value = normalize_side(position_side)
+    if effect == "open":
+        return {"long": "buy", "short": "sell"}.get(side_value)
+    if effect == "close":
+        return {"long": "sell", "short": "buy"}.get(side_value)
+    return None
+
+
+def normalize_position_effect(value: Any) -> str | None:
+    compact = _compact_choice(value)
+    aliases = {
+        "open": "open",
+        "opened": "open",
+        "open_position": "open",
+        "openposition": "open",
+        "open_only": "open",
+        "openonly": "open",
+        "buy_to_open": "open",
+        "buytoopen": "open",
+        "bto": "open",
+        "sell_to_open": "open",
+        "selltoopen": "open",
+        "sto": "open",
+        "sell_short": "open",
+        "short_sell": "open",
+        "卖开": "open",
+        "賣開": "open",
+        "买开": "open",
+        "買開": "open",
+        "close": "close",
+        "closed": "close",
+        "close_position": "close",
+        "closeposition": "close",
+        "close_only": "close",
+        "closeonly": "close",
+        "buy_to_close": "close",
+        "buytoclose": "close",
+        "btc": "close",
+        "buy_back": "close",
+        "buyback": "close",
+        "sell_to_close": "close",
+        "selltoclose": "close",
+        "买平": "close",
+        "買平": "close",
+        "卖平": "close",
+        "賣平": "close",
+        "expire_close": "close",
+        "expireclose": "close",
+        "assignment": "close",
+        "exercise": "close",
+        "void": "void",
+        "voided": "void",
+        "cancel": "void",
+        "cancelled": "void",
+        "canceled": "void",
+        "adjust": "adjust",
+        "adjusted": "adjust",
+        "adjustment": "adjust",
+    }
+    return _alias_lookup(aliases, compact)
+
+
+def _normalize_expiration_ymd(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-":
+        return raw[:10]
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    if len(digits) in {10, 13}:
+        return expiration_timestamp_to_ymd(digits)
+    return None
+
+
+def normalize_contract_expiration(value: Any, *, fallback_raw: bool = False) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = _normalize_expiration_ymd(raw)
+    if normalized:
+        return normalized
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 6:
+        candidate = f"20{digits[:2]}-{digits[2:4]}-{digits[4:6]}"
+        try:
+            datetime.strptime(candidate, "%Y-%m-%d")
+        except Exception:
+            return raw if fallback_raw else None
+        return candidate
+    return raw if fallback_raw else None
+
+
+def normalize_contract_option_type(value: Any, *, fallback_raw: bool = False) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        normalized = normalize_option_type(raw)
+    except Exception:
+        normalized = ""
+    if normalized in {"put", "call"}:
+        return normalized
+    return raw.lower() if fallback_raw else ""
+
+
+def canonical_contract_symbol(value: Any, *, symbol_aliases: Mapping[str, Any] | None = None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return canonical_symbol(raw, symbol_aliases=symbol_aliases) or raw.upper()
+
+
+def contract_strike_key(value: Any) -> str:
+    try:
+        if value in (None, ""):
+            return ""
+        numeric = float(value)
+        if math.isnan(numeric):
+            return ""
+        return f"{numeric:.6f}"
+    except Exception:
+        return ""
+
+
+def contract_key(
+    symbol: Any,
+    option_type: Any,
+    expiration: Any,
+    strike: Any,
+    *,
+    symbol_aliases: Mapping[str, Any] | None = None,
+    option_type_fallback_raw: bool = False,
+    expiration_fallback_raw: bool = False,
+) -> tuple[str, str, str, str]:
+    return (
+        canonical_contract_symbol(symbol, symbol_aliases=symbol_aliases),
+        normalize_contract_option_type(option_type, fallback_raw=option_type_fallback_raw),
+        normalize_contract_expiration(expiration, fallback_raw=expiration_fallback_raw) or "",
+        contract_strike_key(strike),
+    )
+
+
+def require_option_multiplier(value: Any) -> int:
+    """Validate the original option unit before any lossy conversion."""
+    unit = to_decimal(value, field_name="multiplier")
+    if unit <= 0:
+        raise ValueError("multiplier must be > 0")
+    if unit != unit.to_integral_value():
+        raise ValueError("multiplier must be a positive integer")
+    return int(unit)
+
+
+def contract_share_quantity(contracts: Any, multiplier: Any) -> int:
+    """Convert canonical option units without truncation or multiplier defaults."""
+    count = to_decimal(contracts, field_name="contracts")
+    unit = require_option_multiplier(multiplier)
+    if count < 0 or count != count.to_integral_value():
+        raise ValueError("contracts must be a nonnegative integer")
+    return int(count) * unit
+
+
+def stock_settlement_unit_issues(
+    *, terminal_type: str, option_type: str, position_side: str,
+    stock_side: str, contracts: Any, multiplier: Any, shares: Any,
+) -> tuple[str, ...]:
+    """Check the shared option-to-stock direction and quantity contract."""
+    issues = []
+    expected_side = stock_settlement_side(terminal_type, option_type, position_side)
+    if expected_side is None or stock_side != expected_side:
+        issues.append("stock_settlement_side_mismatch")
+    try:
+        actual = to_decimal(shares, field_name="shares")
+        expected = contract_share_quantity(contracts, multiplier)
+    except (TypeError, ValueError):
+        issues.append("stock_settlement_quantity_invalid")
+    else:
+        if actual <= 0 or actual != expected:
+            issues.append("stock_settlement_quantity_mismatch")
+    return tuple(issues)
+
+
+def stock_settlement_side(terminal_type: str, option_type: str, position_side: str) -> str | None:
+    return {
+        ("assignment", "put", "short"): "buy",
+        ("assignment", "call", "short"): "sell",
+        ("exercise", "call", "long"): "buy",
+        ("exercise", "put", "long"): "sell",
+    }.get((terminal_type, option_type, position_side))
