@@ -14,10 +14,10 @@
       <div class="mark"><span class="logo">O<span class="logo-dot">.</span></span><div><strong>OPTIONS MONITOR</strong><small>INDEPENDENT WORKSPACE</small></div></div>
       <div class="nav-label">工作台</div>
       <nav aria-label="页面导航">
-        <a href="#overview" class="nav-link selected">⌘ <span>监控总览</span></a>
-        <a href="#public-options" class="nav-link">◎ <span>期权链行情</span></a>
-        <a href="#positions" class="nav-link">◫ <span>期权持仓</span></a>
-        <a href="#performance" class="nav-link">↗ <span>收益报告</span></a>
+        
+        <a href="#public-options" class="nav-link selected">◎ <span>公开期权行情</span></a>
+        
+        
       </nav>
       <div class="sidebar-bottom"><span class="signal-dot"></span> 独立部署 · 仅提供只读查询</div>
     </aside>
@@ -27,8 +27,9 @@
         <section class="hero" id="overview">
           <div class="eyebrow">OPTIONS INTELLIGENCE</div>
           <h1>期权监控中心<span class="muted"> / Overview</span></h1>
-          <p>独立运行的期权观察和分析工作台。所有数据来自原项目 Tool Gateway，不生成模拟行情，也不执行交易。</p>
+          <p>独立期权行情观察工作台。公开美股期权链无需券商账户；目前不读取任何个人持仓或交易账本。</p>
         </section>
+        <div class="legacy-om" hidden aria-hidden="true">
         <section class="toolbar" aria-label="筛选与刷新">
           <label>市场 <select id="market"><option value="us">美股 US</option><option value="hk">港股 HK</option></select></label>
           <label>账户标签 <input id="account" type="text" maxlength="48" autocomplete="off" placeholder="留空查看可用账户"></label>
@@ -36,6 +37,7 @@
           <button id="refresh" type="button">↻ 刷新数据</button>
         </section>
         <div class="meta-bar"><div><span class="signal-dot"></span> <span id="load-status">等待获取数据</span></div><span id="time-stamp">尚未刷新</span></div>
+        </div>
         <section class="panel observer-panel" id="public-options">
           <div class="panel-head"><div><span class="subheading">PUBLIC OPTIONS MARKET DATA · YFINANCE</span><h2>公开期权行情观察</h2></div><span class="chip">不需要券商 / API Key</span></div>
           <div class="panel-body">
@@ -57,6 +59,7 @@
           <div class="table-scroll"><table><thead><tr><th>行权价</th><th>Bid</th><th>Ask</th><th>Last</th><th>成交量</th><th>未平仓量 OI</th><th>IV</th><th>最后成交时间</th><th>报价质量</th></tr></thead><tbody id="option-chain-tbody"><tr><td colspan="9" class="empty">输入代码并点击查询期权链</td></tr></tbody></table></div>
           <div class="table-footer" id="option-chain-footer">美股期权观察 · 无数据时不提供虚构价格</div>
         </section>
+        <div class="legacy-om" hidden aria-hidden="true">
         <section class="metrics" aria-label="数据概况">
           <article class="metric"><div class="metric-label">运行状态</div><div id="runtime-value" class="metric-value">—</div><div id="runtime-caption" class="metric-foot">尚未读取</div></article>
           <article class="metric"><div class="metric-label">每日简报</div><div id="brief-value" class="metric-value">—</div><div id="brief-caption" class="metric-foot">尚未读取</div></article>
@@ -77,7 +80,8 @@
           <div class="table-scroll"><table><thead><tr><th>标的</th><th>方向</th><th>行权价</th><th>到期日</th><th>剩余合约数</th><th>状态</th></tr></thead><tbody id="positions-tbody"><tr><td colspan="6" class="empty">等待查询</td></tr></tbody></table></div>
           <div class="table-footer" id="positions-footer">行情不可用时不会填充估算价格。</div>
         </section>
-        <footer>OPTIONS MONITOR · 独立 Web MVP · 只读 · 无自动下单 · 数据缺失时明确显示不可用</footer>
+        </div>
+        <footer>OPTIONS MONITOR · 公开行情观察版 · 无券商接入 · 无自动下单 · 缺失数据不伪造</footer>
       </div>
     </main>
   </div>
