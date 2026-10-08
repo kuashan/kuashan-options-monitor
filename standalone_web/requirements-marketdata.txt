@@ -1,0 +1,3 @@
+# Optional only for the standalone public-market-data observer.
+# Does not modify the original options-monitor runtime dependencies.
+yfinance>=0.2.66
