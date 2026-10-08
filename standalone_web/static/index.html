@@ -15,6 +15,7 @@
       <div class="nav-label">工作台</div>
       <nav aria-label="页面导航">
         <a href="#overview" class="nav-link selected">⌘ <span>监控总览</span></a>
+        <a href="#public-options" class="nav-link">◎ <span>期权链行情</span></a>
         <a href="#positions" class="nav-link">◫ <span>期权持仓</span></a>
         <a href="#performance" class="nav-link">↗ <span>收益报告</span></a>
       </nav>
@@ -35,6 +36,27 @@
           <button id="refresh" type="button">↻ 刷新数据</button>
         </section>
         <div class="meta-bar"><div><span class="signal-dot"></span> <span id="load-status">等待获取数据</span></div><span id="time-stamp">尚未刷新</span></div>
+        <section class="panel observer-panel" id="public-options">
+          <div class="panel-head"><div><span class="subheading">PUBLIC OPTIONS MARKET DATA · YFINANCE</span><h2>公开期权行情观察</h2></div><span class="chip">不需要券商 / API Key</span></div>
+          <div class="panel-body">
+            <div class="observer-toolbar">
+              <label>美股 / ETF 代码 <input id="option-symbol" value="SPY" maxlength="15" autocomplete="off" spellcheck="false" placeholder="例如 SPY、AAPL"></label>
+              <label>到期日 <select id="option-expiry"><option value="">自动选择最近到期日</option></select></label>
+              <label>期权类型 <select id="option-side"><option value="puts">Put（看跌期权）</option><option value="calls">Call（看涨期权）</option></select></label>
+              <button id="load-options" type="button">查询期权链</button>
+            </div>
+            <div class="observer-status" id="options-status">尚未查询公开行情</div>
+            <div class="observer-summary">
+              <div><span>最近日 K 收盘价（非实时）</span><strong id="option-spot">—</strong></div>
+              <div><span>当前到期日</span><strong id="option-expiry-label">—</strong></div>
+              <div><span>可展示合约 / 来源总数</span><strong id="option-count">—</strong></div>
+              <div><span>数据来源</span><strong id="option-provider">Yahoo · 非官方</strong></div>
+            </div>
+            <p class="observer-caution">仅供个人观察。网页获取时间不代表报价成交时间；缺少有效买卖盘时不计算 Mid。Delta 等 Greeks 暂未提供。行情可能延迟、限流或中断；不提供任何交易功能。</p>
+          </div>
+          <div class="table-scroll"><table><thead><tr><th>行权价</th><th>Bid</th><th>Ask</th><th>Last</th><th>成交量</th><th>未平仓量 OI</th><th>IV</th><th>最后成交时间</th><th>报价质量</th></tr></thead><tbody id="option-chain-tbody"><tr><td colspan="9" class="empty">输入代码并点击查询期权链</td></tr></tbody></table></div>
+          <div class="table-footer" id="option-chain-footer">美股期权观察 · 无数据时不提供虚构价格</div>
+        </section>
         <section class="metrics" aria-label="数据概况">
           <article class="metric"><div class="metric-label">运行状态</div><div id="runtime-value" class="metric-value">—</div><div id="runtime-caption" class="metric-foot">尚未读取</div></article>
           <article class="metric"><div class="metric-label">每日简报</div><div id="brief-value" class="metric-value">—</div><div id="brief-caption" class="metric-foot">尚未读取</div></article>
