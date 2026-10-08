@@ -203,6 +203,14 @@ def run() -> None:
             "call":{k:{a:v[a] for a in ("count","avg_predicted","actual_otm_rate","brier")} for k,v in metrics["call"] and {k:_summary(v) for k,v in metrics["call"].items()}.items()},
             "put":{k:{a:v[a] for a in ("count","avg_predicted","actual_otm_rate","brier")} for k,v in metrics["put"] and {k:_summary(v) for k,v in metrics["put"].items()}.items()},
         },sort_keys=True),flush=True)
+        print("HIGH_CONFIDENCE_BINS_JSON="+json.dumps({
+            side: [b for b in report[side]["bs"]["bins"] if b["range"] in ("0.8-0.9","0.9-1.0")]
+            for side in ("call","put")
+        },sort_keys=True),flush=True)
+        print("MONTHLY_2024_BRIER_JSON="+json.dumps({
+            side: {"bs": report[side]["bs"]["months"],"delta": report[side]["delta"]["months"]}
+            for side in ("call","put")
+        },sort_keys=True),flush=True)
         if len(dates) < 8 or counts["rows_used"] < 100:
             raise AssertionError("Not enough filtered option observations to draw even pilot diagnostics")
         print("SPY_2024_CALIBRATION_PILOT_PASS_NO_FORMAL_SCORE",flush=True)
