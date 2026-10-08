@@ -88,7 +88,7 @@ def run() -> None:
             # first Wednesday of each month, frozen across years
             db.execute("""
               CREATE OR REPLACE TEMP TABLE selected_dates AS
-              SELECT DATE_TRUNC('month', dt) month, MIN(dt) entry
+              SELECT DATE_TRUNC('month', dt) AS calendar_month, MIN(dt) AS entry
               FROM (SELECT DISTINCT CAST("date" AS DATE) dt FROM o)
               WHERE EXTRACT(DOW FROM dt)=3 GROUP BY 1
             """)
