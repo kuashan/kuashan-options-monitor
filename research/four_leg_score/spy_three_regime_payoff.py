@@ -78,7 +78,7 @@ def run() -> None:
         fetch_verified("spy/underlying_prices.parquet",underlying)
         db=duckdb.connect(":memory:")
         db.execute(f"""CREATE VIEW underlying AS
-            SELECT CAST("date" AS DATE) dt, CAST(close AS DOUBLE) close
+            SELECT CAST("date" AS DATE) dt, CAST("close" AS DOUBLE) spot_close
             FROM read_parquet('{underlying.as_posix()}')""")
         results={}
         for year in YEARS:
@@ -106,7 +106,7 @@ def run() -> None:
                   CAST(o.bid AS DOUBLE) bid,
                   CAST(o.ask AS DOUBLE) ask,
                   CAST(o.implied_volatility AS DOUBLE) iv,
-                  CAST(u.close AS DOUBLE) spot,
+                  CAST(u.spot_close AS DOUBLE) spot,
                   DATE_DIFF('day', CAST(o."date" AS DATE), CAST(o.expiration AS DATE)) dte
               FROM o
               JOIN selected_dates d ON CAST(o."date" AS DATE)=d.entry
@@ -115,8 +115,8 @@ def run() -> None:
                       BETWEEN {DTE_MIN} AND {DTE_MAX}
                 AND CAST(o.expiration AS DATE) <= DATE '{year}-12-31'
                 AND LOWER(CAST(o."type" AS VARCHAR)) IN ('call','put')
-                AND u.close > 0
-                AND o.strike BETWEEN u.close * {STRIKE_BOUNDS[0]} AND u.close * {STRIKE_BOUNDS[1]}
+                AND u.spot_close > 0
+                AND o.strike BETWEEN u.spot_close * {STRIKE_BOUNDS[0]} AND u.spot_close * {STRIKE_BOUNDS[1]}
                 AND o.bid > 0 AND o.ask >= o.bid
                 AND (o.ask-o.bid)/((o.ask+o.bid)/2) <= {MAX_SPREAD_MID}
                 AND o.implied_volatility BETWEEN {IV_MIN} AND {IV_MAX}
@@ -150,7 +150,7 @@ def run() -> None:
             rows=db.execute("""
               WITH ending AS (
                 SELECT e.expiry,
-                       MAX_BY(u.close,u.dt) final_spot,
+                       MAX_BY(u.spot_close,u.dt) final_spot,
                        MAX(u.dt) final_day
                 FROM (SELECT DISTINCT expiry FROM selected) e
                 LEFT JOIN underlying u
