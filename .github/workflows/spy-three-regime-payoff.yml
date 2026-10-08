@@ -1,0 +1,31 @@
+name: SPY Four-Leg EOD Payoff Study
+on:
+  push:
+    branches:
+      - research/spy-three-regime-payoff-v1
+    paths:
+      - 'research/four_leg_score/spy_three_regime_payoff.py'
+      - '.github/workflows/spy-three-regime-payoff.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Parquet reader only
+        run: python -m pip install 'duckdb>=1.1,<2'
+      - name: Verify three archived GitHub data years and compute 4-leg payoffs
+        run: python -m research.four_leg_score.spy_three_regime_payoff
+      - name: Preserve summary JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spy-three-regime-payoff-study
+          path: spy_three_regime_payoff_result.json
+          if-no-files-found: ignore
