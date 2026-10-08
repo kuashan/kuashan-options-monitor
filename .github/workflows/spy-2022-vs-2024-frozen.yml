@@ -1,0 +1,29 @@
+name: SPY 2022 vs 2024 Frozen OTM Probability Check
+on:
+  push:
+    branches:
+      - research/spy-2022-vs-2024-check-v1
+    paths:
+      - research/four_leg_score/spy_2022_2024_frozen_compare.py
+      - .github/workflows/spy-2022-vs-2024-frozen.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'duckdb>=1.1,<2'
+      - name: Run exactly two frozen SPY EOD calibration years, no training
+        run: python -m research.four_leg_score.spy_2022_2024_frozen_compare
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spy-two-year-frozen-otm-results
+          path: spy_*_calibration_compare.json
+          if-no-files-found: ignore
