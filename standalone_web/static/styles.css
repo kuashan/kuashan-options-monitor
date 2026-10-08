@@ -19,3 +19,5 @@
 .observer-panel .table-scroll table{min-width:1050px}
 @media(max-width:980px){.observer-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:620px){.observer-toolbar label{flex:1 1 42%}.observer-toolbar label:nth-child(2){flex:1 1 53%}.observer-toolbar button{width:100%}.observer-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.observer-summary strong{font-size:13px}}
+
+.legacy-om[hidden]{display:none!important}
