@@ -134,15 +134,15 @@ def run() -> None:
                SELECT e.*, t.bucket,
                       CASE WHEN t.bucket='ATM' THEN e.spot
                            WHEN e.side='call' THEN 1.05*e.spot
-                           ELSE 0.95*e.spot END target
+                           ELSE 0.95*e.spot END AS desired_strike
                FROM eligible e
                CROSS JOIN (VALUES ('ATM'),('OTM_5PCT')) t(bucket)
             ), numbered AS (
                SELECT *,
-                      ABS(strike-target)/spot AS target_gap,
+                      ABS(strike-desired_strike)/spot AS target_gap,
                       ROW_NUMBER() OVER (
                         PARTITION BY entry,expiry,side,bucket
-                        ORDER BY ABS(strike-target),strike,contract_id
+                        ORDER BY ABS(strike-desired_strike),strike,contract_id
                       ) rn
                FROM targets
             )
