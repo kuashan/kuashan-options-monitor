@@ -76,13 +76,14 @@ class HttpTests(unittest.TestCase):
                 self.assertIn(content_type, response.headers["Content-Type"])
                 self.assertGreater(len(response.read()), 100)
 
-    def test_fixed_allowlist(self):
-        with patch("standalone_web.server.invoke_tool", return_value={"ok": True, "data": {"rows": []}, "warnings": [], "error": None}) as runner:
-            with urlopen(self.url + "/api/v1/positions?market=us&account=lx") as response:
-                data = json.load(response)
-                self.assertTrue(data["ok"])
-                self.assertEqual(data["data"]["rows"], [])
-            runner.assert_called_once_with("option_positions_read", {"config_key": "us", "action": "list", "status": "open", "account": "lx"})
+    def test_broker_and_ledger_endpoints_disabled(self):
+        with patch("standalone_web.server.invoke_tool") as runner:
+            for route in ("positions?market=us&account=lx", "brief?market=us&account=lx",
+                          "status?market=us", "performance?market=us"):
+                with self.subTest(route=route), self.assertRaises(HTTPError) as context:
+                    urlopen(self.url + "/api/v1/" + route)
+                self.assertEqual(context.exception.code, 403)
+            runner.assert_not_called()
 
     def test_reject_arbitrary_tool_and_bad_param(self):
         for path in ("/api/v1/send_order", "/api/v1/status?cmd=evil"):
