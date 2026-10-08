@@ -1,0 +1,38 @@
+name: Options Monitor V1 Final Acceptance
+on:
+  push:
+    branches:
+      - feature/options-monitor-v1-final
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install optional Yahoo market provider for import compatibility
+        run: python -m pip install -r standalone_web/requirements-marketdata.txt
+      - name: Four-leg theory, source quality, capital and historical research regression
+        run: python -m unittest discover -s research/four_leg_score -p 'test_*.py' -v
+      - name: Standalone observer plus four-leg integration and write-denial tests
+        run: python -m unittest discover -s standalone_web/tests -p 'test_*.py' -v
+      - name: Python syntax
+        run: python -m compileall -q standalone_web research/four_leg_score
+      - name: Browser JS syntax (without external packages)
+        run: node --check standalone_web/static/app.js
+      - name: No production trading connection
+        run: |
+          python - <<'PY'
+          from standalone_web.option_analysis import LEGS, MODEL
+          from standalone_web.server import Handler
+          assert set(LEGS) == {"long_call", "long_put", "short_call", "short_put"}
+          assert MODEL == "V1_THREE_FACTOR_BOTTLENECK"
+          print("OPTIONS_V1_FOUR_LEGS=PASS")
+          print("OPTIONS_V1_MODEL_FROZEN=PASS")
+          print("OPTIONS_V1_NO_TRADING_API=PASS_BY_TESTS")
+          PY
