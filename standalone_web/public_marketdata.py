@@ -145,7 +145,13 @@ def fetch_public_option_chain(symbol: str, expiry: str | None = None) -> dict[st
         raise MarketDataUnavailable("Yahoo expiration list unavailable (network, throttling or symbol)") from exc
     if not expirations:
         raise MarketDataUnavailable("No US option expirations returned for this ticker; coverage unavailable")
-    selected = expiry or expirations[0]
+    # Prefer a future expiration when the symbol has same-day 0DTE contracts.
+    # No intraday quote/exercise cutoff is available for a same-day chain.
+    today_utc = datetime.now(timezone.utc).date()
+    selected = expiry or next(
+        (item for item in expirations if datetime.strptime(item, "%Y-%m-%d").date() > today_utc),
+        expirations[0],
+    )
     if selected not in expirations:
         raise ValueError("Expiration not currently available for this ticker")
 
