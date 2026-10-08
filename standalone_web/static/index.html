@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Options Monitor · 独立期权监控</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="mark"><span class="logo">O<span class="logo-dot">.</span></span><div><strong>OPTIONS MONITOR</strong><small>INDEPENDENT WORKSPACE</small></div></div>
+      <div class="nav-label">工作台</div>
+      <nav aria-label="页面导航">
+        <a href="#overview" class="nav-link selected">⌘ <span>监控总览</span></a>
+        <a href="#positions" class="nav-link">◫ <span>期权持仓</span></a>
+        <a href="#performance" class="nav-link">↗ <span>收益报告</span></a>
+      </nav>
+      <div class="sidebar-bottom"><span class="signal-dot"></span> 独立部署 · 仅提供只读查询</div>
+    </aside>
+    <main class="workspace">
+      <header class="topbar"><span>OPTIONS MONITOR / WORKSPACE</span><div class="top-status"><span class="signal-dot"></span><span id="service-state">检查服务中</span></div></header>
+      <div class="content">
+        <section class="hero" id="overview">
+          <div class="eyebrow">OPTIONS INTELLIGENCE</div>
+          <h1>期权监控中心<span class="muted"> / Overview</span></h1>
+          <p>独立运行的期权观察和分析工作台。所有数据来自原项目 Tool Gateway，不生成模拟行情，也不执行交易。</p>
+        </section>
+        <section class="toolbar" aria-label="筛选与刷新">
+          <label>市场 <select id="market"><option value="us">美股 US</option><option value="hk">港股 HK</option></select></label>
+          <label>账户标签 <input id="account" type="text" maxlength="48" autocomplete="off" placeholder="留空查看可用账户"></label>
+          <label>统计期间 <select id="period"><option value="mtd">本月 MTD</option><option value="ytd">今年 YTD</option></select></label>
+          <button id="refresh" type="button">↻ 刷新数据</button>
+        </section>
+        <div class="meta-bar"><div><span class="signal-dot"></span> <span id="load-status">等待获取数据</span></div><span id="time-stamp">尚未刷新</span></div>
+        <section class="metrics" aria-label="数据概况">
+          <article class="metric"><div class="metric-label">运行状态</div><div id="runtime-value" class="metric-value">—</div><div id="runtime-caption" class="metric-foot">尚未读取</div></article>
+          <article class="metric"><div class="metric-label">每日简报</div><div id="brief-value" class="metric-value">—</div><div id="brief-caption" class="metric-foot">尚未读取</div></article>
+          <article class="metric"><div class="metric-label">未平仓期权记录</div><div id="position-value" class="metric-value">—</div><div id="position-caption" class="metric-foot">尚未读取</div></article>
+        </section>
+        <div class="two-col">
+          <section class="panel" aria-labelledby="brief-title">
+            <div class="panel-head"><div><span class="subheading">DECISION BRIEF</span><h2 id="brief-title">最新决策简报</h2></div><span class="chip">来源于现有快照</span></div>
+            <div class="panel-body"><div id="brief-panel" class="empty">正在等待报告</div><details><summary>查看原始结构化报告</summary><pre id="brief-json">—</pre></details></div>
+          </section>
+          <section class="panel" aria-labelledby="performance-title" id="performance">
+            <div class="panel-head"><div><span class="subheading">PERFORMANCE</span><h2 id="performance-title">期权收益</h2></div><span class="chip">原币统计</span></div>
+            <div class="panel-body"><div id="performance-panel" class="empty">正在等待报告</div><details><summary>查看原始收益数据</summary><pre id="performance-json">—</pre></details></div>
+          </section>
+        </div>
+        <section class="panel position-section" id="positions">
+          <div class="panel-head"><div><span class="subheading">OPEN POSITIONS</span><h2>当前期权持仓</h2></div><span class="chip">SQLite 账本</span></div>
+          <div class="table-scroll"><table><thead><tr><th>标的</th><th>方向</th><th>行权价</th><th>到期日</th><th>剩余合约数</th><th>状态</th></tr></thead><tbody id="positions-tbody"><tr><td colspan="6" class="empty">等待查询</td></tr></tbody></table></div>
+          <div class="table-footer" id="positions-footer">行情不可用时不会填充估算价格。</div>
+        </section>
+        <footer>OPTIONS MONITOR · 独立 Web MVP · 只读 · 无自动下单 · 数据缺失时明确显示不可用</footer>
+      </div>
+    </main>
+  </div>
+</body>
+</html>
