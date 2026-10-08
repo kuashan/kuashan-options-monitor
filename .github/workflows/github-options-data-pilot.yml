@@ -1,0 +1,24 @@
+name: GitHub Historical Options Data One-Year Pilot
+on:
+  push:
+    branches:
+      - research/github-options-data-pilot-v1
+    paths:
+      - research/four_leg_score/github_data_pilot.py
+      - .github/workflows/github-options-data-pilot.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-spy-2024:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install lightweight Parquet query engine (pilot only)
+        run: python -m pip install 'duckdb>=1.1,<2'
+      - name: Verify GitHub pinned data blobs and SPY 2024 EOD coverage
+        run: python -m research.four_leg_score.github_data_pilot
