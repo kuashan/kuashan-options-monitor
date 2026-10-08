@@ -4,84 +4,102 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Options Monitor · 独立期权监控</title>
+  <title>Options Monitor V1 · 四方向期权分析</title>
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <div class="shell">
     <aside class="sidebar">
-      <div class="mark"><span class="logo">O<span class="logo-dot">.</span></span><div><strong>OPTIONS MONITOR</strong><small>INDEPENDENT WORKSPACE</small></div></div>
-      <div class="nav-label">工作台</div>
-      <nav aria-label="页面导航">
-        
-        <a href="#public-options" class="nav-link selected">◎ <span>公开期权行情</span></a>
-        
-        
-      </nav>
-      <div class="sidebar-bottom"><span class="signal-dot"></span> 独立部署 · 仅提供只读查询</div>
+      <div class="brand"><div class="brand-icon">O<span>.</span></div><div><strong>OPTIONS MONITOR</strong><small>FOUR-LEG · V1</small></div></div>
+      <div class="nav-caption">独立研究工作台</div>
+      <a class="nav-active" href="#market">期权行情与评分</a>
+      <a class="nav-secondary" href="#detail">合约收益与风险</a>
+      <a class="nav-secondary" href="#method">模型边界</a>
+      <div class="sidebar-footer"><span class="green-dot"></span> 无券商连接<br>只读 · 不下单 · 不接触其他策略</div>
     </aside>
-    <main class="workspace">
-      <header class="topbar"><span>OPTIONS MONITOR / WORKSPACE</span><div class="top-status"><span class="signal-dot"></span><span id="service-state">检查服务中</span></div></header>
+
+    <main class="main">
+      <header class="topbar"><span>OPTIONS INTELLIGENCE / MARKET OBSERVER</span><span id="service-state" class="service">检查服务…</span></header>
       <div class="content">
-        <section class="hero" id="overview">
-          <div class="eyebrow">OPTIONS INTELLIGENCE</div>
-          <h1>期权监控中心<span class="muted"> / Overview</span></h1>
-          <p>独立期权行情观察工作台。公开美股期权链无需券商账户；目前不读取任何个人持仓或交易账本。</p>
-        </section>
-        <div class="legacy-om" hidden aria-hidden="true">
-        <section class="toolbar" aria-label="筛选与刷新">
-          <label>市场 <select id="market"><option value="us">美股 US</option><option value="hk">港股 HK</option></select></label>
-          <label>账户标签 <input id="account" type="text" maxlength="48" autocomplete="off" placeholder="留空查看可用账户"></label>
-          <label>统计期间 <select id="period"><option value="mtd">本月 MTD</option><option value="ytd">今年 YTD</option></select></label>
-          <button id="refresh" type="button">↻ 刷新数据</button>
-        </section>
-        <div class="meta-bar"><div><span class="signal-dot"></span> <span id="load-status">等待获取数据</span></div><span id="time-stamp">尚未刷新</span></div>
-        </div>
-        <section class="panel observer-panel" id="public-options">
-          <div class="panel-head"><div><span class="subheading">PUBLIC OPTIONS MARKET DATA · YFINANCE</span><h2>公开期权行情观察</h2></div><span class="chip">不需要券商 / API Key</span></div>
-          <div class="panel-body">
-            <div class="observer-toolbar">
-              <label>美股 / ETF 代码 <input id="option-symbol" value="SPY" maxlength="15" autocomplete="off" spellcheck="false" placeholder="例如 SPY、AAPL"></label>
-              <label>到期日 <select id="option-expiry"><option value="">自动选择最近到期日</option></select></label>
-              <label>期权类型 <select id="option-side"><option value="puts">Put（看跌期权）</option><option value="calls">Call（看涨期权）</option></select></label>
-              <button id="load-options" type="button">查询期权链</button>
-            </div>
-            <div class="observer-status" id="options-status">尚未查询公开行情</div>
-            <div class="observer-summary">
-              <div><span>最近日 K 收盘价（非实时）</span><strong id="option-spot">—</strong></div>
-              <div><span>当前到期日</span><strong id="option-expiry-label">—</strong></div>
-              <div><span>可展示合约 / 来源总数</span><strong id="option-count">—</strong></div>
-              <div><span>数据来源</span><strong id="option-provider">Yahoo · 非官方</strong></div>
-            </div>
-            <p class="observer-caution">仅供个人观察。网页获取时间不代表报价成交时间；缺少有效买卖盘时不计算 Mid。Delta 等 Greeks 暂未提供。行情可能延迟、限流或中断；不提供任何交易功能。</p>
+        <div class="eyebrow">SIFTALPHA · INDEPENDENT OPTIONS LAB</div>
+        <h1>四方向期权分析 <em>V1</em></h1>
+        <p class="intro">不堆叠指标，只看报价成本、潜在收益与不利情景损失。规则型评分可解释，但不是盈利概率，也没有经过真实成交收益校准。</p>
+
+        <section class="panel market-panel" id="market">
+          <div class="panel-heading"><div><div class="eyebrow">PUBLIC OPTION CHAIN</div><h2>市场行情</h2></div><span class="pill">Yahoo · 无需 API Key</span></div>
+          <div class="controls">
+            <label>标的代码<input id="option-symbol" value="SPY" maxlength="15" autocomplete="off" spellcheck="false" placeholder="SPY / AAPL"></label>
+            <label>到期日<select id="option-expiry"><option value="">自动选择最近到期日</option></select></label>
+            <button type="button" class="primary" id="load-options">查询期权链</button>
           </div>
-          <div class="table-scroll"><table><thead><tr><th>行权价</th><th>Bid</th><th>Ask</th><th>Last</th><th>成交量</th><th>未平仓量 OI</th><th>IV</th><th>最后成交时间</th><th>报价质量</th></tr></thead><tbody id="option-chain-tbody"><tr><td colspan="9" class="empty">输入代码并点击查询期权链</td></tr></tbody></table></div>
-          <div class="table-footer" id="option-chain-footer">美股期权观察 · 无数据时不提供虚构价格</div>
+          <div id="options-status" class="status" role="status" aria-live="polite">准备获取数据</div>
+          <div class="summary">
+            <div class="summary-item"><span>最近日线收盘价 · 非实时</span><strong id="option-spot">—</strong></div>
+            <div class="summary-item"><span>当前到期日</span><strong id="option-expiry-label">—</strong></div>
+            <div class="summary-item"><span>当前显示／来源总数</span><strong id="option-count">—</strong></div>
+            <div class="summary-item"><span>参考评分状态</span><strong id="option-score-state">未计算</strong></div>
+          </div>
+          <div class="warning" id="quality-warning">
+            Yahoo 正股价格目前是最近日线收盘价，期权 Bid/Ask 缺少同步报价时间。综合分仅是基于这些报价的情景参考，不是历史验证胜率或交易建议。
+          </div>
         </section>
-        <div class="legacy-om" hidden aria-hidden="true">
-        <section class="metrics" aria-label="数据概况">
-          <article class="metric"><div class="metric-label">运行状态</div><div id="runtime-value" class="metric-value">—</div><div id="runtime-caption" class="metric-foot">尚未读取</div></article>
-          <article class="metric"><div class="metric-label">每日简报</div><div id="brief-value" class="metric-value">—</div><div id="brief-caption" class="metric-foot">尚未读取</div></article>
-          <article class="metric"><div class="metric-label">未平仓期权记录</div><div id="position-value" class="metric-value">—</div><div id="position-caption" class="metric-foot">尚未读取</div></article>
+
+        <section class="panel" id="analysis">
+          <div class="panel-heading">
+            <div><div class="eyebrow">FOUR DIRECTIONS · INDEPENDENT EVALUATION</div><h2>选择期权方向</h2></div>
+            <span class="pill">每股美元 · 未校准参考分</span>
+          </div>
+          <div class="leg-tabs" role="tablist" aria-label="期权买卖方向">
+            <button type="button" role="tab" data-leg="long_call" aria-selected="false">买入 Call<span>Long Call</span></button>
+            <button type="button" role="tab" data-leg="long_put" aria-selected="false">买入 Put<span>Long Put</span></button>
+            <button type="button" role="tab" data-leg="short_call" aria-selected="false">卖出 Call<span>Short Call</span></button>
+            <button type="button" role="tab" data-leg="short_put" aria-selected="true">卖出 Put<span>Short Put</span></button>
+          </div>
+          <div class="leg-summary">
+            <div><span>当前模式</span><strong id="leg-label">卖出 Put</strong></div>
+            <div><span>最大风险性质</span><strong id="leg-risk">现金担保，股价跌至零时产生大额亏损</strong></div>
+            <div><span>样本方向</span><strong id="leg-explain">按卖出 Bid − 费用衡量权利金</strong></div>
+          </div>
+          <div class="list-toolbar">
+            <label class="filter">合约筛选
+              <select id="filter-moneyness">
+                <option value="near">优先显示接近现价 ±15%</option>
+                <option value="all">全部可用合约</option>
+              </select>
+            </label>
+            <label class="filter">排序方式
+              <select id="sort-options">
+                <option value="strike">行权价从低到高</option>
+                <option value="score">参考分从高到低</option>
+              </select>
+            </label>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>合约 / 行权价</th><th>Bid / Ask</th><th>IV</th><th>盈亏平衡</th><th>理论 Q 盈利</th><th>不利 20% 情景</th><th>参考分</th><th>分析</th></tr></thead>
+              <tbody id="option-chain-tbody"><tr><td colspan="8" class="empty">请先获取期权链</td></tr></tbody>
+            </table>
+          </div>
+          <div class="table-footer" id="option-chain-footer">数据不可用时不会编造分数或市场报价。</div>
         </section>
-        <div class="two-col">
-          <section class="panel" aria-labelledby="brief-title">
-            <div class="panel-head"><div><span class="subheading">DECISION BRIEF</span><h2 id="brief-title">最新决策简报</h2></div><span class="chip">来源于现有快照</span></div>
-            <div class="panel-body"><div id="brief-panel" class="empty">正在等待报告</div><details><summary>查看原始结构化报告</summary><pre id="brief-json">—</pre></details></div>
-          </section>
-          <section class="panel" aria-labelledby="performance-title" id="performance">
-            <div class="panel-head"><div><span class="subheading">PERFORMANCE</span><h2 id="performance-title">期权收益</h2></div><span class="chip">原币统计</span></div>
-            <div class="panel-body"><div id="performance-panel" class="empty">正在等待报告</div><details><summary>查看原始收益数据</summary><pre id="performance-json">—</pre></details></div>
-          </section>
-        </div>
-        <section class="panel position-section" id="positions">
-          <div class="panel-head"><div><span class="subheading">OPEN POSITIONS</span><h2>当前期权持仓</h2></div><span class="chip">SQLite 账本</span></div>
-          <div class="table-scroll"><table><thead><tr><th>标的</th><th>方向</th><th>行权价</th><th>到期日</th><th>剩余合约数</th><th>状态</th></tr></thead><tbody id="positions-tbody"><tr><td colspan="6" class="empty">等待查询</td></tr></tbody></table></div>
-          <div class="table-footer" id="positions-footer">行情不可用时不会填充估算价格。</div>
+
+        <section class="panel" id="detail">
+          <div class="panel-heading"><div><div class="eyebrow">SCENARIO & RISK DETAIL</div><h2>选中合约的解释</h2></div><span id="detail-state" class="pill">等待选择</span></div>
+          <div class="detail-body" id="detail-body"><div class="empty">查询期权链并选择一张合约，可查看完整的收益、风险与评分依据。</div></div>
         </section>
-        </div>
-        <footer>OPTIONS MONITOR · 公开行情观察版 · 无券商接入 · 无自动下单 · 缺失数据不伪造</footer>
+
+        <section class="panel" id="method">
+          <div class="panel-heading"><div><div class="eyebrow">MINIMUM VIABLE SCORING MODEL</div><h2>评分规则与排除项</h2></div><span class="pill">V1 冻结</span></div>
+          <div class="method-grid">
+            <article><strong>01 · 收益／不利情景平衡</strong><p>同一合约按有利 10% 和不利 20% 的到期价格情景计算盈亏；不赋予情景发生概率。</p></article>
+            <article><strong>02 · 不利情景存活度</strong><p>将不利情景亏损相对正股现价 20% 的幅度进行尺度比较；不能替代真实尾部损失预测。</p></article>
+            <article><strong>03 · 买卖盘摩擦</strong><p>按 Bid/Ask 相对价差衡量获取该权利金的摩擦；超过 25% 的异常价差直接不评分。</p></article>
+          </div>
+          <p class="method-foot">参考分 = 100 × 上述三个非负比例中的<strong>最小值</strong>，不人为指定加权系数。裸卖 Call 理论亏损无上限，因此不提供可比较的数值评分。Delta、IV Rank、20 日趋势、固定 50/50 概率混合、Gamma/Theta/Vega 的重复计分都被排除。IV 只用于单独展示 Black–Scholes 风险中性理论概率，不作为另一个打分因子。</p>
+          <p class="method-foot">模型使用零利率、零连续股息率与每股 $0.01 的明确示意费用；均非实时市场或券商收费参数。只有逐日收盘价、无同步期权报价时间和真实成交记录，因此正式校准评分与提前指派概率均不可用。本服务不提供交易下单、账户访问和其他 SiftAlpha 策略联动。</p>
+        </section>
+        <footer>OPTIONS MONITOR V1 · READ ONLY · NO BROKER · NO ORDER EXECUTION</footer>
       </div>
     </main>
   </div>
