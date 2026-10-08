@@ -197,6 +197,7 @@ function render() {
     const a=option.analyses?.[currentLeg];
     const tr=document.createElement("tr");
     tr.className="option-row"+(selectedContract===option.contract?" selected":"");
+    tr.dataset.contract=option.contract||"";
     cell(tr,fmt(option.strike));
     cell(tr,fmt(option.bid)+" / "+fmt(option.ask));
     cell(tr,fmtPercent(option.iv));
@@ -240,15 +241,10 @@ function render() {
 }
 function renderSelectedRow(){
   for(const row of $("option-chain-tbody").querySelectorAll("tr.option-row")){
-    // The option rows remain in source order within the chosen filter.
-    // Selection is represented by the accessible detail panel and active button.
-    row.classList.remove("selected");
-    const button=row.querySelector("button");
-    if(button&&button.getAttribute("aria-label")?.includes("")) {
-      // Visual focus is retained by the clicked button; no invented row identities.
-    }
+    row.classList.toggle("selected",row.dataset.contract===selectedContract);
   }
 }
+
 function fail(message) {
   chain=null;
   selectedContract=null;
