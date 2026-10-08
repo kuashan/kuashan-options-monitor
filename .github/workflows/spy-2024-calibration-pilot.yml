@@ -1,0 +1,31 @@
+name: SPY 2024 Historical OTM Calibration Pilot
+on:
+  push:
+    branches:
+      - research/spy-2024-calibration-v1
+    paths:
+      - 'research/four_leg_score/spy_2024_calibration_pilot.py'
+      - '.github/workflows/spy-2024-calibration-pilot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  spy-2024-otm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install DuckDB for one historical Parquet file
+        run: python -m pip install 'duckdb>=1.1,<2'
+      - name: One-year historical quality diagnostics and theoretical Q probability calibration
+        run: python -m research.four_leg_score.spy_2024_calibration_pilot
+      - name: Keep minimal results as downloadable JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spy-2024-calibration-pilot-result
+          path: spy_2024_calibration_pilot_result.json
+          if-no-files-found: ignore
