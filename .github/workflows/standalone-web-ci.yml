@@ -1,0 +1,23 @@
+name: Standalone Web MVP checks
+on:
+  push:
+    branches:
+      - feature/standalone-web-mvp
+    paths:
+      - 'standalone_web/**'
+      - '.github/workflows/standalone-web-ci.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: python -m unittest discover -s standalone_web/tests -v
+      - name: Syntax validation
+        run: python -m compileall -q standalone_web
