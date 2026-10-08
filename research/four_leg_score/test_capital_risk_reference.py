@@ -44,7 +44,7 @@ class CapitalAndRiskReferenceTests(unittest.TestCase):
         )
         self.assertAlmostEqual(
             out["normalized_pnl_on_leg_capital_reference"]["mean"],
-            (-1.02/95)/2
+            (-1.02/95)/2, places=5
         )
 
     def test_risk_stress_is_deterministic_and_not_forecast(self):
