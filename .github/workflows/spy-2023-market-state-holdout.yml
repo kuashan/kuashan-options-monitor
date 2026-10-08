@@ -1,0 +1,31 @@
+name: SPY 2023 Single Market State Holdout
+on:
+  push:
+    branches:
+      - research/spy-2023-market-state-check-v1
+    paths:
+      - research/four_leg_score/spy_2023_market_state_holdout.py
+      - .github/workflows/spy-2023-market-state-holdout.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  holdout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install historical Parquet scanner
+        run: python -m pip install 'duckdb>=1.1,<2'
+      - name: 2023 holdout and weekend calendar provenance diagnostic
+        run: python -m research.four_leg_score.spy_2023_market_state_holdout
+      - name: Archive evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: spy-2023-market-state-holdout
+          path: spy_2023_market_state_holdout.json
+          if-no-files-found: ignore
