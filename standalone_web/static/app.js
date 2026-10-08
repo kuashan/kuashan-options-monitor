@@ -213,9 +213,9 @@ async function checkHealth() {
   }
 }
 
-byId("refresh").addEventListener("click", refresh);
-byId("market").addEventListener("change", refresh);
-byId("period").addEventListener("change", refresh);
+
+
+
 for (const link of document.querySelectorAll(".nav-link")) {
   link.addEventListener("click", () => {
     document.querySelectorAll(".nav-link").forEach((item) => item.classList.remove("selected"));
@@ -223,7 +223,7 @@ for (const link of document.querySelectorAll(".nav-link")) {
   });
 }
 checkHealth();
-refresh();
+// No Futu/SQLite/OM account queries in public observer mode.
 
 
 // Public-market observation is completely independent of Futu/OM accounts.
