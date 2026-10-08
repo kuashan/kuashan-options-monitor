@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - feature/standalone-web-mvp
+      - feature/public-options-observer-v1
     paths:
       - 'standalone_web/**'
       - '.github/workflows/standalone-web-ci.yml'
@@ -21,3 +22,23 @@ jobs:
         run: python -m unittest discover -s standalone_web/tests -v
       - name: Syntax validation
         run: python -m compileall -q standalone_web
+      - name: Install optional public market-data provider
+        run: python -m pip install -r standalone_web/requirements-marketdata.txt
+      - name: Optional live public-data availability smoke (non-gating)
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          python - <<'PY'
+          from standalone_web.public_marketdata import fetch_public_option_chain, MarketDataUnavailable
+          try:
+              payload = fetch_public_option_chain("SPY")
+              print("LIVE_SMOKE_STATUS=AVAILABLE")
+              print("SYMBOL=", payload["symbol"])
+              print("EXPIRY=", payload["expiry"])
+              print("CALLS=", payload["counts"]["calls_returned"])
+              print("PUTS=", payload["counts"]["puts_returned"])
+          except (MarketDataUnavailable, ValueError) as e:
+              print("LIVE_SMOKE_STATUS=UNAVAILABLE")
+              print("REASON=", e)
+              raise SystemExit(1)
+          PY
