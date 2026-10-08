@@ -224,3 +224,135 @@ for (const link of document.querySelectorAll(".nav-link")) {
 }
 checkHealth();
 refresh();
+
+
+// Public-market observation is completely independent of Futu/OM accounts.
+let publicChain = null;
+let latestPublicRequest = 0;
+
+function showPublicError(message) {
+  publicChain = null;
+  text("options-status", message);
+  text("option-spot", "—");
+  text("option-expiry-label", "—");
+  text("option-count", "—");
+  const tr = document.createElement("tr");
+  const cell = document.createElement("td");
+  cell.colSpan = 9;
+  cell.className = "empty";
+  cell.textContent = message;
+  tr.append(cell);
+  byId("option-chain-tbody").replaceChildren(tr);
+  text("option-chain-footer", "当前数据不可用；没有使用虚构报价或自动回退到其他券商。");
+}
+
+function formatQuote(value, digits = 2) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits })
+    : "—";
+}
+
+function showPublicSide() {
+  if (!publicChain) return;
+  const side = byId("option-side").value;
+  const rows = Array.isArray(publicChain[side]) ? publicChain[side] : [];
+  const sourceCount = publicChain.counts?.[side + "_source"];
+  const truncated = publicChain.counts?.[side + "_truncated"];
+  text("option-count", String(rows.length) + " / " + (sourceCount ?? "未知"));
+  const tbody = byId("option-chain-tbody");
+  tbody.replaceChildren();
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.colSpan = 9;
+    td.className = "empty";
+    td.textContent = "该到期日没有可显示的 " + side + " 合约。";
+    tr.append(td);
+    tbody.append(tr);
+    return;
+  }
+  for (const option of rows) {
+    const tr = document.createElement("tr");
+    const fields = [
+      formatQuote(option.strike),
+      formatQuote(option.bid),
+      formatQuote(option.ask),
+      formatQuote(option.last),
+      formatValue(option.volume),
+      formatValue(option.open_interest),
+      option.iv !== null ? formatQuote(option.iv * 100, 1) + "%" : "—",
+      option.last_trade_at || "未知",
+      option.quote_state === "valid_bid_ask" ? "有效双边报价" : "无有效双边报价",
+    ];
+    for (let i = 0; i < fields.length; i++) {
+      const td = document.createElement("td");
+      td.textContent = fields[i];
+      if (i === 8 && option.quote_state !== "valid_bid_ask") td.className = "missing-quote";
+      tr.append(td);
+    }
+    tbody.append(tr);
+  }
+  text("option-chain-footer",
+    "数据抓取时间：" + publicChain.observed_at_utc +
+    " · 最近日 K 日期：" + (publicChain.spot_last_daily_bar_at || "未知") +
+    " · " + (publicChain.from_cache ? "命中约 4 分钟缓存" : "本次获取") +
+    (truncated ? " · 已按接近现价选择前 400 张合约；其余未显示" : "") +
+    " · 不可用于确认实时可成交报价。");
+}
+
+async function loadPublicOptions() {
+  const requestId = ++latestPublicRequest;
+  const button = byId("load-options");
+  button.disabled = true;
+  text("options-status", "正在读取公开期权链（无券商账户）…");
+  const symbol = byId("option-symbol").value.trim().toUpperCase();
+  const expiry = byId("option-expiry").value;
+  const params = new URLSearchParams({ symbol });
+  if (expiry) params.set("expiry", expiry);
+  try {
+    const response = await fetch("/api/v1/options?" + params, { cache: "no-store" });
+    const body = await response.json();
+    if (requestId !== latestPublicRequest) return;
+    if (!response.ok || !body.ok || !body.data) {
+      showPublicError("公开行情不可用：" + (body.error || "未知错误"));
+      return;
+    }
+    publicChain = body.data;
+    const select = byId("option-expiry");
+    select.replaceChildren();
+    for (const date of publicChain.expirations || []) {
+      const option = document.createElement("option");
+      option.value = date;
+      option.textContent = date;
+      option.selected = date === publicChain.expiry;
+      select.append(option);
+    }
+    text("option-spot", formatQuote(publicChain.spot_last_daily_close));
+    text("option-expiry-label", publicChain.expiry);
+    text("option-provider", "Yahoo · yfinance");
+    text("options-status", publicChain.symbol + " · " +
+      "已获取" + (publicChain.from_cache ? "（缓存）" : "") +
+      " · 非实时，报价时效不保证");
+    showPublicSide();
+  } catch (error) {
+    if (requestId === latestPublicRequest) showPublicError("行情服务无法连接或解析失败。");
+  } finally {
+    if (requestId === latestPublicRequest) button.disabled = false;
+  }
+}
+
+byId("load-options").addEventListener("click", loadPublicOptions);
+byId("option-side").addEventListener("change", showPublicSide);
+byId("option-expiry").addEventListener("change", loadPublicOptions);
+byId("option-symbol").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    byId("option-expiry").value = "";
+    loadPublicOptions();
+  }
+});
+byId("option-symbol").addEventListener("change", () => {
+  const select = byId("option-expiry");
+  select.replaceChildren(new Option("自动选择最近到期日", ""));
+});
+loadPublicOptions();
