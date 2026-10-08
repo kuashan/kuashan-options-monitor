@@ -44,30 +44,109 @@ def expiry_pl(leg: str, strike: float, terminal_spot: float, bid: float, ask: fl
     return (intrinsic-ask-fee) if leg.startswith("long") else (bid-intrinsic-fee)
 
 
-def _stats(observations: list[tuple[float, float, float, float]]) -> dict:
-    """P/L, initial entry quote, strike and initial spot; NOT independent observations."""
+def _risk_reference(leg: str, quote: float, strike: float, spot: float) -> dict:
+    """Deterministic, transparent denominators; NOT comparable broker margin.
+
+    Long: debit = maximum loss (cash fully at risk).
+    CSP short put: strike is *gross cash reserved* per underlying share,
+    max downside loss is strike - net credit.
+    Naked short call: unlimited maximum loss => NO finite capital-risk ROI.
+    """
+    if leg not in LEGS or spot <= 0 or strike <= 0 or quote <= 0:
+        raise ValueError("invalid option/risk reference")
+    if leg.startswith("long_"):
+        debit = quote + FEE_PER_SHARE
+        return {"capital_at_risk": debit, "max_theoretical_loss": debit,
+                "denominator_type": "LONG_DEBIT_MAX_LOSS", "max_loss_unbounded": False}
+    if leg == "short_put":
+        credit = quote - FEE_PER_SHARE
+        if credit <= 0 or credit >= strike:
+            raise ValueError("invalid net credit on cash-secured short put")
+        return {"capital_at_risk": strike, "max_theoretical_loss": strike-credit,
+                "denominator_type": "GROSS_CASH_SECURED_STRIKE", "max_loss_unbounded": False}
+    return {"capital_at_risk": None, "max_theoretical_loss": None,
+            "denominator_type": "NAKED_SHORT_CALL_NO_FINITE_DENOMINATOR",
+            "max_loss_unbounded": True}
+
+
+def _stats(observations: list[tuple[float, float, float, float]], leg: str) -> dict:
+    """Per-contract expiry P/L; dimensionless exposure and risk references.
+
+    Observations=(terminal pnl/share, entry ask/bid, strike, entry spot).
+    NOT a portfolio return, NOT independent contract samples, NOT margin ROI.
+    """
     if not observations:
-        return {"n":0}
-    pl=sorted(x[0] for x in observations)
-    n=len(pl)
-    tail_size=max(1,math.ceil(n*0.05))
-    def quantile(frac:float) -> float:
-        return pl[int(round((n-1)*frac))]
-    def fmt(x:float) -> float:
-        return round(x,5)
+        return {"n": 0}
+    if leg not in LEGS:
+        raise ValueError("unknown leg")
+    pl = sorted(x[0] for x in observations)
+    n = len(pl)
+    tail_size = max(1, math.ceil(n * 0.05))
+
+    def tail_and_avg(values: list[float]) -> dict:
+        ordered = sorted(values)
+        return {
+            "mean": round(statistics.mean(ordered), 6),
+            "worst_5pct_mean": round(statistics.mean(ordered[:tail_size]), 6),
+        }
+
+    def fmt(x: float) -> float:
+        return round(x, 5)
+
+    risks = [_risk_reference(leg, quote, strike, spot)
+             for pnl, quote, strike, spot in observations]
+    capital = [r["capital_at_risk"] for r in risks]
+    finite_capital = all(x is not None for x in capital)
+    exposure_scaled = [pnl/spot for pnl, quote, strike, spot in observations]
+    capital_scaled = (
+        [row[0]/r["capital_at_risk"] for row, r in zip(observations, risks)]
+        if finite_capital else None
+    )
+
+    # Terminal stress is hypothetical and must NOT be described as a forecast.
+    # For long call and short put, adverse spot = S0*(1-shock).
+    # For long put and short call, adverse spot = S0*(1+shock).
+    direction = -1 if leg in ("long_call", "short_put") else 1
+    stress = {}
+    for shock in (0.20, 0.50):
+        stress_results = []
+        for pnl, quote, strike, spot in observations:
+            terminal_s = spot * (1 + direction * shock)
+            # Ask for long / bid for short is the actual historical entry quote.
+            stress_results.append(expiry_pl(leg, strike, terminal_s, quote, quote))
+        stress[f"adverse_spot_{int(shock*100)}pct"] = {
+            "mean_usd_per_share": fmt(statistics.mean(stress_results)),
+            "mean_as_fraction_of_entry_spot": fmt(statistics.mean(
+                value / row[3] for value, row in zip(stress_results, observations)
+            ))
+        }
     return {
-        "n":n,
-        "profit_frequency":fmt(sum(x>0 for x in pl)/n),
-        "mean_pnl_per_underlying_share_usd":fmt(statistics.mean(pl)),
-        "median_pnl":fmt(statistics.median(pl)),
-        "p05_pnl":fmt(quantile(0.05)),
-        "p95_pnl":fmt(quantile(0.95)),
-        "worst_5pct_mean_pnl":fmt(statistics.mean(pl[:tail_size])),
-        "observed_min_pnl":fmt(pl[0]),
-        "observed_max_pnl":fmt(pl[-1]),
-        "avg_entry_option_quote":fmt(statistics.mean(x[1] for x in observations)),
-        "mean_strike":fmt(statistics.mean(x[2] for x in observations)),
-        "mean_entry_spot":fmt(statistics.mean(x[3] for x in observations)),
+        "n": n,
+        "profit_frequency": fmt(sum(x > 0 for x in pl) / n),
+        "mean_pnl_per_underlying_share_usd": fmt(statistics.mean(pl)),
+        "median_pnl": fmt(statistics.median(pl)),
+        "p05_pnl": fmt(pl[int(round((n-1)*0.05))]),
+        "p95_pnl": fmt(pl[int(round((n-1)*0.95))]),
+        "worst_5pct_mean_pnl": fmt(statistics.mean(pl[:tail_size])),
+        "observed_min_pnl": fmt(pl[0]),
+        "observed_max_pnl": fmt(pl[-1]),
+        "avg_entry_option_quote": fmt(statistics.mean(x[1] for x in observations)),
+        "mean_strike": fmt(statistics.mean(x[2] for x in observations)),
+        "mean_entry_spot": fmt(statistics.mean(x[3] for x in observations)),
+        "exposure_scaled_pnl_over_entry_spot": tail_and_avg(exposure_scaled),
+        "capital_reference_kind": risks[0]["denominator_type"],
+        "capital_required_per_share_mean": (
+            fmt(statistics.mean(capital)) if finite_capital else None
+        ),
+        "max_loss_per_share_mean": (
+            fmt(statistics.mean(r["max_theoretical_loss"] for r in risks))
+            if finite_capital else None
+        ),
+        "normalized_pnl_on_leg_capital_reference": (
+            tail_and_avg(capital_scaled) if capital_scaled is not None else None
+        ),
+        "unbounded_theoretical_loss": risks[0]["max_loss_unbounded"],
+        "fixed_expiry_stress_scenarios": stress,
     }
 
 
@@ -190,7 +269,7 @@ def run() -> None:
             for bucket in BUCKETS:
                 all_bucket[bucket]={}
                 for leg in LEGS:
-                    all_bucket[bucket][leg]=_stats(groups[(bucket,leg)])
+                    all_bucket[bucket][leg]=_stats(groups[(bucket,leg)], leg)
                 # Synthetic payoff identities for paired long/short same
                 # contract: their sum is always -(ask-bid)-2*fee.
                 for side in ("call","put"):
@@ -224,13 +303,17 @@ def run() -> None:
             "payoffs_are_correlated_not_independent_trials":True,
             "theoretical_short_call_max_loss":"UNBOUNDED",
             "theoretical_short_put_max_loss":"strike minus net entry credit per underlying share",
+            "capital_basis":"Long: premium debit; cash-secured short put: gross strike; naked short call: NO finite return on capital",
+            "exposure_scale":"P/L divided by entry stock price, NOT portfolio return or risk-adjusted score",
+            "severe_spot_scenario":"hypothetical expiry spots +/-20%, +/-50% from entry, no probability attached",
+            "normalized_returns_not_comparable_across_different_capital_models":True,
             "no_formal_score_or_factor_fit":True,
             "year_results":results,
         }
-        Path("spy_three_regime_payoff_result.json").write_text(
+        Path("spy_four_leg_capital_risk_result.json").write_text(
             json.dumps(final,indent=2,ensure_ascii=False),encoding="utf-8"
         )
-        print("SPY_THREE_REGIME_PAYOFF_PILOT_COMPLETE",flush=True)
+        print("SPY_FOUR_LEG_CAPITAL_REFERENCE_AND_STRESS_PASS_NO_SCORE",flush=True)
 
 
 if __name__=="__main__":
