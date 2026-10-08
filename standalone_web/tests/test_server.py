@@ -89,7 +89,7 @@ class HttpTests(unittest.TestCase):
         for path in ("/api/v1/send_order", "/api/v1/status?cmd=evil"):
             with self.subTest(path=path), self.assertRaises(HTTPError) as context:
                 urlopen(self.url + path)
-            self.assertIn(context.exception.code, (400,))
+            self.assertEqual(context.exception.code, 403)
 
     def test_no_post_endpoint(self):
         from urllib.request import Request
