@@ -52,6 +52,7 @@ def _metrics(rows):
     if not rows:
         return {"n": 0}
     valid_scores = [r[0] for r in rows if isinstance(r[0], int)]
+    normalized = [r[2] for r in rows if r[2] is not None]
     return {
         "n": len(rows),
         "n_with_score": len(valid_scores),
@@ -60,8 +61,8 @@ def _metrics(rows):
         "win_rate": _mean([int(r[1]>0) for r in rows]),
         "avg_pnl_usd_per_underlying_share": _mean([r[1] for r in rows]),
         "worst_5pct_pnl_usd_per_share": _tail([r[1] for r in rows]),
-        "avg_normalized_pnl": _mean([r[2] for r in rows]),
-        "worst_5pct_normalized_pnl": _tail([r[2] for r in rows]),
+        "avg_normalized_pnl": _mean(normalized),
+        "worst_5pct_normalized_pnl": _tail(normalized),
         "q_profit_brier": _mean([(r[3] - int(r[1]>0))**2 for r in rows if r[3] is not None]),
         "q_profit_mean": _mean([r[3] for r in rows if r[3] is not None]),
     }
