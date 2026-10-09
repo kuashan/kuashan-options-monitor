@@ -1,0 +1,31 @@
+name: Original Sell Put SPY Shadow (Not Original 1-to-1)
+on:
+  push:
+    branches:
+      - research/original-csp-spy-shadow-v1
+    paths:
+      - research/four_leg_score/original_csp_spy_shadow.py
+      - .github/workflows/original-csp-spy-shadow.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Parquet reader for verified public historical files
+        run: python -m pip install 'duckdb>=1.1,<2'
+      - name: Audit original CSP reproducible shadow — no Futu, no accounts, no trade
+        run: python -m research.four_leg_score.original_csp_spy_shadow
+      - name: Archive results, including exact missing-evidence warnings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: original-csp-spy-shadow-not-exact
+          path: original_csp_spy_shadow_result.json
+          if-no-files-found: ignore
