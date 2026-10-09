@@ -20,6 +20,8 @@ class ContainerContractTests(unittest.TestCase):
             r"FROM python:3\.12-slim-bookworm@sha256:[0-9a-f]{64}",
         )
         self.assertIn("requirements-marketdata.txt", self.dockerfile)
+        self.assertIn("apt-get install", self.dockerfile)
+        self.assertIn("curl", self.dockerfile)
         self.assertIn("USER options-monitor", self.dockerfile)
         self.assertIn('"--host", "0.0.0.0", "--port", "8765"', self.dockerfile)
         self.assertIn("research/four_leg_score/engine.py", self.dockerfile)

@@ -12,6 +12,10 @@ RUN addgroup --system --gid 10001 options-monitor \
     && adduser --system --uid 10001 --ingroup options-monitor \
         --no-create-home --disabled-login options-monitor
 
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes curl \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY standalone_web/requirements-marketdata.txt /app/requirements-marketdata.txt
 RUN python -m pip install --no-cache-dir --requirement /app/requirements-marketdata.txt
 
