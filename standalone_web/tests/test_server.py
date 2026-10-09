@@ -1,5 +1,6 @@
 """Offline tests for the standalone read-only Web adapter."""
 import json
+import sys
 import threading
 import unittest
 from http.server import ThreadingHTTPServer
@@ -43,6 +44,27 @@ class RequestMappingTests(unittest.TestCase):
         ):
             with self.subTest(view=view, query=query), self.assertRaises(ValueError):
                 make_tool_request(view, query)
+
+
+class HostBindingTests(unittest.TestCase):
+    def _run_main(self, *args):
+        server = unittest.mock.Mock()
+        server.serve_forever.side_effect = KeyboardInterrupt
+        with patch("standalone_web.server.ThreadingHTTPServer", return_value=server) as factory:
+            with patch.object(sys, "argv", ["options-monitor", *args]):
+                from standalone_web.server import main
+
+                main()
+        return factory.call_args.args[0]
+
+    def test_local_default_stays_loopback(self):
+        self.assertEqual(self._run_main("--port", "8765"), ("127.0.0.1", 8765))
+
+    def test_container_can_select_all_interfaces(self):
+        self.assertEqual(
+            self._run_main("--host", "0.0.0.0", "--port", "8765"),
+            ("0.0.0.0", 8765),
+        )
 
 
 class HttpTests(unittest.TestCase):

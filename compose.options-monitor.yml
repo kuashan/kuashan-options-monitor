@@ -1,0 +1,20 @@
+services:
+  options-monitor:
+    image: ${OPTIONS_MONITOR_IMAGE:-ghcr.io/kuashan/kuashan-options-monitor:local}
+    expose:
+      - "8765"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          from urllib.request import urlopen;
+          raise SystemExit(0 if urlopen('http://127.0.0.1:8765/api/v1/health', timeout=3).status == 200 else 1)

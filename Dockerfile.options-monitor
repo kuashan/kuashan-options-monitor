@@ -1,0 +1,29 @@
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/tmp \
+    XDG_CACHE_HOME=/tmp
+
+WORKDIR /app
+
+RUN addgroup --system --gid 10001 options-monitor \
+    && adduser --system --uid 10001 --ingroup options-monitor \
+        --no-create-home --disabled-login options-monitor
+
+COPY standalone_web/requirements-marketdata.txt /app/requirements-marketdata.txt
+RUN python -m pip install --no-cache-dir --requirement /app/requirements-marketdata.txt
+
+COPY standalone_web /app/standalone_web
+COPY research/four_leg_score/engine.py /app/research/four_leg_score/engine.py
+
+RUN chown -R options-monitor:options-monitor /app
+
+USER options-monitor
+EXPOSE 8765
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "from urllib.request import urlopen; raise SystemExit(0 if urlopen('http://127.0.0.1:8765/api/v1/health', timeout=3).status == 200 else 1)"
+
+ENTRYPOINT ["python", "-m", "standalone_web.server", "--host", "0.0.0.0", "--port", "8765"]

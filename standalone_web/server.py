@@ -1,6 +1,8 @@
-"""Read-only loopback dashboard for Options Monitor.
+"""Read-only dashboard for Options Monitor.
 
-No order submission, strategy execution, configuration writes or public listener.
+No order submission, strategy execution, configuration writes or broker access.
+The local default remains loopback; container deployments may select a private
+listener explicitly.
 """
 from __future__ import annotations
 
@@ -159,12 +161,13 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Independent read-only Options Monitor Web UI")
+    parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     if not (1024 <= args.port <= 65535):
         parser.error("port must be between 1024 and 65535")
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Options Monitor Web: http://127.0.0.1:{args.port} (read-only, loopback only)", flush=True)
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"Options Monitor Web: http://{args.host}:{args.port} (read-only)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
